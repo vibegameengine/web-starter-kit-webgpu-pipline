@@ -24,6 +24,10 @@ const out = resolve(flag('out', 'shots/compare'));
 const width = Number(flag('w', '1280'));
 const height = Number(flag('h', '800'));
 const wait = Number(flag('wait', '20000'));
+// Per-side overrides let one build be diffed against itself at two points in time,
+// which is how cache decay gets measured rather than assumed.
+const waitA = Number(flag('waitA', String(wait)));
+const waitB = Number(flag('waitB', String(wait)));
 const tolerance = Number(flag('tol', '8'));
 // Seconds fed to window.__freeze on both pages; `--freeze off` disables pinning.
 const freezeRaw = flag('freeze', '3.0');
@@ -45,7 +49,7 @@ const browser = await chromium.launch({
   ],
 });
 
-async function grab(url, label) {
+async function grab(url, label, holdMs) {
   const page = await browser.newPage({
     viewport: { width, height },
     deviceScaleFactor: 1,
@@ -57,7 +61,7 @@ async function grab(url, label) {
   });
 
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-  await page.waitForTimeout(wait);
+  await page.waitForTimeout(holdMs);
 
   // Pin the mover to the same pose in both builds, then let the GI re-converge
   // around it, so the diff measures the renderer and not two animation clocks.
@@ -88,7 +92,7 @@ async function grab(url, label) {
 }
 
 console.log('capturing…');
-const [bufA, bufB] = [await grab(urlA, 'A'), await grab(urlB, 'B')];
+const [bufA, bufB] = [await grab(urlA, 'A', waitA), await grab(urlB, 'B', waitB)];
 await browser.close();
 
 writeFileSync(`${out}-a.png`, bufA);

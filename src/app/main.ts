@@ -103,13 +103,37 @@ async function boot(): Promise<void> {
   // After the BVH: the mover is raster + shadows only, never part of the static world.
   const dynamic: DynamicObject = addDynamicSphere(scene);
 
+  // --- bake the GI cache ----------------------------------------------------
+  // Static geometry only, wall-clock budgeted, then frozen. The mover is excluded
+  // from the bake (Layer.GiStatic) so its lighting is not frozen into the cache;
+  // at runtime it still *receives* GI from the cache and still casts a real-time
+  // shadow onto the static world.
+  const bakeMs = num('bake') ?? 5000;
+  gi.freezeCompletely = params.get('freezeAll') === '1';
+  let baked = false;
+
+  if (bakeMs > 0) {
+    setLoading(`Baking GI (${(bakeMs / 1000).toFixed(0)}s)`);
+    await gi.bake(renderer, scene, sun, {
+      durationMs: bakeMs,
+      onProgress: (fraction, frames) => {
+        setLoading(`Baking GI ${(fraction * 100).toFixed(0)}% · ${frames} views`);
+      },
+    });
+    baked = true;
+  }
+
   setLoading('Compiling frame graph');
   const frameGraph = new FrameGraph(renderer, scene, camera, {
     giMode: (params.get('giMode') as GiMode) ?? GiMode.Combined,
     indirectIntensity: num('gi') ?? 1,
   });
 
-  const hud = showChrome ? new Hud(world, stats) : null;
+  const hud = showChrome
+    ? new Hud(world, stats, () =>
+        !baked ? 'converging' : gi.frozen ? 'baked · fully frozen' : 'baked · movers live',
+      )
+    : null;
 
   const giParams = {
     mode: frameGraph.giMode,
@@ -137,7 +161,31 @@ async function boot(): Promise<void> {
   giFolder
     .add(giParams, 'baseSamples', 1, 64, 1)
     .name('rays/surfel')
-    .onChange((v: number) => gi.setBaseSampleCount(v));
+    .onChange((v: number) => gi.setRuntimeSampleCount(v));
+
+  const bakeParams = { seconds: bakeMs / 1000, frozen: gi.frozen };
+  const bakeFolder = gui.addFolder('GI bake');
+  bakeFolder.add(bakeParams, 'seconds', 1, 30, 0.5).name('budget s');
+  const frozenCtrl = bakeFolder
+    .add(bakeParams, 'frozen')
+    .name('frozen')
+    .onChange((v: boolean) => gi.setFrozen(v))
+    .listen?.();
+  bakeFolder
+    .add(
+      {
+        rebake: () => {
+          void gi
+            .bake(renderer, scene, sun, { durationMs: bakeParams.seconds * 1000 })
+            .then(() => {
+              bakeParams.frozen = gi.frozen;
+              frozenCtrl?.updateDisplay?.();
+            });
+        },
+      },
+      'rebake',
+    )
+    .name('re-bake now');
   giFolder
     .add(giParams, 'envIntensity', 0, 5, 0.05)
     .name('env')
@@ -205,6 +253,12 @@ async function boot(): Promise<void> {
     frozen = true;
     return true;
   };
+
+  const freezeAt = num('freezeAt');
+  if (freezeAt !== null) {
+    dynamic.update(freezeAt);
+    frozen = true;
+  }
 
   let previous = performance.now();
   let firstFrame = true;

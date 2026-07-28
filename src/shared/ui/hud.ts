@@ -23,6 +23,8 @@ export class Hud {
   constructor(
     private readonly world: WorldState,
     private readonly stats: CacheStats,
+    /** Reports whether the GI cache is frozen — the headline state of a baked build. */
+    private readonly giFrozen: () => string = () => 'converging',
   ) {
     this.root = document.createElement('div');
     this.root.id = 'hud';
@@ -30,6 +32,7 @@ export class Hud {
     document.body.appendChild(this.root);
 
     this.addRow('fps', () => this.fps.toFixed(0));
+    this.addRow('gi cache', () => this.giFrozen());
     this.addRow('sun', () => {
       const { azimuthDeg, elevationDeg } = this.world.sun;
       return `${azimuthDeg.toFixed(2)}° / ${elevationDeg.toFixed(2)}°`;
