@@ -837,6 +837,21 @@ export function createSurfelIntegratePass(
           let s = surfels.value[index];
           if (s.age >= ${SURFEL_TTL}) { return; }
 
+          // LOCAL CHANGE vs upstream: a negative age marks a surfel pinned by the
+          // bake (see gi/immortalise.ts). Its radiance already converged, so skip
+          // the ray tracing entirely -- that skip is what makes a timed bake pay
+          // off instead of just pre-warming a still-fully-live integrator.
+          //
+          // The moments buffer is double-buffered and swapped every frame, so the
+          // converged state must still be carried read -> write. Skipping the write
+          // as well would show a stale buffer on alternate frames.
+          if (s.age < 0) {
+            let pinnedRead  = index + readOffset;
+            let pinnedWrite = index + writeOffset;
+            moments.value[pinnedWrite] = moments.value[pinnedRead];
+            return;
+          }
+
           // Compute basis once per surfel (used for ray directions + final meanWorld).
           let basis = getTangentBasis(s.normal);
           let nW = basis[2];
