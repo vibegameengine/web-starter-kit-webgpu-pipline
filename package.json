@@ -26,6 +26,7 @@
     "@types/stats.js": "^0.17.4",
     "@types/three": "^0.182.0",
     "playwright": "^1.55.0",
+    "pngjs": "^7.0.0",
     "typescript": "^5.8.3",
     "vite": "^6.0.0"
   }

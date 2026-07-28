@@ -1,0 +1,1209 @@
+// @ts-nocheck -- vendored from jure/webgiya; kept byte-compatible so upstream fixes can be re-applied.
+// surfelIntegratePass.ts
+import * as THREE from 'three/webgpu';
+import { storage, uniform, wgslFn, wgsl, sampler, texture } from 'three/tsl';
+import type { SurfelPool } from './surfelPool';
+import type { SceneBVHBundle } from './sceneBvh';
+import { SurfelMoments, SurfelStruct } from './surfelPool';
+import {
+  bvhIntersectFirstHit,
+  getVertexAttribute,
+  rayStruct,
+  constants,
+} from '../bvh/webgpu/index.js';
+import {
+  snap_to_surfel_grid_origin,
+  type SurfelHashGrid,
+} from './surfelHashGrid';
+import {
+  SLG_TOTAL_FLOATS,
+  SLG_DIM,
+  SLG_LOBE_COUNT,
+  MAX_SURFELS_PER_CELL_FOR_KEEP_ALIVE,
+  SURFEL_IMPORTANCE_INDIRECT_MAX,
+  SURFEL_DEPTH_TEXELS,
+  OFFSETS_AND_LIST_START,
+} from './constants';
+
+import {
+  CASCADES,
+  SURFEL_BASE_RADIUS,
+  SURFEL_CS,
+  SURFEL_GRID_CELL_DIAMETER,
+  SURFEL_NORMAL_DIRECTION_SQUISH,
+  SURFEL_RADIUS_OVERSCALE,
+  SURFEL_TTL,
+  TOTAL_CELLS,
+} from './constants';
+import {
+  update_surfel_depth2,
+  surfelRadialDepthOcclusionRW,
+  U_OCCLUSION_PARAMS,
+} from './surfelRadialDepth';
+
+const MAX_SURFELS_PER_CELL_LOOKUP = 32;
+
+export type SurfelIntegratePass = {
+  run: (
+    renderer: THREE.WebGPURenderer,
+    pool: SurfelPool,
+    bvh: SceneBVHBundle,
+    grid: SurfelHashGrid,
+    camera: THREE.PerspectiveCamera,
+    light: THREE.DirectionalLight,
+    dispatchArgs: THREE.IndirectStorageBufferAttribute,
+  ) => void;
+  setBaseSampleCount: (count: number) => void;
+  setAlbedoBoost: (boost: number) => void;
+  setGiScales: (fromDirect: number, fromIndirect: number) => void;
+  setEnvControls: (intensity: number, lod: number) => void;
+};
+
+// --- Grid helper functions (world → grid → hash) ---
+export { consts } from './wgslConsts';
+import { consts } from './wgslConsts';
+
+const envEquirectUV = wgslFn(/* wgsl */ `
+  fn envEquirectUV(dirW: vec3f) -> vec2f {
+    let d = normalize(dirW);
+    // u: [-pi..pi] -> [0..1]
+    let u = atan2(d.z, d.x) * (0.5 / PI) + 0.5;
+    // v: [0..pi] -> [0..1]
+    let v = acos(clamp(-d.y, -1.0, 1.0)) / PI;
+    return vec2f(u, v);
+  }
+`);
+
+// const sampleEnvEquirect = wgslFn(
+//   /* wgsl */ `
+//   fn sampleEnvEquirect(
+//     dirW: vec3f,
+//     envTex: texture_2d<f32>,
+//     envSampler: sampler,
+//     lod: f32
+//   ) -> vec3f {
+//     let uv = envEquirectUV(dirW);
+//     // In compute you don't have derivatives, so use SampleLevel.
+//     return textureSampleLevel(envTex, envSampler, uv, lod).rgb;
+//   }
+// `,
+//   [consts],
+// );
+
+const sampleEnvEquirectClamped = wgslFn(
+  /* wgsl */ `
+  fn sampleEnvEquirect(
+    dirW: vec3f,
+    envTex: texture_2d<f32>,
+    envSampler: sampler,
+    lod: f32
+  ) -> vec3f {
+    let uv = envEquirectUV(dirW);
+    // In compute you don't have derivatives, so use SampleLevel.
+    let hdr =  textureSampleLevel(envTex, envSampler, uv, lod).rgb;
+    let lum = dot(hdr, vec3f(0.2126, 0.7152, 0.0722));
+    let knee = 5.0;   // preserve below this
+    let maxVal = 15.0; // compress toward this
+
+    if (lum <= knee) { return hdr; }
+
+    let compressed = knee + (maxVal - knee) * (1.0 - exp(-(lum - knee) / (maxVal - knee)));
+    return hdr * (compressed / lum);
+    }
+`,
+  [consts],
+);
+
+export const radiusBasedEpsilon = wgslFn(/* wgsl */ `
+  fn radius_based_epsilon(sRad: f32) -> f32 {
+    // return 0.0001;
+    return clamp(sRad * 0.01, 0.0005, 0.01);
+  } 
+`);
+
+// Color helpers
+const colorHelpers = wgsl(/* wgsl */ `
+  fn calculate_luma(c: vec3f) -> f32 {
+    return dot(c, vec3f(0.2126, 0.7152, 0.0722));
+  }
+
+  fn rgb_to_ycbcr(col: vec3f) -> vec3f {
+    let r = col.r; let g = col.g; let b = col.b;
+    let y  = 0.299 * r + 0.587 * g + 0.114 * b;
+    let cb = -0.168736 * r - 0.331264 * g + 0.5 * b;
+    let cr = 0.5 * r - 0.418688 * g - 0.081312 * b;
+    return vec3f(y, cb, cr);
+  }
+
+  fn ycbcr_to_rgb(ycbcr: vec3f) -> vec3f {
+    let y = ycbcr.x; let cb = ycbcr.y; let cr = ycbcr.z;
+    let r = y + 1.402 * cr;
+    let g = y - 0.344136 * cb - 0.714136 * cr;
+    let b = y + 1.772 * cb;
+    return vec3f(r, g, b);
+  }
+`);
+
+const sampleDiffuseArray = wgslFn(/* wgsl */ `
+  fn sampleDiffuseArray(
+    tex: texture_2d_array<f32>,
+    texSampler: sampler,
+    uvIn: vec2f,
+    layerIn: i32
+  ) -> vec3f {
+    let uv = uvIn;
+
+    let layerCount = textureNumLayers(tex);
+    let layer = clamp(layerIn, 0, i32(layerCount) - 1);
+
+    // Unsampled texel load
+    // let dims = textureDimensions(tex, 0); // vec2<u32>
+    // let w = max(1u, dims.x);
+    // let h = max(1u, dims.y);
+    // let x = i32(min(u32(uv.x * f32(w)), w - 1u));
+    // let y = i32(min(u32(uv.y * f32(h)), h - 1u));
+    // let c = textureLoad(tex, vec2i(x, y), layer, 0);
+
+    let c = textureSampleLevel(tex, texSampler, uv, layer, 0.0);
+    return c.rgb;
+  }
+`);
+
+const blueNoise4 = wgslFn(
+  /* wgsl */ `
+  fn blueNoise4(
+    surfelIndex: u32,
+    sampleIndex: u32,
+    purpose: u32,
+    tex: texture_2d<f32>,
+  ) -> vec4f {
+    // Traverse the 1024x1024 tile in a deterministic way
+    let combined = sampleIndex + purpose * 0x10000u;
+    let seq = (combined * 4099u + surfelIndex * 7919u) & BLUE_NOISE_MASK;
+
+    let x = seq & (BLUE_NOISE_SIZE - 1u);
+    let y = seq >> 10u; // 1024 = 2^10
+
+    return textureLoad(tex, vec2u(x,y), 0);
+  }
+`,
+  [consts],
+);
+
+// ---------------------------------------------------------
+// 1. Basis + cosine/cone sampling
+// ---------------------------------------------------------
+
+const getTangentBasis = wgslFn(/* wgsl */ `
+  fn getTangentBasis(normal: vec3f) -> mat3x3f {
+    let nNormal = normalize(normal);
+    let up = select(vec3f(1,0,0), vec3f(0,0,1), abs(nNormal.z) < 0.999);
+    let t = normalize(cross(up, nNormal));
+    let b = cross(nNormal, t);
+    return mat3x3f(t, b, nNormal);
+  }
+`);
+
+// NEW: local-space cosine hemisphere sampling (z-up), no basis creation here. // NEW
+const sampleCosineHemisphereLocal = wgslFn(
+  /* wgsl */ `
+  fn sampleCosineHemisphereLocal(u: vec2f) -> vec3f {
+    // TODO: Testing
+    // let z = u.x;
+    // let r = sqrt(max(0.0, 1.0 - z * z));
+    // let theta = 2.0 * PI * u.y;
+    // let x = r * cos(theta);
+    // let y = r * sin(theta);
+    // return vec3f(x, y, z);
+    let r = sqrt(u.x);
+    let theta = 2.0 * PI * u.y;
+    let x = r * cos(theta);
+    let y = r * sin(theta);
+    let z = sqrt(max(0.0, 1.0 - u.x));
+    return vec3f(x, y, z);
+  }
+`,
+  [consts],
+); // NEW
+
+// ------------------------------------------------------------------
+// [SLG] Hemi-oct-square mapping (bijection hemi <-> square)
+// ------------------------------------------------------------------
+export { hemiOctSquareEncode, hemiOctSquareDecode } from './wgslConsts';
+import { hemiOctSquareEncode, hemiOctSquareDecode } from './wgslConsts';
+
+const slgSafeU01 = wgslFn(/* wgsl */ `
+  fn slgSafeU01(x: f32) -> f32 {
+    // Avoid exactly 0 or 1 (blue-noise textures often contain exact endpoints)
+    return clamp(x, 1e-6, 1.0 - 1e-6);
+  }
+`);
+
+const hemiOctJacobian = wgslFn(/* wgsl */ `
+  fn hemiOctJacobian(uv: vec2f) -> f32 {
+    // Maps uv in [0,1]^2 -> hemisphere direction n = normalize(v)
+    // Returns J = dΩ / d(uv area)  (steradians per unit uv^2)
+
+    let q = uv * 2.0 - 1.0;
+    let p = vec2f(q.x + q.y, q.x - q.y) * 0.5;
+
+    let z = 1.0 - abs(p.x) - abs(p.y);
+    let v = vec3f(p.x, p.y, z);
+
+    let r2 = dot(v, v);
+
+    // J = 2 / |v|^3
+    // |v|^3 = r2 * sqrt(r2)
+    // Use inverseSqrt for speed; clamp to avoid INF if something goes weird numerically.
+    let invR = inverseSqrt(max(1e-12, r2));
+    return 2.0 * invR * invR * invR;
+  }
+`);
+
+// pdfSLG works purely from uv in hemi-oct-square, no basis recompute
+const pdfSLG = wgslFn(
+  /* wgsl */ `
+  fn pdfSLG(
+    surfelIndex: u32,
+    uv: vec2f,
+    slgMass: f32
+  ) -> f32 {
+    if (slgMass <= 1e-6) { return 0.0; }
+
+    let cx = min(u32(floor(uv.x * f32(SLG_DIM))), SLG_DIM - 1u);
+    let cy = min(u32(floor(uv.y * f32(SLG_DIM))), SLG_DIM - 1u);
+    let idx = cy * SLG_DIM + cx;
+
+    let baseIdx = surfelIndex * SLG_TOTAL_FLOATS;
+    let w = max(0.0, guidingBuffer.value[baseIdx + idx]);
+
+    // P(cell) = w / slgMass
+    // PDF = P(cell) * (1 / A_uv_cell) * (1 / J(uv))
+    //     = P(cell) * 64 / J(uv)
+    let J = hemiOctJacobian(uv);
+
+    return (w / slgMass) * f32(SLG_LOBE_COUNT) / J;
+  }
+`,
+  [consts, hemiOctJacobian],
+);
+
+// [SLG] Lobe axis in the SURFEL-LOCAL frame (no wasted cells)
+const slgGetLobeAxisLocal = wgslFn(
+  /* wgsl */ `
+  fn slgGetLobeAxisLocal(idx: u32) -> vec3f {
+    let x = f32(idx % SLG_DIM);
+    let y = f32(idx / SLG_DIM);
+    let uv = vec2f((x + 0.5) / f32(SLG_DIM), (y + 0.5) / f32(SLG_DIM));
+    return hemiOctSquareDecode(uv);
+  }
+`,
+  [consts, hemiOctSquareDecode],
+);
+
+// SLG Zero lobes for a fresh surfel
+const slgClearForNewSurfel = wgslFn(/* wgsl */ `
+fn slgClearForNewSurfel(
+  surfelIndex: u32
+) -> void {
+    let base = surfelIndex * SLG_TOTAL_FLOATS;
+    for (var j: u32 = 0u; j < SLG_TOTAL_FLOATS; j = j + 1u) {
+        guidingBuffer.value[base + j] = 0.0;
+    }
+}`);
+
+// -----------------------------------------------------------------------------
+// MSME (Multiscale Mean Estimator) helpers
+// Based on Ray Tracing Gems, Chapter 25 (Barré‑Brisebois et al.), listing around
+// pp. 26–27 (“MultiscaleMeanEstimator”).
+// -----------------------------------------------------------------------------
+const msmeHelpers = wgsl(/* wgsl */ `
+struct MSMEData {
+  mean: vec3f,
+  shortMean: vec3f,
+  vbbr: f32,
+  variance: vec3f,
+  inconsistency: f32,
+};
+
+fn runMSME(y: vec3f, dataIn: MSMEData, shortWindowBlend: f32) -> MSMEData {
+  var data = dataIn;
+
+  // 1) Firefly suppression (per-channel "high threshold")
+  let dev = sqrt(max(vec3f(1e-5), data.variance));
+  let highThreshold = vec3f(0.1) + data.shortMean + dev * 8.0;
+  // let highThreshold = max(vec3f(1.0), data.shortMean * 2.0) + dev * 6.0;
+  let yClamped = min(y, highThreshold);
+
+  // 2) Short mean
+  let delta = yClamped - data.shortMean;
+  data.shortMean = mix(data.shortMean, yClamped, shortWindowBlend);
+  let delta2 = yClamped - data.shortMean;
+
+  // 3) Variance (slower blend than short mean)
+  let varianceBlend = shortWindowBlend * 0.5;
+  data.variance = mix(data.variance, delta * delta2, varianceBlend);
+  data.variance = max(data.variance, vec3f(0.0));
+
+  // 4) Inconsistency (short vs long, normalized by deviation)
+  let devNew = sqrt(max(vec3f(1e-5), data.variance));
+  let shortDiff = data.mean - data.shortMean;
+  let relativeDiff =
+      dot(vec3f(0.299, 0.587, 0.114), abs(shortDiff) / max(vec3f(1e-5), devNew));
+  data.inconsistency = mix(data.inconsistency, relativeDiff, 0.08);
+
+  // 5) VBBR (reduce blending in high variance situations)
+  let term = (0.5 * data.shortMean) / max(vec3f(1e-5), devNew);
+  let varianceBasedBlendReduction =
+      clamp(dot(vec3f(0.299, 0.587, 0.114), term), 1.0/32.0, 1.0);
+
+  // 6) Catch-up logic (react quickly when inconsistent)
+  let catchUpFactor =
+      smoothstep(0.0, 1.0, relativeDiff * max(0.02, data.inconsistency - 0.2));
+  var catchUpBlend = clamp(catchUpFactor, 1.0/256.0, 1.0);
+
+  // IMPORTANT: match original ordering — scale by previous vbbr, then update vbbr.
+  catchUpBlend *= data.vbbr;
+  data.vbbr = mix(data.vbbr, varianceBasedBlendReduction, 0.1);
+
+  data.mean = mix(data.mean, yClamped, clamp(catchUpBlend, 0.0, 1.0));
+  return data;
+}`);
+
+// ------------------------------------------------------------------
+// [SLG] Sampling: choose lobe by weights, then sample a UNIFORM UV within that cell.
+// ------------------------------------------------------------------
+const slgSampleLobeIndex = wgslFn(
+  /* wgsl */ `
+  fn slgSampleLobeIndex(
+    surfelIndex: u32,
+    u: f32,
+    totalIn: f32
+  ) -> i32 {
+    if (totalIn <= 1e-6) { return -1; }
+    let baseIdx = surfelIndex * SLG_TOTAL_FLOATS;
+    let rowSumOffset = baseIdx + SLG_LOBE_COUNT;
+
+    // Safety: Clamp target
+    var targ = clamp(u * totalIn, 0.0, totalIn);
+
+    // 1) Row select
+    var row: u32 = 0u;
+    for (var r: u32 = 0u; r < SLG_DIM; r = r + 1u) {
+      let w = max(0.0, guidingBuffer.value[rowSumOffset + r]);
+      // STRICT FIX: Force selection if we are at the last element
+      if (targ <= w || r == SLG_DIM - 1u) { row = r; break; }
+      targ -= w;
+    }
+
+    // 2) Column select
+    let rowStart = baseIdx + row * SLG_DIM;
+    var col: u32 = 0u;
+    for (var c: u32 = 0u; c < SLG_DIM; c = c + 1u) {
+      let w = max(0.0, guidingBuffer.value[rowStart + c]);
+      // STRICT FIX: Force selection if we are at the last element
+      if (targ <= w || c == SLG_DIM - 1u) { col = c; break; }
+      targ -= w;
+    }
+
+    return i32(row * SLG_DIM + col);
+  }
+`,
+  [consts],
+);
+
+// [SLG] Update guiding weights by splatting luminance into the hemi-oct-square grid.
+// takes `uv` directly (local-space-first)
+const slgUpdateFromSample = wgslFn(
+  /* wgsl */ `
+  fn slgUpdateFromSample(
+    surfelIndex: u32,
+    uv: vec2f,
+    lum: f32
+  ) -> f32 {
+    let gridPos = uv * f32(SLG_DIM) - 0.5;
+
+    let basePos = floor(gridPos);
+    let f = fract(gridPos);
+
+    let baseIdx = surfelIndex * SLG_TOTAL_FLOATS;
+    let rowSumOffset = baseIdx + SLG_LOBE_COUNT;
+
+    let eta = LEARNING_RATE; // Learning Rate (Exponential Moving Average)
+    var massDiff = 0.0;
+    for (var dy: i32 = 0; dy <= 1; dy = dy + 1) {
+      for (var dx: i32 = 0; dx <= 1; dx = dx + 1) {
+        let cx = i32(basePos.x) + dx;
+        let cy = i32(basePos.y) + dy;
+
+        if (cx >= 0 && cx < i32(SLG_DIM) && cy >= 0 && cy < i32(SLG_DIM)) {
+          let wx = select(1.0 - f.x, f.x, dx == 1);
+          let wy = select(1.0 - f.y, f.y, dy == 1);
+          let w  = wx * wy;
+          let targ = lum * w; 
+          
+          let idx = u32(cy) * SLG_DIM + u32(cx);
+          let oldVal = guidingBuffer.value[baseIdx + idx];
+          
+          // EMA Update: decays old value if targ is 0 (shadow)
+          let newVal = mix(oldVal, targ, eta);
+          
+          guidingBuffer.value[baseIdx + idx] = newVal;
+          
+          // Maintain row sum cache
+          let diff = newVal - oldVal;
+          guidingBuffer.value[rowSumOffset + u32(cy)] += diff;
+          massDiff += diff;
+        }
+      }
+    }
+    return massDiff;
+  }
+`,
+  [consts],
+);
+
+// sampleGuidedDirection returns BOTH local direction + uv (local-space-first).
+const sampleGuidedDirection = wgslFn(
+  /* wgsl */ `
+  fn sampleGuidedDirection(
+    surfelIndex: u32,
+    slgMass: f32,
+    pGuide: f32,
+    // u.xy for within-cell UV, u.z for lobe selection, u.w for decision
+    u: vec4f,
+  ) -> SLGSample {
+
+    // Make sure we don't hit uv==0/1 exactly (z==0 boundary on hemi-oct-square)
+    let ux = slgSafeU01(u.x);
+    let uy = slgSafeU01(u.y);
+    let uz = slgSafeU01(u.z);
+    let uw = slgSafeU01(u.w);
+
+    var out: SLGSample;
+
+    // Guided: sample a UNIFORM UV within the chosen cell
+    if (slgMass > 1e-6 && uw < pGuide) {
+      let chosen = slgSampleLobeIndex(surfelIndex, uz, slgMass);
+      if (chosen >= 0) {
+        let col = u32(chosen) % SLG_DIM;
+        let row = u32(chosen) / SLG_DIM;
+
+        // Uniform in UV within selected cell
+        let cellUV = vec2f(
+          (f32(col) + ux) / f32(SLG_DIM),
+          (f32(row) + uy) / f32(SLG_DIM)
+        );
+
+        out.uv = cellUV;
+        out.dirLocal = hemiOctSquareDecode(cellUV);
+        return out;
+      }
+    }
+
+    // Fallback: cosine hemisphere in LOCAL space, then encode to uv for pdf/update
+    let dirLocal = sampleCosineHemisphereLocal(vec2f(ux, uy));
+    out.dirLocal = dirLocal;
+    out.uv = hemiOctSquareEncode(dirLocal);
+    return out;
+  }
+  
+`,
+  [
+    consts,
+    slgSampleLobeIndex,
+    hemiOctSquareDecode,
+    hemiOctSquareEncode,
+    sampleCosineHemisphereLocal,
+    slgSafeU01,
+  ],
+);
+
+const slgGetTotalMass = wgslFn(
+  /* wgsl */ `
+    fn slgGetTotalMass(
+      surfelIndex: u32
+    ) -> f32 {
+        let baseIdx = surfelIndex * SLG_TOTAL_FLOATS;
+        let rowSumOffset = baseIdx + SLG_LOBE_COUNT;
+        var total = 0.0;
+        for (var r: u32 = 0u; r < SLG_DIM; r = r + 1u) {
+            total += max(0.0, guidingBuffer.value[rowSumOffset + r]);
+        }
+        return total;
+    }
+    `,
+  [consts],
+);
+
+export function createSurfelIntegratePass(
+  blueNoiseTex: THREE.Texture,
+  envTex: THREE.Texture,
+): SurfelIntegratePass {
+  let computeNode: THREE.ComputeNode | null = null;
+
+  // Uniforms
+  const U_FRAME = uniform(0);
+  const U_LIGHT_DIR = uniform(new THREE.Vector3(0, 1, 0));
+  const U_LIGHT_COLOR = uniform(new THREE.Color(1, 1, 1));
+  const U_CAM_POS = uniform(new THREE.Vector3());
+  const U_READ_OFFSET = uniform(0);
+  const U_WRITE_OFFSET = uniform(0);
+  const U_GRID_ORIGIN = uniform(new THREE.Vector3());
+  const U_BASE_SAMPLE_COUNT = uniform(4);
+  const U_ALBEDO_BOOST = uniform(1.0);
+  const U_GI_FROM_DIRECT = uniform(1.0);
+  const U_GI_FROM_INDIRECT = uniform(1.0);
+
+  const blueNoiseTexN = texture(blueNoiseTex);
+  const envTexture = envTex ? texture(envTex).toInspector('Env') : null;
+  const envSampler = envTex ? sampler(envTex) : null;
+
+  const U_ENV_INTENSITY = uniform(1.0);
+  const U_ENV_LOD = uniform(4.0);
+
+  function run(
+    renderer: THREE.WebGPURenderer,
+    pool: SurfelPool,
+    bvh: SceneBVHBundle,
+    grid: SurfelHashGrid,
+    camera: THREE.PerspectiveCamera,
+    dirLight: THREE.DirectionalLight,
+    dispatchArgs: THREE.IndirectStorageBufferAttribute,
+  ) {
+    const surfelAttr = pool.getSurfelAttr();
+    const momentsAttr = pool.getMomentsAttr();
+    const poolMax = pool.getPoolMaxAtomic();
+    const guidingAttr = pool.getGuidingAttr(); // SLG lobe weights
+    const offsetsAndListAttr = grid.getOffsetsAndListAttr();
+    const touchedAtomic = pool.getTouched();
+    const surfelDepthAttr = pool.getSurfelDepthAttr();
+
+    if (
+      !surfelAttr ||
+      !momentsAttr ||
+      !poolMax ||
+      !bvh.bvhNode ||
+      !offsetsAndListAttr ||
+      !guidingAttr ||
+      !surfelDepthAttr ||
+      !touchedAtomic
+    )
+      return;
+
+    const touchedBuffer = touchedAtomic.setName('touched');
+
+    // Update Uniforms
+    U_FRAME.value = renderer.info.frame;
+    const lightDir = new THREE.Vector3()
+      .subVectors(dirLight.position, dirLight.target.position)
+      .normalize();
+
+    U_LIGHT_DIR.value.copy(lightDir);
+    U_LIGHT_COLOR.value.copy(dirLight.color).multiplyScalar(dirLight.intensity);
+    U_CAM_POS.value.copy(camera.position);
+    snap_to_surfel_grid_origin(U_GRID_ORIGIN.value, camera.position);
+
+    // 1. UPDATE OFFSETS
+    const { readOffset, writeOffset } = pool.getOffsets();
+    U_READ_OFFSET.value = readOffset;
+    U_WRITE_OFFSET.value = writeOffset;
+
+    if (!computeNode) {
+      const capacity = surfelAttr.count;
+
+      const surfelBuffer = storage(surfelAttr, SurfelStruct, capacity)
+        .setAccess('readOnly')
+        .setName('surfels');
+      const momentsBuffer = storage(momentsAttr, SurfelMoments, capacity * 2)
+        .setAccess('readWrite')
+        .setName('moments');
+
+      const offsetsAndList = storage(
+        offsetsAndListAttr,
+        'int',
+        offsetsAndListAttr.count,
+      )
+        .setAccess('readOnly')
+        .setName('offsetsAndList');
+
+      const guidingBuffer = storage(guidingAttr, 'float', guidingAttr.count)
+        .setAccess('readWrite')
+        .setName('guidingBuffer');
+      const surfelDepthBuffer = storage(
+        surfelDepthAttr,
+        'vec4',
+        surfelDepthAttr.count,
+      )
+        .setAccess('readWrite')
+        .setName('surfelDepth');
+
+      const gridHelpers = wgsl(
+        /* wgsl */ `
+        fn surfel_pos_to_grid_coord(pRel: vec3f) -> vec3i {
+          return vec3i(floor(pRel / SURFEL_GRID_CELL_DIAMETER));
+        }
+      
+        fn surfel_grid_coord_to_cascade_float(coord: vec3i) -> f32 {
+          let fcoord = vec3f(coord) + vec3f(0.5);
+          let max_c = max(abs(fcoord.x), max(abs(fcoord.y), abs(fcoord.z)));
+          return log2(max_c / (f32(SURFEL_CS) * 0.5));
+        }
+      
+        fn surfel_cascade_float_to_cascade(cf: f32) -> u32 {
+          let v = ceil(max(0.0, cf));
+          let clamped = clamp(v, 0.0, f32(SURFEL_CASCADES - 1));
+          return u32(clamped);
+        }
+
+        fn surfel_grid_coord_within_cascade(coord: vec3i, cascade: u32) -> vec3i {
+          let c = i32(cascade);
+          
+          return (coord >> vec3<u32>(cascade)) + SURFEL_CS / 2;
+        }
+      
+        fn surfel_grid_coord_to_c4(coord: vec3i) -> vec4u {
+          let cf = surfel_grid_coord_to_cascade_float(coord);
+          let cascade = surfel_cascade_float_to_cascade(cf);
+          let ucoord = surfel_grid_coord_within_cascade(coord, cascade);
+      
+          let clamped = clamp(
+            ucoord,
+            vec3i(0, 0, 0),
+            vec3i(SURFEL_CS - 1, SURFEL_CS - 1, SURFEL_CS - 1)
+          );
+      
+          return vec4u(u32(clamped.x), u32(clamped.y), u32(clamped.z), cascade);
+        }
+      
+        fn surfel_grid_c4_to_hash(c4: vec4u) -> u32 {
+          let cs = u32(SURFEL_CS);
+          return c4.x
+            + c4.y * cs
+            + c4.z * cs * cs
+            + c4.w * cs * cs * cs;
+        }
+      
+        fn surfel_radius_for_pos(pRel: vec3f) -> f32 {
+          let dist = length(pRel);
+          let cascadeRadius = SURFEL_GRID_CELL_DIAMETER * f32(SURFEL_CS) * 0.5;
+          return SURFEL_BASE_RADIUS * max(1.0, dist / cascadeRadius);
+        }
+      `,
+        [consts],
+      );
+
+      const lookupSurfelGI = wgslFn(
+        /* wgsl */ `
+      fn lookupSurfelGI(
+        pt_ws: vec3f,
+        normal_ws: vec3f,
+        cam_pos: vec3f,
+        grid_origin: vec3f,
+        readOffset: u32,
+        occParams: vec4f
+      ) -> vec3f {
+        // Position relative to camera, matches grid build
+        let pRel = pt_ws - grid_origin;
+    
+        let gridCoord = surfel_pos_to_grid_coord(pRel);
+        let c4       = surfel_grid_coord_to_c4(gridCoord);
+        let hash     = surfel_grid_c4_to_hash(c4);
+        let cellIdx  = i32(hash % TOTAL_CELLS);
+    
+        let start = offsetsAndList.value[cellIdx];
+        let end   = offsetsAndList.value[cellIdx + 1];
+        var count = max(end - start, 0);
+    
+        // Clamp to avoid insane work in hot cells
+        let maxCount = min(count, MAX_SURFELS_PER_CELL_LOOKUP);
+        if (maxCount <= 0) {
+          return vec3f(0.0);
+        }
+    
+        var totalColor = vec3f(0.0);
+        var totalWeight = 0.0;
+    
+        var bestContrib = 0.0;
+        var bestSid = 0;
+
+        for (var i: i32 = 0; i < maxCount; i = i + 1) {
+          let sid = offsetsAndList.value[OFFSETS_AND_LIST_START + start + i];
+          
+          if (sid < 0) {
+            continue;
+          }
+    
+          let surfel = surfels.value[u32(sid)];
+          let sPos   = surfel.posb.xyz;
+          let sNor   = normalize(surfel.normal);
+    
+          // Surfel radius and falloff
+          let pRelSurfel = sPos - cam_pos;
+          let sRad = surfel_radius_for_pos(pRelSurfel) * SURFEL_RADIUS_OVERSCALE;
+    
+          // IMPORTANT: match the origin offset used for depth learning
+          let eps = radius_based_epsilon(sRad);
+          let sPosOff = sPos + sNor * eps;
+
+          let dV    = pt_ws - sPosOff;
+          let dist  = length(dV);
+          // if (dist <= eps) { continue; } // TODO
+          let dirWS = dV / dist;
+
+          let align     = abs(dot(dV, sNor));
+          let mahal     = dist * (1.0 + align * SURFEL_NORMAL_DIRECTION_SQUISH);
+    
+          let directional = max(0.0, dot(sNor, normal_ws));
+          var weight = smoothstep(sRad, 0.0, mahal) * directional;
+    
+          if (weight <= 0.0) {
+            continue;
+          }
+
+
+          // ----------------------------------------------------------------
+          // NEW: MSM visibility gate (0..1)
+          // ----------------------------------------------------------------
+          // Optional perf guard: only run MSM if the geometric weight matters
+          // (tune threshold: 0.01–0.05 tends to be safe for “secondary bounce”)
+          if (weight > 0.02) {
+            let vis = surfel_radial_occlusion_rw(
+              u32(sid),
+              dirWS,
+              sNor,
+              dist,
+              occParams
+            );
+            weight *= vis;
+            if (weight <= 0.0) { continue; }
+          }
+
+          let readSid = u32(sid) + readOffset;
+          let sIrr = moments.value[readSid].irradiance.xyz;
+
+          let contrib = sIrr * weight;
+          let lenContrib = length(contrib);
+          if (lenContrib > bestContrib) {
+            bestContrib = lenContrib;
+            bestSid = sid;
+          }
+
+          totalWeight = totalWeight + weight;
+          totalColor  = totalColor + contrib;
+        }
+
+        // Indirect range: 1 to 50
+        if (bestSid >= 0 && bestContrib > 0.01) {
+          let impMax = f32(${SURFEL_IMPORTANCE_INDIRECT_MAX});
+          let importance = clamp(i32(bestContrib * impMax), 0, 50);
+          atomicMax(&touched.value[bestSid], importance);
+        }
+
+        if (totalWeight < 1e-5) { return vec3f(0.0); }
+        return totalColor / totalWeight;
+      }
+      `,
+        [consts, gridHelpers, surfelRadialDepthOcclusionRW],
+      );
+
+      // --- WGSL Integrator ---
+      const integrator = wgslFn(
+        /* wgsl */ `
+      fn compute(
+          diffuseTex: texture_2d_array<f32>,
+          diffuseTexSampler: sampler,
+          envTexture: texture_2d<f32>,
+          envSampler: sampler,
+          envIntensity: f32,
+          envLod: f32,
+          frame: u32, 
+          lightDir: vec3f, 
+          lightColor: vec3f, 
+          camPos: vec3f,
+          gridOrigin: vec3f,
+          blueNoiseTex: texture_2d<f32>,
+          readOffset: u32, writeOffset: u32,
+          occParams: vec4f,
+          baseSampleCount: u32,
+          albedoBoost: f32,
+          giFromDirect: f32,
+          giFromIndirect: f32,
+        ) -> void {
+          let index = instanceIndex;
+          // let total = atomicLoad(&poolMax[0]);
+          // if (i32(index) >= total) { return; }
+
+          let s = surfels.value[index];
+          if (s.age >= ${SURFEL_TTL}) { return; }
+
+          // Compute basis once per surfel (used for ray directions + final meanWorld).
+          let basis = getTangentBasis(s.normal);
+          let nW = basis[2];
+
+          // --- READ PREVIOUS STATE ---
+          let readIdx  = index + readOffset;
+          let mPrev    = moments.value[readIdx];
+
+          // Decode previous MSME state
+          var msmeState: MSMEData;
+          msmeState.mean          = mPrev.irradiance.xyz;
+          msmeState.shortMean     = mPrev.msmeData0.xyz;
+          msmeState.vbbr          = mPrev.msmeData0.w;
+          msmeState.variance      = mPrev.msmeData1.xyz;
+          msmeState.inconsistency = mPrev.msmeData1.w;
+          
+          let prevCount = mPrev.irradiance.w;
+
+          // [MSME FIX] sanitize state to avoid NaNs / stuck blending (important when buffers contain garbage)
+          msmeState.vbbr = clamp(msmeState.vbbr, 1.0/32.0, 1.0);
+          msmeState.inconsistency = clamp(msmeState.inconsistency, 0.0, 10.0);
+          msmeState.variance = max(msmeState.variance, vec3f(0.0));
+
+          let birthFrame = u32(s.posb.w);
+          let sinceBirth = frame - birthFrame;
+          
+          var slgMass = slgGetTotalMass(index);
+
+          let hasGrid = slgMass > 1e-5;
+          var pGuide = select(0.0, 0.9, hasGrid);
+          let guideRamp = clamp(f32(sinceBirth) / 16.0, 0.0, 1.0); 
+          pGuide = min(pGuide * guideRamp, 0.9);
+          
+          var diffuseGI = vec3f(0.0);
+          var validSamples = 0.0;
+
+          // Adaptive based on MSME inconsistency
+          let baseCount = max(1u, baseSampleCount);
+          let boostCount = select(0u, 12u, msmeState.inconsistency > 0.3);
+          var sampleCount = baseCount + boostCount;
+
+          let warmup = (sinceBirth <= 4u);
+          // let warmup = (sinceBirth <= 2u) || (prevCount < 32.0);  // <-- tune threshold
+          if (warmup) { sampleCount = 32u; }
+
+          var hitPos0 = s.posb.xyz;
+          var debugFlag = 0.0;
+
+          // NOTE: For debug - maybe use for real loop?
+          // for (var i = 0u; i < 16u; i = i + 1u) {
+          //     let pRelS = s.posb.xyz - camPos;
+          //     let sRad = surfel_radius_for_pos(pRelS);
+          //     let eps = radius_based_epsilon(sRad); // Offset from position
+          //     let bx  = i % 4u;                         // 0..3
+          //     let by  = i / 4u;                        // 0..3
+          //     // Jitter within the bin - different position each frame
+          //     let noise = blueNoise4(index, i + frame * 16u, 1u, blueNoiseTex);
+          //     let jitter = noise.xy;  // 0 to 1
+              
+          //     let uvDepth = (vec2f(f32(bx) + jitter.x, f32(by) + jitter.y)) / f32(SURFEL_DEPTH_TEXELS);
+          //     // convert uv -> local dir (must match your encode)
+          //     let dirLocalDepth = hemiOctSquareDecode(uvDepth);
+          //     let rayDirDepth   = basis * dirLocalDepth;
+
+          //     // Offset along normalized normal (from basis) for consistent epsilon.
+          //     let rayOrigin = s.posb.xyz + nW * eps; // Old: 0.002
+
+          //     var ray: Ray; ray.origin = rayOrigin; ray.direction = rayDirDepth;
+          //     let hit = bvhIntersectFirstHit(ray);
+
+          //     // ----------------------------------------------------------
+          //     // [RADIAL DEPTH] Learn depth along this direction (uv)
+          //     // Similar to the example: miss writes "max depth", hit writes clamped hit depth.
+          //     // ----------------------------------------------------------
+          //     let maxDepth = sRad * 2.0;
+          //     let dHit = clamp(hit.dist, 0.0, maxDepth);
+          //     let dLearn = select(maxDepth, dHit, hit.didHit);
+          //     update_surfel_depth2(surfelDepth, index, uvDepth, dLearn, dirLocalDepth);
+          // }
+
+          let DEPTH_PROBE_STRIDE = 4u; // 4 => 25% of surfels per frame do 1 probe
+          let doProbe = (((index ^ frame) & (DEPTH_PROBE_STRIDE - 1u)) == 0u);
+
+          // Common surfel data
+          var ray: Ray;
+          let pRelS = s.posb.xyz - camPos;
+          let sRad = surfel_radius_for_pos(pRelS);
+          let eps = radius_based_epsilon(sRad);
+          // Offset along normalized normal (from basis) for consistent epsilon.
+          ray.origin = s.posb.xyz + nW * eps;
+
+          if (doProbe) {
+            // pick a bin deterministically (covers all bins over time)
+
+            let binCount = SURFEL_DEPTH_TEXELS * SURFEL_DEPTH_TEXELS;
+            let bin = (frame + index * 13u) % u32(binCount);
+
+            let bx = bin % SURFEL_DEPTH_TEXELS;
+            let by = bin / SURFEL_DEPTH_TEXELS;
+
+            // jitter within the bin
+            let n4 = blueNoise4(index, frame, 0u, blueNoiseTex);
+            let uvDepth = vec2f(f32(bx) + n4.x, f32(by) + n4.y) / f32(SURFEL_DEPTH_TEXELS);
+
+            let dirLocalDepth = hemiOctSquareDecode(uvDepth);
+            let rayDirDepth   = basis * dirLocalDepth;
+
+            ray.direction = rayDirDepth;
+
+            let hitD = bvhIntersectFirstHit(ray);
+
+            let maxDepth = sRad * 2.0;
+            let dHit = clamp(hitD.dist, 0.0, maxDepth);
+            let dLearn = select(maxDepth, dHit, hitD.didHit);
+
+            update_surfel_depth2(index, uvDepth, dLearn, dirLocalDepth);
+          }
+
+          for (var i = 0u; i < sampleCount; i = i + 1u) {
+            let u4 = blueNoise4(index, frame * BLUE_NOISE_STRIDE + i, 1u, blueNoiseTex);
+            // u4.xy = spatial
+            // u4.z  = lobe selection
+            // u4.w  = decision
+
+            // Sample in LOCAL space; get both local dir + uv in one call.
+            let slgS = sampleGuidedDirection(index, slgMass, pGuide, u4);
+            let dirLocal = slgS.dirLocal;
+            let uv = slgS.uv;
+
+            // Cosine/pdf use local z directly
+            let cosTerm = max(0.0, dirLocal.z);
+            let pdfCos  = cosTerm / PI;
+
+            // pdfSLG now uses uv directly
+            var pdfGuide = 0.0;
+            if (pGuide > 0.0) {
+              pdfGuide = pdfSLG(index, uv, slgMass);
+            }
+
+            let mixPdf = (1.0 - pGuide) * pdfCos + pGuide * pdfGuide;
+
+            if (mixPdf > 1e-6 && cosTerm > 0.0) {
+              debugFlag = 1.0;
+              // Convert local dir -> world dir once using precomputed basis
+              let rayDir = basis * dirLocal;
+
+              ray.direction = rayDir;
+              let hit = bvhIntersectFirstHit(ray);
+              var bounceLi = vec3f(0.0);
+              
+              // ----------------------------------------------------------
+              // [RADIAL DEPTH] Learn depth along this direction (uv)
+              // Similar to the example: miss writes "max depth", hit writes clamped hit depth.
+              // ----------------------------------------------------------
+              let maxDepth = sRad * 2.0;
+              // let maxDepth = 1e2;
+              let dHit = clamp(hit.dist, 0.0, maxDepth);
+              let dLearn = select(maxDepth, dHit, hit.didHit);
+              update_surfel_depth2(index, uv, dLearn, dirLocal);
+              
+              if (hit.didHit) {
+                let hitPoint  = ray.origin + ray.direction * hit.dist;
+                let hitNormal = normalize(hit.normal);
+                if (i == 0u) { hitPos0 = hitPoint; }
+                let uvMat = getVertexAttribute(hit.barycoord, hit.indices.xyz);
+                // matId is constant per triangle because we made geometry non-indexed + filled per-tri.
+                let matId = i32(round(uvMat.z));
+                let hitUv = uvMat.xy;
+                var hitAlbedo = sampleDiffuseArray(diffuseTex, diffuseTexSampler, hitUv, matId);
+                let y = max(1e-4, dot(hitAlbedo, vec3f(0.2126, 0.7152, 0.0722)));
+                let y2 = 1.0 - pow(1.0 - y, max(0.0, albedoBoost));
+                let s = y2 / y;
+                hitAlbedo = clamp(hitAlbedo * s, vec3f(0.0), vec3f(1.0));
+
+                var shadowRay2: Ray; shadowRay2.origin = hitPoint + hitNormal * eps; 
+                shadowRay2.direction = lightDir;
+                let shadowHit2 = bvhIntersectFirstHit(shadowRay2);
+                if (!shadowHit2.didHit) {
+                  let NdotL2 = max(0.0, dot(hitNormal, lightDir));
+                  bounceLi += lightColor * hitAlbedo * NdotL2 * (1.0 / PI) * giFromDirect;
+                }
+                let gi = lookupSurfelGI(hitPoint, hitNormal, camPos, gridOrigin, readOffset, occParams);
+                bounceLi += gi * hitAlbedo * giFromIndirect;
+              } else {
+                // Basic Sky
+                // let t = 0.5 * (rayDir.y + 1.0);
+                // bounceLi = mix(vec3f(0.05), vec3f(0.2), vec3f(t));
+                bounceLi = sampleEnvEquirect(rayDir, envTexture, envSampler, envLod) * envIntensity;
+              }
+
+              // Use local cosTerm already computed
+              diffuseGI += bounceLi * (cosTerm / PI) / mixPdf;
+              let lum = calculate_luma(bounceLi) * cosTerm;
+
+              // Update SLG from uv directly.
+              let slgMassDiff = slgUpdateFromSample(index, uv, lum);
+              slgMass += slgMassDiff;
+              validSamples += 1.0;
+            }
+          }
+
+          slgMass = slgGetTotalMass(index);
+
+          let newAvg = diffuseGI / max(1.0, validSamples);
+
+          // --- RUN MSME ---
+          if (validSamples > 0.0) {
+            // Adapt short-window blend to how many samples contributed this frame          
+            let tau = 12.5; // ~1/0.08, matches the paper-ish magnitude
+            let n = validSamples;
+            let shortWindowBlend = clamp(1.0 - exp(-n / tau), 0.01, 0.10); // TODO 0.10 or 0.12?
+
+            // No temporal averaging
+            // ---------------------
+            // msmeState.mean = newAvg;
+            // msmeState.shortMean = newAvg;
+            // msmeState.variance = vec3f(1.0);
+            // msmeState.vbbr = 1.0;
+            // msmeState.inconsistency = 1.0;
+
+            // EMA
+            // msmeState.mean = mix(msmeState.mean, newAvg, 0.01);
+            // msmeState.shortMean = mix(msmeState.mean, newAvg, 0.01);
+            // msmeState.variance = vec3f(1.0);
+            // msmeState.vbbr = 1.0;
+            // msmeState.inconsistency = 1.0;
+
+            if (prevCount < 32.0) {
+              let blend = 1.0 / (1.0 + prevCount);
+              msmeState.mean      = mix(msmeState.mean,      newAvg, blend);
+              msmeState.shortMean = mix(msmeState.shortMean, newAvg, blend);
+              msmeState.variance  = mix(msmeState.variance, vec3f(1.0), blend);
+
+              // [MSME FIX] keep brand-new surfels responsive
+              msmeState.vbbr = max(msmeState.vbbr, 1.0);
+              msmeState.inconsistency = max(msmeState.inconsistency, 1.0);
+            } else {
+              msmeState = runMSME(newAvg, msmeState, shortWindowBlend);
+            }
+          }
+
+          var totalCount = prevCount;
+          if (validSamples > 0.0) {
+            totalCount = min(prevCount + 1.0, MAX_TEMPORAL_M);
+          }
+          let alpha = validSamples / max(1.0, totalCount);
+
+          let baseIdx = index * SLG_TOTAL_FLOATS;
+          var maxW = 0.0;
+          var meanLocal = vec3f(0.0);
+          for (var li: u32 = 0u; li < SLG_LOBE_COUNT; li = li + 1u) {
+            let w = max(0.0, guidingBuffer.value[baseIdx + li]);
+            if (w <= 0.0) { continue; }
+            if (w > maxW) { maxW = w; }
+            let axisL = slgGetLobeAxisLocal(li);
+            meanLocal += axisL * w;
+          }
+          let meanLen = length(meanLocal);
+          let meanLocalN = select(vec3f(0.0, 0.0, 1.0), meanLocal / meanLen, meanLen > 1e-6);
+
+          // Reuse precomputed basis
+          let meanWorld = normalize(basis * meanLocalN);
+
+          // --- WRITE NEW STATE ---
+          let outIdx = index + writeOffset;
+              
+          moments.value[outIdx].irradiance   = vec4f(msmeState.mean, totalCount);
+          moments.value[outIdx].msmeData0    = vec4f(msmeState.shortMean, msmeState.vbbr);
+          moments.value[outIdx].msmeData1    = vec4f(msmeState.variance, msmeState.inconsistency);
+          moments.value[outIdx].hit          = vec4f(hitPos0, debugFlag);
+          moments.value[outIdx].guiding      = vec4f(meanWorld, slgMass);
+        }
+      `,
+        [
+          constants,
+          consts,
+          rayStruct,
+          bvhIntersectFirstHit,
+          getVertexAttribute,
+
+          blueNoise4,
+
+          getTangentBasis,
+
+          hemiOctSquareEncode,
+          hemiOctSquareDecode,
+          hemiOctJacobian,
+          slgGetLobeAxisLocal,
+          slgClearForNewSurfel,
+          slgGetTotalMass,
+          slgUpdateFromSample,
+          slgSampleLobeIndex,
+
+          sampleGuidedDirection,
+          pdfSLG,
+
+          // cache lookup + color
+          lookupSurfelGI,
+          gridHelpers,
+          colorHelpers,
+          msmeHelpers,
+          update_surfel_depth2,
+          radiusBasedEpsilon,
+          surfelRadialDepthOcclusionRW,
+          sampleDiffuseArray,
+          envEquirectUV,
+          sampleEnvEquirectClamped,
+          bvh.bvhNode,
+          bvh.positionNode,
+          bvh.indexNode,
+          bvh.colorNode,
+          surfelBuffer,
+          momentsBuffer,
+          offsetsAndList,
+          touchedBuffer,
+          guidingBuffer,
+          surfelDepthBuffer,
+        ],
+      );
+
+      const computeCall = integrator({
+        diffuseTex: texture(bvh.diffuseArrayTex),
+        diffuseTexSampler: sampler(bvh.diffuseArrayTex),
+
+        envTexture,
+        envSampler,
+        envIntensity: U_ENV_INTENSITY,
+        envLod: U_ENV_LOD,
+
+        frame: U_FRAME,
+        lightDir: U_LIGHT_DIR,
+        lightColor: U_LIGHT_COLOR,
+        camPos: U_CAM_POS,
+        gridOrigin: U_GRID_ORIGIN,
+        blueNoiseTex: blueNoiseTexN,
+        readOffset: U_READ_OFFSET,
+        writeOffset: U_WRITE_OFFSET,
+        occParams: U_OCCLUSION_PARAMS,
+        baseSampleCount: U_BASE_SAMPLE_COUNT,
+        albedoBoost: U_ALBEDO_BOOST,
+        giFromDirect: U_GI_FROM_DIRECT,
+        giFromIndirect: U_GI_FROM_INDIRECT,
+      });
+
+      computeNode = computeCall
+        .compute(capacity)
+        .setName('Surfel Integrate Pass');
+    }
+
+    renderer.compute(computeNode, dispatchArgs);
+  }
+
+  return {
+    run,
+    setBaseSampleCount: (count: number) => {
+      U_BASE_SAMPLE_COUNT.value = Math.max(1, Math.floor(count));
+    },
+    setAlbedoBoost: (boost: number) => {
+      U_ALBEDO_BOOST.value = Math.max(0, boost);
+    },
+    setGiScales: (fromDirect: number, fromIndirect: number) => {
+      U_GI_FROM_DIRECT.value = Math.max(0, fromDirect);
+      U_GI_FROM_INDIRECT.value = Math.max(0, fromIndirect);
+    },
+    setEnvControls: (intensity: number, lod: number) => {
+      U_ENV_INTENSITY.value = Math.max(0, intensity);
+      U_ENV_LOD.value = Math.max(0, lod);
+    },
+  };
+}

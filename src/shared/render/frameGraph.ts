@@ -1,17 +1,17 @@
 import * as THREE from 'three/webgpu';
 import {
-  add,
   diffuseColor,
   mrt,
   normalView,
   output,
   pass,
+  screenUV,
+  texture,
   uniform,
   vec4,
   velocity,
 } from 'three/tsl';
-import { ssgi } from 'three/addons/tsl/display/SSGINode.js';
-import { traa } from 'three/addons/tsl/display/TRAANode.js';
+import { fxaa } from 'three/addons/tsl/display/FXAANode.js';
 
 /**
  * TSL's fluent API returns a different concrete node class per operator, so the
@@ -19,70 +19,65 @@ import { traa } from 'three/addons/tsl/display/TRAANode.js';
  */
 type TslNode = THREE.Node;
 
-export interface SsgiParams {
-  sliceCount: number;
-  stepCount: number;
-  aoIntensity: number;
-  giIntensity: number;
-  expFactor: number;
-  thickness: number;
-  backfaceLighting: number;
+export const GiMode = {
+  Direct: 'direct',
+  Indirect: 'indirect',
+  Combined: 'combined',
+} as const;
+export type GiMode = (typeof GiMode)[keyof typeof GiMode];
+
+export interface FrameGraphOptions {
+  giMode?: GiMode;
+  indirectIntensity?: number;
+  debugTaps?: boolean;
 }
 
-export const DEFAULT_SSGI: SsgiParams = {
-  sliceCount: 2,
-  stepCount: 8,
-  aoIntensity: 1,
-  giIntensity: 10,
-  expFactor: 2,
-  thickness: 1,
-  backfaceLighting: 0,
-};
-
 /**
- * Elderwood Frame Graph — Phase 0 skeleton.
+ * Elderwood frame graph.
  *
- * What exists now:
- *   scene pass → MRT(HDR colour | albedo | view normal | velocity | depth)
- *              → SSGI (screen traces, returns vec4(GI.rgb, AO.a))
- *              → composite
- *              → TRAA
+ * ```
+ * scene pass → MRT( HDR | albedo | view normal | velocity | depth )
+ *            → composite( direct + indirect × albedo )      ← surfel GI resolve
+ *            → FXAA
+ * ```
  *
- * What plugs in later, at the marked slots:
- *   Phase 1  cached static/dynamic cascade shadows (feeds the base pass)
- *   Phase 2  irradiance volume sample (adds to `indirect`)
- *   Phase 4  sky LUT + aerial perspective + froxel fog (between composite and TRAA)
- *   Phase 5  bloom / grade / grain (after TRAA)
+ * The composite is rebuilt on demand rather than once at construction, because the
+ * GI resolve target is created lazily and replaced on resize — the same reason
+ * webgiya rebuilds its composite material.
  *
- * The ordering is not arbitrary — it is the UE ordering from
- * docs/ue-pipeline-study-and-plan.md §3.4, and screen traces come *first* because
- * that is what Lumen does: trace the screen, fall back to the world cache only for
- * what the screen cannot see.
+ * Slots still to fill, in UE order (docs/ue-pipeline-study-and-plan.md §3.4):
+ *   Phase 1  cached static/dynamic cascade shadows, feeding the base pass
+ *   Phase 4  sky LUT + aerial perspective + froxel fog, before AA
+ *   Phase 5  bloom → exposure → grade → grain, and TRAA in place of FXAA
  */
 export class FrameGraph {
   readonly post: THREE.PostProcessing;
   readonly scenePass: ReturnType<typeof pass>;
-  readonly ssgiParams: SsgiParams = { ...DEFAULT_SSGI };
 
-  private readonly ssgiNode: ReturnType<typeof ssgi>;
+  giMode: GiMode;
+  readonly indirectIntensity = uniform(1);
+
+  private readonly color: TslNode;
   private readonly taps: Array<{ name: string; node: TslNode }> = [];
+  private readonly debugTaps: boolean;
+
+  private giTexture: THREE.Texture | null = null;
+  private albedoTexture: THREE.Texture | null = null;
+  private needsComposite = true;
 
   constructor(
     private readonly renderer: THREE.WebGPURenderer,
     scene: THREE.Scene,
     camera: THREE.PerspectiveCamera,
-    /**
-     * Composite SSGI on top of the traced cache. Off by default — screen traces are
-     * a refinement, never the GI itself.
-     */
-    private readonly useScreenTraces = false,
-    private readonly debugTaps = true,
+    options: FrameGraphOptions = {},
   ) {
+    const { giMode = GiMode.Combined, indirectIntensity = 1, debugTaps = true } = options;
+    this.giMode = giMode;
+    this.indirectIntensity.value = indirectIntensity;
+    this.debugTaps = debugTaps;
+
     this.post = new THREE.PostProcessing(renderer);
 
-    // ---- 3. Opaque base pass → G-Buffer -------------------------------------
-    // r182 has no packNormalToRGB; PassNode allocates HalfFloat targets, so view
-    // normals are stored signed and raw. SSGINode consumes them via .sample().rgb.
     const scenePass = pass(scene, camera);
     scenePass.setMRT(
       mrt({
@@ -94,72 +89,45 @@ export class FrameGraph {
     );
     this.scenePass = scenePass;
 
-    const color = scenePass.getTextureNode('output').toInspector('GBuffer / HDR');
-    const albedo = scenePass
-      .getTextureNode('albedo')
-      .toInspector('GBuffer / Albedo');
-    const normal = scenePass
-      .getTextureNode('normal')
-      .toInspector('GBuffer / Normal', (node) => vec4(node.rgb.mul(0.5).add(0.5), 1));
-    const depth = scenePass
-      .getTextureNode('depth')
-      .toInspector('GBuffer / Depth', () => scenePass.getLinearDepthNode());
-    const vel = scenePass.getTextureNode('velocity');
-    this.tap('GBuffer / Velocity', vec4(vel.rg.abs().mul(20), 0, 1));
+    this.color = scenePass.getTextureNode('output').toInspector('Direct / HDR');
 
-    // ---- 5. GI ---------------------------------------------------------------
-    // The indirect term is NOT computed here. It comes from the world-space
-    // irradiance cache (src/shared/gi), traced against the BVH and sampled per pixel
-    // inside the material — so it is real traced bounce, not a screen-space guess,
-    // and it survives the camera looking away.
-    //
-    // SSGI stays available as an optional *near-field* refinement on top of that
-    // cache, exactly as Lumen layers screen traces over its world cache. It is OFF
-    // by default: as the only GI term it is just noise, which is the trap this
-    // pipeline was rebuilt to avoid.
-    const ssgiNode = ssgi(color, depth, normal, camera);
-    this.ssgiNode = ssgiNode;
-    this.applySsgiParams();
+    this.tap('GBuffer / Albedo', vec4(scenePass.getTextureNode('albedo').rgb, 1));
+    this.tap(
+      'GBuffer / Normal',
+      vec4(scenePass.getTextureNode('normal').rgb.mul(0.5).add(0.5), 1),
+    );
+    this.tap(
+      'GBuffer / Velocity',
+      vec4(scenePass.getTextureNode('velocity').rg.abs().mul(20), 0, 1),
+    );
 
-    const gi = ssgiNode.rgb.toInspector('SSGI / GI', (node) => vec4(node, 1));
-    const ao = ssgiNode.a.toInspector('SSGI / AO', (node) => vec4(node, node, node, 1));
-
-    // ---- SLOT (Phase 4): + sky / aerial perspective / froxel fog -------------
-
-    // ---- 6. Compose ----------------------------------------------------------
-    const composed = this.useScreenTraces
-      ? vec4(add(color.rgb.mul(ao), albedo.rgb.mul(gi)), color.a)
-      : (color as unknown as TslNode);
-    if (!this.useScreenTraces) {
-      // Keep the SSGI buffers inspectable even when they are not composited, so the
-      // pass viewer can show what the near-field term *would* contribute.
-      this.tap('SSGI / GI', vec4(gi, 1));
-      this.tap('SSGI / AO', vec4(ao, ao, ao, 1));
-    }
-
-    // ---- 10. Temporal reconstruction ----------------------------------------
-    const resolved = traa(composed, depth, vel, camera) as unknown as TslNode;
-
-    // ---- SLOT (Phase 5): bloom → exposure → grade → grain -------------------
-
-    this.post.outputNode = this.foldTaps(resolved);
+    this.rebuildComposite();
   }
 
   /**
-   * Registers a buffer for the Inspector's Viewer tab.
-   *
-   * `toInspector()` attaches via `node.before(...)`, so a node that nothing
-   * downstream consumes is never built and never shows up. Buffers we do not
-   * otherwise read (velocity, and later the shadow layers) are therefore folded
-   * into the output at zero weight. Dev-only: `debugTaps = false` drops them.
+   * Points the composite at the GI resolve output. Safe to call every frame; the
+   * node graph is only rebuilt when a texture identity actually changed.
    */
+  setGiTextures(gi: THREE.Texture | null, albedo: THREE.Texture | null): void {
+    if (gi === this.giTexture && albedo === this.albedoTexture) return;
+    this.giTexture = gi;
+    this.albedoTexture = albedo;
+    this.needsComposite = true;
+  }
+
+  setGiMode(mode: GiMode): void {
+    if (mode === this.giMode) return;
+    this.giMode = mode;
+    this.needsComposite = true;
+  }
+
   private tap(name: string, displayNode: TslNode): void {
     if (!this.debugTaps) return;
     this.taps.push({ name, node: displayNode });
   }
 
   private foldTaps(outputNode: TslNode): TslNode {
-    // A literal `* 0` gets constant-folded away and the tapped node is never built,
+    // A literal `* 0` is constant-folded away and the tapped node never gets built,
     // so the Inspector never sees it. A uniform cannot be folded.
     const zero = uniform(0);
     let node = outputNode;
@@ -169,21 +137,32 @@ export class FrameGraph {
     return node;
   }
 
-  private applySsgiParams(): void {
-    const p = this.ssgiParams;
-    const n = this.ssgiNode;
-    n.sliceCount.value = p.sliceCount;
-    n.stepCount.value = p.stepCount;
-    n.aoIntensity.value = p.aoIntensity;
-    n.giIntensity.value = p.giIntensity;
-    n.expFactor.value = p.expFactor;
-    n.thickness.value = p.thickness;
-    n.backfaceLighting.value = p.backfaceLighting;
-  }
+  private rebuildComposite(): void {
+    let beauty: TslNode = this.color;
 
-  /** Call after mutating `ssgiParams` (e.g. from the GUI). */
-  syncSsgiParams(): void {
-    this.applySsgiParams();
+    if (this.giTexture && this.albedoTexture) {
+      const albedo = texture(this.albedoTexture, screenUV);
+      const indirect = texture(this.giTexture, screenUV)
+        .toInspector('GI / Surfel')
+        .mul(albedo)
+        .mul(this.indirectIntensity);
+
+      switch (this.giMode) {
+        case GiMode.Direct:
+          beauty = this.color;
+          break;
+        case GiMode.Indirect:
+          beauty = indirect;
+          break;
+        default:
+          beauty = (this.color as ReturnType<typeof vec4>).add(indirect);
+          break;
+      }
+    }
+
+    this.post.outputNode = this.foldTaps(fxaa(beauty) as unknown as TslNode);
+    this.post.needsUpdate = true;
+    this.needsComposite = false;
   }
 
   setSize(width: number, height: number): void {
@@ -193,6 +172,7 @@ export class FrameGraph {
   }
 
   render(): void {
+    if (this.needsComposite) this.rebuildComposite();
     this.post.render();
   }
 }

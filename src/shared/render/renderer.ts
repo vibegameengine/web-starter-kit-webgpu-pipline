@@ -23,6 +23,15 @@ export async function initRenderer(
   const renderer = new THREE.WebGPURenderer({
     antialias: false,
     forceWebGL: false,
+    // The surfel GI passes need more than the WebGPU defaults: the integrator binds
+    // 10 storage buffers in one compute stage, and the grid build dispatches
+    // 512-wide workgroups. Without these the pipelines fail to create and every
+    // compute pass silently drops.
+    requiredLimits: {
+      maxStorageBuffersPerShaderStage: 10,
+      maxComputeWorkgroupSizeX: 1024,
+      maxComputeInvocationsPerWorkgroup: 1024,
+    },
   });
 
   // The pass viewer. Every intermediate buffer registers here via `.toInspector()`,
@@ -32,7 +41,10 @@ export async function initRenderer(
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.outputColorSpace = THREE.SRGBColorSpace;
-  renderer.toneMapping = THREE.AgXToneMapping;
+  // Neutral, matching webgiya, so the GI port can be compared against its reference
+  // frame-for-frame. AgX is the eventual target (CLAUDE.md §3) but swapping the
+  // transfer function while porting would make every difference ambiguous.
+  renderer.toneMapping = THREE.NeutralToneMapping;
   renderer.toneMappingExposure = 1.0;
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;

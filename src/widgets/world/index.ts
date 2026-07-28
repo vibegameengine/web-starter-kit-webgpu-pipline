@@ -1,1 +1,6 @@
-export { createCornerScene, type CornerScene } from './cornerScene.ts';
+export {
+  createCornellScene,
+  populateCornell,
+  addDynamicSphere,
+  type CornellScene,
+} from './cornellScene.ts';
