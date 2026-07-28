@@ -197,6 +197,15 @@ async function boot(): Promise<void> {
     gi: { ...giParams },
   });
 
+  // Pins the mover to a fixed pose so a diff against webgiya measures the renderer
+  // rather than two animation clocks that were never in step.
+  let frozen = false;
+  (window as unknown as Record<string, unknown>).__freeze = (t: number) => {
+    dynamic.update(t);
+    frozen = true;
+    return true;
+  };
+
   let previous = performance.now();
   let firstFrame = true;
 
@@ -211,7 +220,7 @@ async function boot(): Promise<void> {
     controls.update();
     updateAnimation();
     camera.updateMatrixWorld();
-    dynamic.update(now * 0.001);
+    if (!frozen) dynamic.update(now * 0.001);
 
     gi.update(renderer, scene, camera, sun);
     frameGraph.setGiTextures(gi.outputTexture, gi.albedoTexture);

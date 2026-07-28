@@ -25,6 +25,10 @@ const width = Number(flag('w', '1280'));
 const height = Number(flag('h', '800'));
 const wait = Number(flag('wait', '20000'));
 const tolerance = Number(flag('tol', '8'));
+// Seconds fed to window.__freeze on both pages; `--freeze off` disables pinning.
+const freezeRaw = flag('freeze', '3.0');
+const freezeAt = freezeRaw === 'off' ? null : Number(freezeRaw);
+const settle = Number(flag('settle', '6000'));
 
 mkdirSync(dirname(out), { recursive: true });
 
@@ -54,6 +58,17 @@ async function grab(url, label) {
 
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
   await page.waitForTimeout(wait);
+
+  // Pin the mover to the same pose in both builds, then let the GI re-converge
+  // around it, so the diff measures the renderer and not two animation clocks.
+  if (freezeAt !== null) {
+    const ok = await page.evaluate(
+      (t) => (window.__freeze ? window.__freeze(t) : false),
+      freezeAt,
+    );
+    if (!ok) console.log(`  ! ${label}: no window.__freeze hook`);
+    await page.waitForTimeout(settle);
+  }
 
   // Hide every overlay both apps might draw, so only the canvas is compared.
   await page
