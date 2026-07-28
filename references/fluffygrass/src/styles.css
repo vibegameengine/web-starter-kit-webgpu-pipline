@@ -1,0 +1,66 @@
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu',
+    'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue', sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+code {
+  font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New', monospace;
+}
+
+#root,
+body,
+canvas {
+  margin: 0;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  background: rgb(234, 255, 253);
+  /* background: radial-gradient(circle, #363636 0%, #0e0e0e 75%); */
+  cursor: grab;
+  cursor: -moz-grab;
+  cursor: -webkit-grab;
+}
+
+canvas:active {
+  cursor: grabbing;
+  cursor: -moz-grabbing;
+  cursor: -webkit-grabbing;
+}
+
+.copy {
+  position: absolute;
+  bottom: 0;
+  right: 0;
+  width: 100%;
+
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  color: black;
+  pointer-events: none;
+}
+
+.copy svg {
+  width: 32px;
+  fill: black;
+}
+
+.copy > * {
+  padding: 32px;
+  padding-bottom: 64px;
+}
+
+a {
+  font-style: italic;
+  color: #3370ff;
+  font-weight: bold;
+  text-decoration: none;
+  pointer-events: all;
+}
+
+/* .copy span a svg {
+  margin-right: 16px;
+} */

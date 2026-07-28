@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Elderwood — AAA Forest Showcase</title>
+    <style>
+      :root { color-scheme: dark; }
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      html, body { width: 100%; height: 100%; overflow: hidden; background: #05070a; }
+      #app { position: fixed; inset: 0; }
+      canvas { display: block; }
+      #boot {
+        position: fixed; inset: 0; display: grid; place-content: center;
+        font: 500 14px/1.5 system-ui, sans-serif; color: #9fb3c8;
+        letter-spacing: 0.08em; text-transform: uppercase; z-index: 10;
+        transition: opacity 0.8s ease;
+      }
+      #boot.hidden { opacity: 0; pointer-events: none; }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <div id="boot">Summoning the Elderwood…</div>
+    <script type="module" src="/src/app/main.ts"></script>
+  </body>
+</html>

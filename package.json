@@ -1,0 +1,32 @@
+{
+  "name": "skyrim-forest-showcase",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "AAA forest showcase — render pipeline based on jure/webgiya surfel GI",
+  "scripts": {
+    "dev": "vite",
+    "dev:legacy": "vite --config vite.legacy.config.ts",
+    "build": "vite build",
+    "preview": "vite preview --port 5188",
+    "shot": "node scripts/capture-chrome.mjs",
+    "shot:legacy": "node scripts/capture.mjs"
+  },
+  "dependencies": {
+    "@dgreenheck/ez-tree": "^1.1.0",
+    "lil-gui": "^0.20.0",
+    "n8ao": "^1.10.2",
+    "postprocessing": "^6.37.8",
+    "simplex-noise": "^4.0.3",
+    "stats.js": "^0.17.0",
+    "three": "^0.182.0",
+    "three-mesh-bvh": "^0.9.2"
+  },
+  "devDependencies": {
+    "@types/stats.js": "^0.17.4",
+    "@types/three": "^0.182.0",
+    "playwright": "^1.55.0",
+    "typescript": "^5.8.3",
+    "vite": "^6.0.0"
+  }
+}

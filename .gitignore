@@ -1,0 +1,17 @@
+node_modules/
+dist/
+dist-*/
+.vite/
+*.log
+scripts/_dev.log
+
+# heavy / regenerable
+shots/
+
+# external reference clones (public repos, not our code)
+references/spiri0-clouds/
+references/TheLongSilence/
+references/*.zip
+
+# vendored donor repo keeps its own history
+vendor/webgiya/

@@ -1,0 +1,39 @@
+{
+  "name": "r3f-fairly-realistic-grass",
+  "version": "1.0.0",
+  "description": "",
+  "keywords": [],
+  "main": "src/index.js",
+  "dependencies": {
+    "@gsimone/suzanne": "0.0.12",
+    "@pmndrs/branding": "0.0.8",
+    "@react-three/drei": "9.115.0",
+    "@react-three/fiber": "8.17.10",
+    "@react-three/postprocessing": "2.16.3",
+    "gl-noise": "1.6.1",
+    "lamina": "^1.1.8",
+    "leva": "^0.9.23",
+    "perlin.js": "^1.0.0",
+    "postprocessing": "6.36.4",
+    "react": "18.0.0",
+    "react-dom": "18.0.0",
+    "react-icons": "4.3.1",
+    "react-scripts": "5.0.0",
+    "three": "0.170.0",
+    "three-custom-shader-material": "6.1.1",
+    "three-noise": "1.1.2"
+  },
+  "devDependencies": {},
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build",
+    "test": "react-scripts test --env=jsdom",
+    "eject": "react-scripts eject"
+  },
+  "browserslist": [
+    ">0.2%",
+    "not dead",
+    "not ie <= 11",
+    "not op_mini all"
+  ]
+}
