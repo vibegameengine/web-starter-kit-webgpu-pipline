@@ -3,14 +3,14 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "AAA forest showcase — render pipeline based on jure/webgiya surfel GI",
+  "description": "AAA showcase — UE-shaped WebGPU frame graph with static/dynamic shadow and light split",
   "scripts": {
     "dev": "vite",
-    "dev:legacy": "vite --config vite.legacy.config.ts",
+    "dev:gi": "vite --config vite.webgiya.config.ts",
     "build": "vite build",
+    "typecheck": "tsc --noEmit",
     "preview": "vite preview --port 5188",
-    "shot": "node scripts/capture-chrome.mjs",
-    "shot:legacy": "node scripts/capture.mjs"
+    "shot": "node scripts/capture-chrome.mjs"
   },
   "dependencies": {
     "@dgreenheck/ez-tree": "^1.1.0",

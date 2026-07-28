@@ -118,11 +118,57 @@ const probe = await page.evaluate(async () => {
   };
 });
 
+// Optional: open the three.js Inspector and select a tab, so the pass viewer
+// (GBuffer / SSGI / shadow layers) can be verified without a human clicking.
+let inspectorState = null;
+if (has('inspector')) {
+  const tab = flag('tab', 'Viewer');
+
+  const opened = await page.evaluate(() => {
+    const toggle = document.querySelector('#profiler-toggle');
+    if (!toggle) return false;
+    toggle.click();
+    return true;
+  });
+
+  if (opened) {
+    await page.waitForTimeout(400);
+    // A real user click — the tab strip ignores synthetic .click() dispatches.
+    await page
+      .getByRole('button', { name: tab, exact: true })
+      .first()
+      .click({ timeout: 5000 })
+      .catch((e) => console.log(`  ! tab "${tab}" click failed: ${e.message.split('\n')[0]}`));
+    await page.waitForTimeout(600);
+
+    // Expand every collapsed group so all registered buffers are visible.
+    await page.evaluate(() => {
+      document
+        .querySelectorAll('.item-row:not(.open) .item-toggler')
+        .forEach((el) => el.click());
+    });
+    await page.waitForTimeout(1000);
+
+    inspectorState = await page.evaluate(() => {
+      const active =
+        document.querySelector('.profiler-content.active') ??
+        document.querySelector('.profiler-content-wrapper');
+      const tabs = Array.from(document.querySelectorAll('.tab-btn'))
+        .map((b) => (b.textContent || '').trim())
+        .filter((t) => t.length > 0 && t.length < 24);
+      return { opened: true, tabs, text: (active?.innerText ?? '').slice(0, 2500) };
+    });
+  } else {
+    inspectorState = { opened: false, tabs: [], text: '' };
+  }
+  await page.waitForTimeout(600);
+}
+
 await page.addStyleTag({
   content: '#stats,#boot,.lil-gui{opacity:0.85}',
 }).catch(() => {});
 
-await page.screenshot({ path: out, type: 'png' });
+await page.screenshot({ path: out, type: 'png', fullPage: false });
 
 // pixel stats
 const stats = await page.evaluate(async () => {
@@ -134,6 +180,17 @@ const buf = await page.screenshot({ type: 'png' });
 // quick luminance via evaluate drawing is heavy; use simple file log
 console.log(`✓ saved ${out}`);
 console.log(`  probe: ${JSON.stringify(probe)}`);
+if (inspectorState) {
+  console.log(`  inspector: ${JSON.stringify({ opened: inspectorState.opened, tabs: inspectorState.tabs })}`);
+  if (inspectorState.text) {
+    console.log('  viewer entries:');
+    inspectorState.text
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .forEach((l) => console.log('   |', l));
+  }
+}
 console.log(`  wait-state: ${JSON.stringify(state)}`);
 if (warnings.length) {
   console.log(`  warnings (${warnings.length}):`);

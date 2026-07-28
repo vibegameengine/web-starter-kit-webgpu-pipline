@@ -191,6 +191,28 @@ Every cache stores the version it was built at. That is the whole invalidation s
 direct copy of UE's model — including its most important property: **a camera move invalidates
 nothing.**
 
+## 3.0b Pass Inspector is a hard requirement, not a nice-to-have
+
+Reference: three's own [SSGI Ball Pool example](https://threejs.org/examples/#webgpu_postprocessing_ssgi_ballpool)
+exposes `SSGI.AO`, `SSGI.GI` and `Point Light Shadow / Depth` in the Inspector's Viewer tab via
+`.toInspector( name )`. We adopt the same thing, for **every** pass. This is the Prime Law
+("a feature does not exist until it has been seen") turned into tooling — instead of guessing why an
+image is wrong, we look at the buffer.
+
+`renderer.inspector = new Inspector()` (already how webgiya does it), then every intermediate node
+gets a name. Required entries from Phase 0 onward:
+
+```
+GBuffer / Depth          GBuffer / Normal        GBuffer / Albedo       GBuffer / Velocity
+Shadow / Static          Shadow / Dynamic        Shadow / Combined      Shadow / Cascade ID
+SSGI / AO                SSGI / GI
+GI / VolumeSample        GI / Composed
+Fog / Froxel             Sky / AerialLUT
+HDR / Beauty             Post / Bloom            Post / Final
+```
+
+`.toInspector()` is WebGPU-only (`InspectorNode.js:99` warns otherwise) — fine, we are WebGPU.
+
 ## 3.1 Shadows: `CachedCascadeShadowNode extends ShadowBaseNode`
 
 Our VSM-equivalent, minus virtual paging (we don't need 40 km).
@@ -246,16 +268,28 @@ Epic ships exactly that.
 
 ## 3.3 GI compose
 
+Screen traces come from three's **`SSGINode`** — we do not write our own. Its output packs both
+terms in one target: **`vec4( GI.rgb, AO.a )`** (`SSGINode.js:602`), which is exactly the pair we
+need and saves us a separate GTAO pass in the near field.
+
+Knobs (uniforms, all live-tweakable): `sliceCount` (1), `stepCount` (12), `aoIntensity` (1),
+`giIntensity` (10), `expFactor` (2), `thickness` (1), `backfaceLighting` (0),
+`useScreenSpaceSampling`.
+
 ```
-indirect = screenTrace                       // SSGI half-res + temporal — near field, dynamic
-         + sampleIrradianceVolume(P, N)      // far field, static, O(1) — NOT rebuilt here
-         + dynamicProbes                     // movable lights, capped
-indirect *= aoMultiBounce(GTAO bent normal)
+st = ssgi( hdrColor, depth, normal, camera )   // near field, dynamic, per frame, half-res
+
+indirect = st.rgb                              // screen-traced bounce
+         + sampleIrradianceVolume(P, N)        // far field, static cache, O(1) — NOT rebuilt here
+         + dynamicProbes                       // movable lights, capped
+indirect *= st.a                               // AO from the same pass
 
 hdr = direct + indirect * albedo + volumetric + emissive
 ```
 
-`sampleIrradianceVolume` **never** triggers a rebuild. Rebuild is a separate budgeted job.
+This mirrors Lumen's ordering exactly: **screen traces first, world cache as the fallback for what
+the screen cannot see.** `sampleIrradianceVolume` **never** triggers a rebuild — rebuild is a
+separate budgeted job (3.2).
 
 ## 3.4 Composing order (the pass graph)
 
