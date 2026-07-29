@@ -198,6 +198,13 @@ export function createScreenProbePass(grid: SurfelHashGrid, pool: SurfelPool) {
   const U_ENV_LOD = uniform(4);
   const U_NEAR_FIELD = uniform(2.5);
   const U_TEMPORAL = uniform(0.12);
+  /**
+   * Ceiling on the accumulated-frame count in `probeRadiance.w`, and the switch that
+   * gives that field its meaning: 0 is the shipping 0/1 valid flag and the fixed-alpha
+   * blend, anything else is the running average. One uniform for both because the two
+   * are the same decision — see `probeSettings.temporalAge`.
+   */
+  const U_AGE_MAX = uniform(0);
   const U_PLANE_EPS = uniform(0.06);
   const U_NORMAL_THRESHOLD = uniform(0.75);
   const U_ADAPTIVE = uniform(1);
@@ -744,6 +751,7 @@ export function createScreenProbePass(grid: SurfelHashGrid, pool: SurfelPool) {
         dynBounds: vec4f,
         traceStride: u32,
         reprojFlipY: f32,
+        ageMax: f32,
       ) -> void {
         let tid = instanceIndex;
         let probeIdx = tid / PROBE_TEXELS;
@@ -767,7 +775,12 @@ export function createScreenProbePass(grid: SurfelHashGrid, pool: SurfelPool) {
         // same way, this texel's history is that probe's same texel -- the basis is
         // a deterministic function of the normal, so agreeing normals mean agreeing
         // directions.
+        // hist.w carries whichever of two meanings ageMax selects: zero keeps the
+        // shipping 0/1 valid flag, anything else makes it a count of frames already
+        // folded into hist.xyz. conf is the reprojection test's answer, likewise
+        // either 0/1 or a weight -- see the accept branch below.
         var hist = vec4f(0.0);
+        var conf = 0.0;
         if (historyValid > 0.5) {
           let clip = prevViewProj * vec4f(P, 1.0);
           if (clip.w > 1e-6) {
@@ -793,7 +806,22 @@ export function createScreenProbePass(grid: SurfelHashGrid, pool: SurfelPool) {
                 let pp = probes.value[pIdx + probePrev];
                 if (pp.pos.w > 0.5) {
                   let pn = normalize(pp.normal.xyz);
-                  if (dot(pn, N) > 0.9 && abs(dot(P - pp.pos.xyz, pn)) < planeEps) {
+                  let nd = dot(pn, N);
+                  let offPlane = abs(dot(P - pp.pos.xyz, pn));
+                  if (ageMax > 0.5) {
+                    // The same two quantities, read as a weight instead of a verdict.
+                    //
+                    // The thresholds are unchanged -- confidence still reaches zero at
+                    // exactly the cosine and the plane distance the hard test rejected
+                    // at -- so nothing that used to be accepted is now refused and
+                    // nothing refused is now accepted. What changes is the middle: a
+                    // probe on a surface that is *moving through* the tolerance, which
+                    // on a mover is most of them, keeps a fraction of its accumulated
+                    // history rather than being handed a cliff to fall off.
+                    conf = smoothstep(0.9, 1.0, nd) * (1.0 - smoothstep(0.0, planeEps, offPlane));
+                    hist = probeRadiance.value[pIdx * PROBE_TEXELS + texel + radPrev];
+                  } else if (nd > 0.9 && offPlane < planeEps) {
+                    conf = 1.0;
                     hist = probeRadiance.value[pIdx * PROBE_TEXELS + texel + radPrev];
                   }
                 }
@@ -813,8 +841,14 @@ export function createScreenProbePass(grid: SurfelHashGrid, pool: SurfelPool) {
         // A texel with no history is traced regardless, so a camera cut or a
         // disocclusion is filled immediately rather than a stride later.
         let doTrace = (texel % traceStride) == (frame % traceStride);
-        if (!doTrace && hist.w > 0.5) {
-          probeRadiance.value[outIdx] = hist;
+        // Confidence scales the accumulated count rather than gating it. Under the
+        // flag semantics the two are the same number -- hist.w is 1 exactly when
+        // conf is 1, and 0 otherwise -- so the 0.5 test still reads as "has history"
+        // either way, and a texel whose history is only half trusted carries half a
+        // window forward instead of the whole thing or none of it.
+        let ageIn = select(hist.w, min(hist.w * conf, ageMax), ageMax > 0.5);
+        if (!doTrace && ageIn > 0.5) {
+          probeRadiance.value[outIdx] = select(hist, vec4f(hist.xyz, ageIn), ageMax > 0.5);
           return;
         }
 
@@ -878,7 +912,17 @@ export function createScreenProbePass(grid: SurfelHashGrid, pool: SurfelPool) {
         }
 
         var outVal = vec4f(Li, 1.0);
-        if (hist.w > 0.5 && temporalAlpha < 1.0) {
+        if (ageMax > 0.5) {
+          // A running average with a floor under it. 1/(n+1) is the weight that makes
+          // n+1 samples their own mean, so the first sample after a disocclusion is
+          // taken whole, the second at a half, the third at a third -- instead of the
+          // shipping pair of a raw sample at full strength followed by a 6%
+          // correction, which is the step the flicker measurement sees. temporalAlpha
+          // is the floor: once the count saturates the window stops growing, so
+          // genuine change is still tracked rather than averaged away.
+          let a = select(1.0, max(temporalAlpha, 1.0 / (ageIn + 1.0)), ageIn > 0.0);
+          outVal = vec4f(mix(hist.xyz, Li, clamp(a, 0.0, 1.0)), min(ageIn + 1.0, ageMax));
+        } else if (hist.w > 0.5 && temporalAlpha < 1.0) {
           outVal = vec4f(mix(hist.xyz, Li, temporalAlpha), 1.0);
         }
 
@@ -957,6 +1001,7 @@ export function createScreenProbePass(grid: SurfelHashGrid, pool: SurfelPool) {
       dynBounds: dynBvh.influence,
       traceStride: U_TRACE_STRIDE,
       reprojFlipY: U_REPROJ_FLIP,
+      ageMax: U_AGE_MAX,
     })
       .compute(maxProbes * PROBE_TEXELS)
       .setName('Probe trace');
@@ -1452,6 +1497,11 @@ export function createScreenProbePass(grid: SurfelHashGrid, pool: SurfelPool) {
 
     U_NEAR_FIELD.value = probeSettings.nearField;
     U_TEMPORAL.value = probeSettings.temporalAlpha;
+    // Zero is the ablation, and it is the default: the kernel's `ageMax > 0.5` branches
+    // collapse to the arithmetic that shipped, down to `hist.w` staying a flag.
+    U_AGE_MAX.value = probeSettings.temporalAge
+      ? Math.max(1, probeSettings.temporalAgeMax)
+      : 0;
     U_PLANE_EPS.value = probeSettings.planeEpsilon;
     U_NORMAL_THRESHOLD.value = probeSettings.normalThreshold;
     U_ADAPTIVE.value = probeSettings.adaptive ? 1 : 0;
