@@ -66,6 +66,98 @@ function knobs(): {
   };
 }
 
+/** sRGB byte -> linear reflectance. */
+function srgbToLinear(v: number): number {
+  const c = v / 255;
+  return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+}
+
+/** Linear reflectance -> sRGB byte. */
+function linearToSrgb(v: number): number {
+  const c = v <= 0.0031308 ? v * 12.92 : 1.055 * Math.pow(v, 1 / 2.4) - 0.055;
+  return Math.max(0, Math.min(255, Math.round(c * 255)));
+}
+
+/**
+ * Puts a scanned "Color" map into a physically valid albedo range.
+ *
+ * An ambientCG `*_Color.jpg` is a *photograph*, not a reflectance measurement: it is
+ * captured under an unknown exposure and it still carries the ambient occlusion of the
+ * capture rig. `Rock030_2K-JPG_Color.jpg` averages linear 0.076 (sRGB 79) — below coal.
+ * Fed to a standard material as-is it is already too dark, and multiplying a tint over
+ * it darkens it a second time; see the note on the boulder material in
+ * `entities/rocks/rocks.ts`.
+ *
+ * The level is the one part of a photographic albedo that carries no information, so it
+ * is the one part that may be replaced. Every pixel is scaled in *linear* space by a
+ * single constant chosen to land the map's mean on `targetLinear`, which preserves the
+ * texture's spatial detail and its hue variation exactly and changes only the absolute
+ * reflectance. Dry rock and concrete sit at linear 0.13–0.30 (sRGB 100–150); nothing
+ * natural is below ~0.03 or above ~0.9, which is the range this exists to restore.
+ *
+ * Done on the texture rather than in `material.color`, deliberately: the ray tracer's
+ * diffuse array (`shared/gi/surfel/diffuseArray.ts`) bakes `material.color × map` into
+ * an 8-bit sRGB array, so a tint above 1 would clamp there and the tracer would bounce
+ * a different albedo than the raster shows.
+ */
+function normaliseAlbedoRange(
+  source: THREE.Texture,
+  targetLinear: number,
+  label: string,
+): THREE.Texture {
+  const image = source.image as CanvasImageSource & { width: number; height: number };
+  const width = image.width;
+  const height = image.height;
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) return source;
+  ctx.drawImage(image, 0, 0);
+  const pixels = ctx.getImageData(0, 0, width, height);
+  const data = pixels.data;
+
+  const decode = new Float32Array(256);
+  for (let i = 0; i < 256; i++) decode[i] = srgbToLinear(i);
+
+  let sum = 0;
+  for (let i = 0; i < data.length; i += 4) {
+    sum += decode[data[i]] + decode[data[i + 1]] + decode[data[i + 2]];
+  }
+  const mean = sum / (data.length / 4) / 3;
+  if (!(mean > 0)) return source;
+
+  const gain = targetLinear / mean;
+  // One 256-entry LUT instead of two transfer-function evaluations per channel per
+  // texel: 2048² is 12.6 M channel conversions and pow() is not free.
+  const lut = new Uint8Array(256);
+  for (let i = 0; i < 256; i++) lut[i] = linearToSrgb(decode[i] * gain);
+
+  let clipped = 0;
+  for (let i = 0; i < data.length; i += 4) {
+    if (decode[data[i]] * gain > 1) clipped++;
+    data[i] = lut[data[i]];
+    data[i + 1] = lut[data[i + 1]];
+    data[i + 2] = lut[data[i + 2]];
+  }
+  ctx.putImageData(pixels, 0, 0);
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = source.colorSpace;
+  texture.wrapS = source.wrapS;
+  texture.wrapT = source.wrapT;
+  texture.anisotropy = source.anisotropy;
+  texture.name = `${label}_albedo`;
+  source.dispose();
+
+  console.log(
+    `[albedo] ${label}: mean ${mean.toFixed(4)} -> ${targetLinear.toFixed(3)} linear ` +
+      `(gain ${gain.toFixed(2)}, ${((100 * clipped) / (data.length / 4)).toFixed(2)}% ` +
+      'of red samples clipped)',
+  );
+  return texture;
+}
+
 async function loadColorMap(url: string): Promise<THREE.Texture | null> {
   try {
     const texture = await new THREE.TextureLoader().loadAsync(url);
@@ -119,10 +211,14 @@ export async function populateLargeScene(
 ): Promise<LargeSceneContents> {
   const cfg = knobs();
 
-  const [groundMap, rockMap] = await Promise.all([
+  const [groundMap, rawRockMap] = await Promise.all([
     loadColorMap(`${baseUrl}textures/grass/Grass004_2K-JPG_Color.jpg`),
     loadColorMap(`${baseUrl}textures/rock/Rock030_2K-JPG_Color.jpg`),
   ]);
+  // 0.18 linear: the middle of the dry-rock band, and what "light grey boulder" means
+  // as a reflectance rather than as a hex code. The ground map is deliberately left
+  // alone — it is the control this defect was measured against.
+  const rockMap = rawRockMap ? normaliseAlbedoRange(rawRockMap, 0.18, 'rock') : null;
   // One shared texture object carrying the repeat, so the per-chunk materials differ
   // only in tint. That is the honest arrangement: it is the *material count* the
   // diffuse array charges for, not the texture count, and this makes the distinction
