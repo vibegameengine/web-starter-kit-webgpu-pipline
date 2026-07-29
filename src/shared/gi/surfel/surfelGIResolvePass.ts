@@ -54,9 +54,6 @@ import {
   U_OCCLUSION_PARAMS,
 } from './surfelRadialDepth';
 import { radiusBasedEpsilon } from './surfelIntegratePass';
-import { createScreenProbePass } from '../probe/screenProbePass.ts';
-import { probeSettings, probeTextures } from '../probe/settings.ts';
-import { createReflectPass } from '../reflect/reflectPass.ts';
 
 // @ts-ignore Fn is mistyped
 export const resolveIrradiance = Fn(
@@ -138,25 +135,12 @@ export const resolveIrradiance = Fn(
 );
 
 /**
- * LOCAL CHANGE vs upstream: this factory now owns two final gathers, not one.
+ * Upstream's final gather, unaltered: hash the pixel into one grid cell, average the
+ * surfels it holds, emit black when it holds none.
  *
- * Upstream's is below and unaltered — hash the pixel into one grid cell, average
- * the surfels it holds, emit black when it holds none. That last clause is the
- * whole problem: an empty cell produced `vec3(0)` with alpha 1, which is a hard
- * cell-shaped patch rather than a falloff, and no amount of loosening the
- * visibility gate fixes it because the cell really is empty. Surfels are spawned
- * from a G-Buffer and a concave corner is never in one.
- *
- * The answer is Lumen's, and it is a tier rather than a tweak: screen probes,
- * placed in screen space (so coverage holes cannot exist), tracing the near field
- * for real (so contact-scale shadowing exists at all) and falling back to the
- * surfel cache beyond a short-ray budget (so the cache is used as what it is, a
- * world-space radiance cache). It lives in `gi/probe/` and is constructed here
- * because this is the one place in the pipeline handed both the hash grid and the
- * pool it needs to read.
- *
- * Both write RGBA16F at full screen resolution and `getOutputTexture()` names
- * whichever is active, so the composite in `render/frameGraph.ts` is unchanged.
+ * The screen-probe and reflection tiers that used to be constructed here are gone —
+ * they were an answer to this pass's coverage holes, and the build has moved to baking
+ * the statics into a lightmap instead. What remains is the reference gather.
  */
 export function createSurfelGIResolvePass(
   grid: SurfelHashGrid,
@@ -166,20 +150,18 @@ export function createSurfelGIResolvePass(
   let outputTexture: THREE.Texture | null = null;
   let activeTexture: THREE.Texture | null = null;
 
-  const probes = createScreenProbePass(grid, pool);
-  // Constructed here for the same reason the probes are: this factory is the one place
-  // in the pipeline handed both the hash grid and the surfel pool, and the specular
-  // gather reads the cache exactly as the diffuse one does. It does not write into
-  // `activeTexture` — reflections are a separate term in the composite, not a different
-  // opinion about the same one — so nothing below this line branches on it.
-  const reflections = createReflectPass(grid, pool);
-
   // Uniforms
   const U_PROJ_INV = uniform(new THREE.Matrix4());
   const U_CAM_WORLD = uniform(new THREE.Matrix4());
   const U_CAM_POS = uniform(new THREE.Vector3());
   const U_RESOLVE_OFFSET = uniform(0);
   const U_FRAME = uniform(0);
+  /**
+   * 1 while the lightmap owns the statics, so the gather drops pinned atlas surfels.
+   * Set per frame from `giKnobs.dynamicSurfels()`; 0 is upstream's behaviour, in which
+   * every surfel in the cell counts and there are no pinned ones to worry about.
+   */
+  const U_SKIP_PINNED = uniform(0);
 
   const U_GRID_ORIGIN = uniform(new THREE.Vector3());
 
@@ -203,7 +185,6 @@ export function createSurfelGIResolvePass(
       outputTexture.type = THREE.HalfFloatType;
       // @ts-ignore
       outputTexture.format = THREE.RGBAFormat;
-      probeTextures.legacy = outputTexture;
       computeNode = null; // Rebuild compute graph on resize
     }
   }
@@ -213,23 +194,6 @@ export function createSurfelGIResolvePass(
     camera: THREE.PerspectiveCamera,
     gbuffer: { target: THREE.RenderTarget },
   ) {
-    const probeRan = probeSettings.enabled
-      ? probes.run(renderer, camera, gbuffer)
-      : false;
-
-    // Before the early return below, deliberately: reflections are orthogonal to which
-    // diffuse gather won. They are also independent of the probes entirely — `?probes=0`
-    // must still get a mirror — so this is not nested inside that branch.
-    reflections.run(renderer, camera, gbuffer);
-
-    // The legacy gather still runs when the probes are off, and when a split pane
-    // is pointed at it so the two can be judged against each other in one frame.
-    // Nothing else keeps it alive: it is the reference, not a fallback.
-    if (probeRan && !probeSettings.compare) {
-      activeTexture = probes.getOutputTexture();
-      return;
-    }
-
     const width = gbuffer.target.width;
     const height = gbuffer.target.height;
     resize(width, height);
@@ -241,6 +205,7 @@ export function createSurfelGIResolvePass(
     U_CAM_WORLD.value.copy(camera.matrixWorld);
     U_CAM_POS.value.copy(camera.position);
     U_FRAME.value = renderer.info.frame;
+    U_SKIP_PINNED.value = giKnobs.dynamicSurfels() ? 1 : 0;
     const { writeOffset } = pool.getOffsets();
     U_RESOLVE_OFFSET.value = writeOffset; // Because we want the fresh values
 
@@ -358,9 +323,27 @@ export function createSurfelGIResolvePass(
             const sid = offsetsAndList.element(
               int(OFFSETS_AND_LIST_START).add(start).add(i),
             );
+            // Pinned surfels are skipped when the lightmap owns the statics.
+            //
+            // `?dynsurfel=1` pins the atlas into the pool and keeps the lifecycle alive
+            // for movers, so the grid then holds two populations that mean different
+            // things: atlas texels, whose radiance is *already* in the baked lightmap the
+            // material samples, and live surfels on Movable geometry, which nothing else
+            // lights. Summing both double-counts the statics — and worse, the atlas
+            // entries sit at lightmap texel centres rather than where a screen pixel
+            // hashes, so the gather over them comes back as holes: the black patches
+            // across the ceiling, walls and floor in the `?split=gi` pane. Dropping them
+            // here leaves the statics to the lightmap and the movers to the cache, which
+            // is the split the whole mode exists for.
+            const notPinned = U_SKIP_PINNED.lessThan(0.5).or(
+              surfels.element(sid).get('age').greaterThanEqual(int(0)),
+            );
             // Basic bounds check
             If(
-              sid.greaterThanEqual(int(0)).and(sid.lessThan(int(capacity))),
+              sid
+                .greaterThanEqual(int(0))
+                .and(sid.lessThan(int(capacity)))
+                .and(notPinned),
               () => {
                 // @ts-ignore Fn is mistyped
                 const irr = resolveIrradiance({
@@ -451,19 +434,12 @@ export function createSurfelGIResolvePass(
 
     renderer.compute(computeNode);
 
-    activeTexture = probeRan ? probes.getOutputTexture() : outputTexture;
+    activeTexture = outputTexture;
   }
 
   return {
     run,
     getOutputTexture: () => activeTexture ?? outputTexture,
-    /** Upstream's gather, kept addressable so a split pane can show it. */
     getLegacyTexture: () => outputTexture,
-    getProbeDebugTexture: () => probes.getDebugTexture(),
-    getReflectTexture: () => reflections.getOutputTexture(),
-    invalidateProbeHistory: () => {
-      probes.invalidate();
-      reflections.invalidate();
-    },
   };
 }
