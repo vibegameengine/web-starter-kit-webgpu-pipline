@@ -4,7 +4,7 @@ import { Layer } from '../world/index.ts';
 import { createSurfelImmortaliser } from './immortalise.ts';
 import { createCacheAtlas } from './cacheAtlas.ts';
 
-import { MAX_SURFELS } from './surfel/constants.ts';
+import { MAX_SURFELS, SURFEL_TTL } from './surfel/constants.ts';
 import { createGBuffer } from './surfel/gbuffer.ts';
 import { createSceneBVH, type SceneBVHBundle } from './surfel/sceneBvh.ts';
 import { createSurfelPool } from './surfel/surfelPool.ts';
@@ -359,6 +359,40 @@ export class SurfelGI {
 
   setBaseSampleCount(count: number): void {
     this.integrate?.setBaseSampleCount(count);
+  }
+
+  /**
+   * Reads the surfel buffer back off the GPU and counts what is actually in it.
+   *
+   * This is the only way to answer "is there a cache, or is it being rebuilt every
+   * frame" with a number instead of an opinion. Stride is 8 floats per surfel
+   * (posb.xyzw, normal.xyz, age); age occupies the last slot as raw int bits.
+   */
+  async readSurfelStats(renderer: THREE.WebGPURenderer): Promise<{
+    capacity: number;
+    alive: number;
+    pinned: number;
+    live: number;
+    recycled: number;
+  } | null> {
+    const attr = this.pool.getSurfelAttr();
+    if (!attr) return null;
+
+    const buffer = await renderer.getArrayBufferAsync(attr as unknown as THREE.BufferAttribute);
+    const ints = new Int32Array(buffer);
+    const stride = 8;
+    const capacity = Math.floor(ints.length / stride);
+
+    let pinned = 0;
+    let live = 0;
+    let recycled = 0;
+    for (let i = 0; i < capacity; i++) {
+      const age = ints[i * stride + 7];
+      if (age < 0) pinned++;
+      else if (age < SURFEL_TTL) live++;
+      else recycled++;
+    }
+    return { capacity, alive: pinned + live, pinned, live, recycled };
   }
 
   /** Ray count to fall back to after a bake. */

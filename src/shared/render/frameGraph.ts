@@ -43,6 +43,8 @@ export const SplitView = {
   Normal: 'normal',
   /** The baked cache itself, laid out as a 2D atlas — one texel per surfel. */
   Cache: 'cache',
+  /** The baked lightmap texture, shown flat. */
+  Lightmap: 'lightmap',
 } as const;
 export type SplitView = (typeof SplitView)[keyof typeof SplitView];
 
@@ -81,6 +83,7 @@ export class FrameGraph {
   private splitView: SplitView = SplitView.Off;
   /** Supplied by the app once the GI cache exists; see gi/cacheAtlas.ts. */
   private cacheAtlasNode: ((uv: unknown) => unknown) | null = null;
+  private lightmapTexture: THREE.Texture | null = null;
 
   private readonly color: TslNode;
   private readonly taps: Array<{ name: string; node: TslNode }> = [];
@@ -149,6 +152,13 @@ export class FrameGraph {
   setGiMode(mode: GiMode): void {
     if (mode === this.giMode) return;
     this.giMode = mode;
+    this.needsComposite = true;
+  }
+
+  /** The baked lightmap, for the split view's `lightmap` pane. */
+  setLightmapTexture(tex: THREE.Texture | null): void {
+    if (tex === this.lightmapTexture) return;
+    this.lightmapTexture = tex;
     this.needsComposite = true;
   }
 
@@ -247,6 +257,16 @@ export class FrameGraph {
           this.scenePass.getTextureNode('normal').rgb.mul(0.5).add(0.5),
           1,
         );
+        break;
+      case SplitView.Lightmap:
+        if (this.lightmapTexture) {
+          // Remap the pane to a full square so the atlas is shown whole.
+          const lmUv = vec2(
+            screenUV.x.sub(this.splitPosition).div(1 - this.splitPosition),
+            screenUV.y.oneMinus(),
+          );
+          right = vec4(texture(this.lightmapTexture, lmUv).rgb, 1);
+        }
         break;
       case SplitView.Cache:
         if (this.cacheAtlasNode) {

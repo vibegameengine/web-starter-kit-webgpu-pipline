@@ -5,6 +5,15 @@ import { CacheStats, WorldState } from '../shared/world/index.ts';
 import { Hud } from '../shared/ui/hud.ts';
 import { SurfelGI } from '../shared/gi/index.ts';
 import {
+  LightmapBaker,
+  applyLightmap,
+  assignLightmapUvs,
+  createBakeBvh,
+  measureCoverage,
+  rasteriseLightmapGBuffer,
+} from '../shared/gi/bake/index.ts';
+import { uniform } from 'three/tsl';
+import {
   createLightControls,
   findSunPositionWeighted,
   setLightAnglesFromEnvMapSunUVLocation,
@@ -103,21 +112,57 @@ async function boot(): Promise<void> {
   // After the BVH: the mover is raster + shadows only, never part of the static world.
   const dynamic: DynamicObject = addDynamicSphere(scene);
 
-  // --- bake the GI cache ----------------------------------------------------
-  // Static geometry only, wall-clock budgeted, then frozen. The mover is excluded
-  // from the bake (Layer.GiStatic) so its lighting is not frozen into the cache;
-  // at runtime it still *receives* GI from the cache and still casts a real-time
-  // shadow onto the static world.
+  // --- bake a real lightmap --------------------------------------------------
+  // UV atlas -> rasterise world position/normal into it -> path-trace every texel
+  // against the static BVH under a wall-clock budget -> sample it at runtime.
+  // Camera plays no part at any stage, which is what separates this from the
+  // surfel cache: the result is a texture, not a residency structure.
   const bakeMs = num('bake') ?? 5000;
+  const lightmapSize = num('lm') ?? 1024;
+  const useLightmap = params.get('mode') !== 'surfel';
   gi.freezeCompletely = params.get('freezeAll') === '1';
+
+  const lightmapIntensity = uniform(1);
+  let baker: LightmapBaker | null = null;
   let baked = false;
 
-  if (bakeMs > 0) {
-    setLoading(`Baking GI (${(bakeMs / 1000).toFixed(0)}s)`);
+  if (useLightmap && bakeMs > 0) {
+    setLoading('Unwrapping lightmap UVs');
+    assignLightmapUvs(scene);
+
+    setLoading('Building bake BVH');
+    const bakeBvh = createBakeBvh(scene);
+
+    setLoading('Rasterising lightmap G-Buffer');
+    const lightmapGBuffer = rasteriseLightmapGBuffer(renderer, scene, lightmapSize);
+
+    const coverage = await measureCoverage(renderer, lightmapGBuffer, lightmapSize);
+    console.log(
+      `[lightmap] atlas coverage ${coverage.covered}/${coverage.total} texels ` +
+        `(${(coverage.fraction * 100).toFixed(1)}%)`,
+    );
+
+    baker = new LightmapBaker(bakeBvh, lightmapGBuffer, lightmapSize);
+    await baker.bake(renderer, sun, bakeMs, (fraction, passes) => {
+      setLoading(
+        `Baking lightmap ${(fraction * 100).toFixed(0)}% · ${passes} passes · ${lightmapSize}px`,
+      );
+    });
+
+    const lmStats = await baker.readStats(renderer);
+    console.log(
+      `[lightmap] traced ${lmStats.traced}/${lmStats.total} texels, ` +
+        `mean luma ${lmStats.meanLuma.toFixed(4)}, max ${lmStats.maxLuma.toFixed(3)}`,
+    );
+
+    applyLightmap(scene, baker.lightmap, lightmapIntensity);
+    baked = true;
+  } else if (bakeMs > 0) {
+    setLoading(`Warming surfel cache (${(bakeMs / 1000).toFixed(0)}s)`);
     await gi.bake(renderer, scene, sun, {
       durationMs: bakeMs,
       onProgress: (fraction, frames) => {
-        setLoading(`Baking GI ${(fraction * 100).toFixed(0)}% · ${frames} views`);
+        setLoading(`Warming ${(fraction * 100).toFixed(0)}% · ${frames} views`);
       },
     });
     baked = true;
@@ -132,7 +177,13 @@ async function boot(): Promise<void> {
 
   const hud = showChrome
     ? new Hud(world, stats, () =>
-        !baked ? 'converging' : gi.frozen ? 'baked · fully frozen' : 'baked · movers live',
+        !baked
+          ? 'converging'
+          : useLightmap
+            ? `lightmap ${lightmapSize}px · ${baker?.passCount ?? 0} passes`
+            : gi.frozen
+              ? 'surfel · fully frozen'
+              : 'surfel · movers live',
       )
     : null;
 
@@ -166,6 +217,7 @@ async function boot(): Promise<void> {
 
   const atlas = gi.getCacheAtlas();
   frameGraph.setCacheAtlasNode(atlas?.node ?? null);
+  frameGraph.setLightmapTexture(baker?.lightmap ?? null);
 
   const splitParams = {
     right: (params.get('split') as SplitView) ?? SplitView.Gi,
@@ -287,6 +339,11 @@ async function boot(): Promise<void> {
     frozen = true;
   }
 
+  // Reads the surfel buffer back off the GPU: the only way to tell a real cache
+  // from a per-frame rebuild without guessing.
+  (window as unknown as Record<string, unknown>).__surfels = () =>
+    gi.readSurfelStats(renderer);
+
   let previous = performance.now();
   let firstFrame = true;
 
@@ -303,8 +360,12 @@ async function boot(): Promise<void> {
     camera.updateMatrixWorld();
     if (!frozen) dynamic.update(now * 0.001);
 
-    gi.update(renderer, scene, camera, sun);
-    frameGraph.setGiTextures(gi.outputTexture, gi.albedoTexture);
+    // In lightmap mode the statics are lit from the baked texture, so the entire
+    // surfel chain is skipped -- no spawn, no trace, no resolve, nothing per frame.
+    if (!useLightmap) {
+      gi.update(renderer, scene, camera, sun);
+      frameGraph.setGiTextures(gi.outputTexture, gi.albedoTexture);
+    }
 
     scene.background = gi.envTexture;
     frameGraph.render();
