@@ -57,6 +57,23 @@ export interface ProbeSettings {
   /** Blend weight for this frame's trace against the reprojected history. */
   temporalAlpha: number;
   /**
+   * Treat `hist.w` as a count of accumulated frames rather than a 0/1 valid flag,
+   * and let the reprojection test scale that count instead of zeroing it.
+   *
+   * Two things change together, because neither alone is worth much. The blend
+   * weight becomes `max(temporalAlpha, 1/(n+1))`, so a texel that has just been
+   * disoccluded takes its first sample whole, its second at a half, its third at a
+   * third — a running average, rather than one raw sample at full strength followed
+   * by a 6% correction. And the accept test becomes a weight in 0..1 rather than an
+   * `if`, so a probe sitting on the edge of the plane tolerance loses *some* of its
+   * accumulated confidence rather than all of it.
+   *
+   * `?probeAge=1`. See `knobs.ts`.
+   */
+  temporalAge: boolean;
+  /** Ceiling on that count; the longest window the running average may reach. */
+  temporalAgeMax: number;
+  /**
    * One in N of a probe's 64 directions is retraced per frame; the rest carry
    * their reprojected history forward. A texel with no history is always traced,
    * so this costs latency on standing geometry and nothing at all on a cut.
@@ -136,6 +153,8 @@ export const probeSettings: ProbeSettings = {
   // The cost is latency, and it is paid by indirect light alone — the sun and its
   // shadow map are untouched — which is the cheapest place in the frame to pay it.
   temporalAlpha: 0.06,
+  temporalAge: probeKnobs.temporalAge(),
+  temporalAgeMax: probeKnobs.temporalAgeMax(),
   // Stride 2 halves the ray cost against a per-frame trace. It also halves the
   // per-frame delta on its own, because half the texels are carrying history rather
   // than moving; stride 1 measures *worse* for that reason (0.50 against 0.28 on the
