@@ -1,2 +1,7 @@
 export { initRenderer, type RendererBundle } from './renderer.ts';
-export { FrameGraph, GiMode, type FrameGraphOptions } from './frameGraph.ts';
+export {
+  FrameGraph,
+  GiMode,
+  SplitView,
+  type FrameGraphOptions,
+} from './frameGraph.ts';

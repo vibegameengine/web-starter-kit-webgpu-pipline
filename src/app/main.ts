@@ -1,6 +1,6 @@
 import GUI from 'lil-gui';
 
-import { FrameGraph, GiMode, initRenderer } from '../shared/render/index.ts';
+import { FrameGraph, GiMode, SplitView, initRenderer } from '../shared/render/index.ts';
 import { CacheStats, WorldState } from '../shared/world/index.ts';
 import { Hud } from '../shared/ui/hud.ts';
 import { SurfelGI } from '../shared/gi/index.ts';
@@ -127,6 +127,7 @@ async function boot(): Promise<void> {
   const frameGraph = new FrameGraph(renderer, scene, camera, {
     giMode: (params.get('giMode') as GiMode) ?? GiMode.Combined,
     indirectIntensity: num('gi') ?? 1,
+    splitView: (params.get('split') as SplitView) ?? SplitView.Gi,
   });
 
   const hud = showChrome
@@ -162,6 +163,32 @@ async function boot(): Promise<void> {
     .add(giParams, 'baseSamples', 1, 64, 1)
     .name('rays/surfel')
     .onChange((v: number) => gi.setRuntimeSampleCount(v));
+
+  const atlas = gi.getCacheAtlas();
+  frameGraph.setCacheAtlasNode(atlas?.node ?? null);
+
+  const splitParams = {
+    right: (params.get('split') as SplitView) ?? SplitView.Gi,
+    at: frameGraph.splitPosition,
+  };
+  const splitFolder = gui.addFolder('Split view');
+  splitFolder
+    .add(splitParams, 'right', Object.values(SplitView))
+    .name('right pane')
+    .onChange((v: SplitView) => frameGraph.setSplitView(v));
+  if (atlas) {
+    splitFolder
+      .add({ rows: atlas.rows.value as number }, 'rows', 1, atlas.side, 1)
+      .name('cache rows')
+      .onChange((v: number) => {
+        atlas.rows.value = v;
+      });
+  }
+  splitFolder.add(splitParams, 'at', 0, 1, 0.01).name('divider').onChange((v: number) => {
+    frameGraph.splitPosition = v;
+    frameGraph.setSplitView(splitParams.right);
+    frameGraph.forceRebuild();
+  });
 
   const bakeParams = { seconds: bakeMs / 1000, frozen: gi.frozen };
   const bakeFolder = gui.addFolder('GI bake');

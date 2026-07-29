@@ -2,6 +2,7 @@ import * as THREE from 'three/webgpu';
 import { HDRLoader } from 'three/examples/jsm/Addons.js';
 import { Layer } from '../world/index.ts';
 import { createSurfelImmortaliser } from './immortalise.ts';
+import { createCacheAtlas } from './cacheAtlas.ts';
 
 import { MAX_SURFELS } from './surfel/constants.ts';
 import { createGBuffer } from './surfel/gbuffer.ts';
@@ -59,6 +60,7 @@ export class SurfelGI {
   /** Ray count restored after a bake finishes. */
   private runtimeSampleCount = 4;
   private readonly immortaliser = createSurfelImmortaliser();
+  private cacheAtlas: ReturnType<typeof createCacheAtlas> | null = null;
 
   readonly envTexture: THREE.DataTexture;
 
@@ -122,6 +124,19 @@ export class SurfelGI {
   /** The G-Buffer albedo the composite multiplies indirect light by. */
   get albedoTexture(): THREE.Texture {
     return this.gbuffer.target.textures[1];
+  }
+
+  /**
+   * A flat 2D view of the cache itself — one texel per surfel, in pool order.
+   * Null until the scene has been built. See cacheAtlas.ts for why this is an atlas
+   * of a buffer rather than a lightmap.
+   */
+  getCacheAtlas(): ReturnType<typeof createCacheAtlas> | null {
+    if (this.cacheAtlas) return this.cacheAtlas;
+    const momentsAttr = this.pool.getMomentsAttr();
+    if (!momentsAttr) return null;
+    this.cacheAtlas = createCacheAtlas(momentsAttr, MAX_SURFELS);
+    return this.cacheAtlas;
   }
 
   /**
@@ -221,6 +236,11 @@ export class SurfelGI {
 
     this.prevCameraPos.copy(camera.position);
     if (!this._frozen) this.pool.swapMoments();
+
+    // Keep the atlas view pointed at whichever half of the double buffer is current.
+    if (this.cacheAtlas) {
+      this.cacheAtlas.readOffset.value = this.pool.getOffsets().readOffset;
+    }
 
     const output = this.resolve.getOutputTexture();
     const changed = output !== this.lastOutput;

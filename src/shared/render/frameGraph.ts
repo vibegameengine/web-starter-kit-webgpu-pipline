@@ -7,6 +7,7 @@ import {
   pass,
   screenUV,
   texture,
+  vec2,
   uniform,
   vec4,
   velocity,
@@ -26,9 +27,29 @@ export const GiMode = {
 } as const;
 export type GiMode = (typeof GiMode)[keyof typeof GiMode];
 
+/**
+ * Right-hand pane of the split view. Same screen UV as the left, so the two halves
+ * line up pixel for pixel and a buffer can be read against the shading it produced.
+ */
+export const SplitView = {
+  Off: 'off',
+  /** Raw resolve output: the radiance gathered from the surfel cache. */
+  Gi: 'gi',
+  /** That radiance times albedo — the indirect term as it enters the composite. */
+  Indirect: 'indirect',
+  /** Direct lighting alone. */
+  Direct: 'direct',
+  Albedo: 'albedo',
+  Normal: 'normal',
+  /** The baked cache itself, laid out as a 2D atlas — one texel per surfel. */
+  Cache: 'cache',
+} as const;
+export type SplitView = (typeof SplitView)[keyof typeof SplitView];
+
 export interface FrameGraphOptions {
   giMode?: GiMode;
   indirectIntensity?: number;
+  splitView?: SplitView;
   debugTaps?: boolean;
 }
 
@@ -56,6 +77,10 @@ export class FrameGraph {
 
   giMode: GiMode;
   readonly indirectIntensity = uniform(1);
+  splitPosition = 0.5;
+  private splitView: SplitView = SplitView.Off;
+  /** Supplied by the app once the GI cache exists; see gi/cacheAtlas.ts. */
+  private cacheAtlasNode: ((uv: unknown) => unknown) | null = null;
 
   private readonly color: TslNode;
   private readonly taps: Array<{ name: string; node: TslNode }> = [];
@@ -71,9 +96,15 @@ export class FrameGraph {
     camera: THREE.PerspectiveCamera,
     options: FrameGraphOptions = {},
   ) {
-    const { giMode = GiMode.Combined, indirectIntensity = 1, debugTaps = true } = options;
+    const {
+      giMode = GiMode.Combined,
+      indirectIntensity = 1,
+      splitView = SplitView.Off,
+      debugTaps = true,
+    } = options;
     this.giMode = giMode;
     this.indirectIntensity.value = indirectIntensity;
+    this.splitView = splitView;
     this.debugTaps = debugTaps;
 
     this.post = new THREE.PostProcessing(renderer);
@@ -121,6 +152,23 @@ export class FrameGraph {
     this.needsComposite = true;
   }
 
+  /** Hands the frame graph a uv -> colour function that draws the surfel cache. */
+  setCacheAtlasNode(node: ((uv: unknown) => unknown) | null): void {
+    this.cacheAtlasNode = node;
+    this.needsComposite = true;
+  }
+
+  setSplitView(view: SplitView): void {
+    if (view === this.splitView) return;
+    this.splitView = view;
+    this.needsComposite = true;
+  }
+
+  /** Rebuild on the next render — used when a baked-in constant like the divider moves. */
+  forceRebuild(): void {
+    this.needsComposite = true;
+  }
+
   private tap(name: string, displayNode: TslNode): void {
     if (!this.debugTaps) return;
     this.taps.push({ name, node: displayNode });
@@ -139,11 +187,13 @@ export class FrameGraph {
 
   private rebuildComposite(): void {
     let beauty: TslNode = this.color;
+    let giRaw: TslNode | null = null;
+    let indirect: TslNode | null = null;
 
     if (this.giTexture && this.albedoTexture) {
       const albedo = texture(this.albedoTexture, screenUV);
-      const indirect = texture(this.giTexture, screenUV)
-        .toInspector('GI / Surfel')
+      giRaw = texture(this.giTexture, screenUV).toInspector('GI / Surfel');
+      indirect = (giRaw as ReturnType<typeof texture>)
         .mul(albedo)
         .mul(this.indirectIntensity);
 
@@ -160,9 +210,64 @@ export class FrameGraph {
       }
     }
 
-    this.post.outputNode = this.foldTaps(fxaa(beauty) as unknown as TslNode);
+    const composed = this.applySplit(beauty, giRaw, indirect);
+    this.post.outputNode = this.foldTaps(fxaa(composed) as unknown as TslNode);
     this.post.needsUpdate = true;
     this.needsComposite = false;
+  }
+
+  /**
+   * Draws a chosen buffer into the right half of the frame at the same screen UV, so
+   * the shading and the buffer that produced it can be read against each other
+   * without switching modes and losing the comparison.
+   */
+  private applySplit(
+    beauty: TslNode,
+    giRaw: TslNode | null,
+    indirect: TslNode | null,
+  ): TslNode {
+    if (this.splitView === SplitView.Off) return beauty;
+
+    let right: TslNode | null = null;
+    switch (this.splitView) {
+      case SplitView.Gi:
+        right = giRaw;
+        break;
+      case SplitView.Indirect:
+        right = indirect;
+        break;
+      case SplitView.Direct:
+        right = this.color;
+        break;
+      case SplitView.Albedo:
+        right = this.albedoTexture ? texture(this.albedoTexture, screenUV) : null;
+        break;
+      case SplitView.Normal:
+        right = vec4(
+          this.scenePass.getTextureNode('normal').rgb.mul(0.5).add(0.5),
+          1,
+        );
+        break;
+      case SplitView.Cache:
+        if (this.cacheAtlasNode) {
+          // Remap the right pane back to a full 0..1 square so the atlas is shown
+          // whole rather than cropped to whatever aspect the pane happens to be.
+          const local = vec2(
+            screenUV.x.sub(this.splitPosition).div(1 - this.splitPosition),
+            screenUV.y,
+          );
+          right = this.cacheAtlasNode(local) as TslNode;
+        }
+        break;
+    }
+    if (right === null) return beauty;
+
+    const split = this.splitPosition;
+    const picked = screenUV.x.lessThan(split).select(beauty, right);
+
+    // A one-pixel-ish seam, so the boundary is unmistakable in a screenshot.
+    const seam = screenUV.x.sub(split).abs().lessThan(0.0012);
+    return seam.select(vec4(1, 0.35, 0.1, 1), picked) as unknown as TslNode;
   }
 
   setSize(width: number, height: number): void {
