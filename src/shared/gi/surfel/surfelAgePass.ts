@@ -110,7 +110,13 @@ export function createSurfelAgePass(): SurfelAgePass {
           // This works because values are positive.
           const income = atomicMin(touchedAtomic.element(idx), int(0)).toVar();
 
-          const isAlive = currentAge.lessThan(int(SURFEL_TTL));
+          // LOCAL CHANGE vs upstream: a negative age marks a surfel pinned by the
+          // bake (gi/immortalise.ts). Upstream has no such state, so its economy
+          // clamps every age into [0, TTL] at the end of the tick -- which silently
+          // erased the pin on the very next frame and made the whole bake a no-op.
+          // Pinned surfels are excluded here: no metabolism, no rent, no death.
+          const isPinned = currentAge.lessThan(int(0));
+          const isAlive = currentAge.lessThan(int(SURFEL_TTL)).and(isPinned.not());
 
           If(isAlive, () => {
             // 1. POLICE EXECUTION

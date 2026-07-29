@@ -10,6 +10,7 @@
 import { wgsl, wgslFn } from 'three/tsl';
 import {
   CASCADES,
+  MAX_TEMPORAL_M,
   MAX_SURFELS_PER_CELL_FOR_KEEP_ALIVE,
   OFFSETS_AND_LIST_START,
   SLG_DIM,
@@ -37,7 +38,7 @@ export const consts = wgsl(/* wgsl */ `
   const MAX_SURFELS_PER_CELL_LOOKUP = ${MAX_SURFELS_PER_CELL_LOOKUP};
   const MAX_SURFELS_PER_CELL_FOR_KEEP_ALIVE = ${MAX_SURFELS_PER_CELL_FOR_KEEP_ALIVE};
   const SURFEL_DEPTH_TEXELS = ${SURFEL_DEPTH_TEXELS};
-  const MAX_TEMPORAL_M: f32 = 200.0;
+  const MAX_TEMPORAL_M: f32 = ${MAX_TEMPORAL_M.toFixed(1)};
   const BLUE_NOISE_SIZE : u32 = 1024u;
   const BLUE_NOISE_MASK : u32 = BLUE_NOISE_SIZE * BLUE_NOISE_SIZE - 1u;
   

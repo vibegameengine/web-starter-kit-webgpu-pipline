@@ -44,8 +44,33 @@ export const SurfelMoments = struct(
   'SurfelMoments',
 );
 
+/**
+ * Bytes one slot costs, summed over every allocation in `ensureCapacity`.
+ *
+ * Exported because docs/scale-report.md had to reconstruct this number by reading that
+ * function term by term, and a reconstruction goes stale the first time somebody adds a
+ * buffer. `scaleProbe.ts` now asserts its own breakdown against this, so the two are
+ * wrong together or not at all.
+ */
+export const BYTES_PER_SURFEL =
+  8 * 4 + // packed struct: posb.xyzw, normal.xyz, age
+  1 * 4 + // free-list stack slot
+  20 * 4 * 2 + // moments, double-buffered
+  1 * 4 + // touched flag
+  SLG_TOTAL_FLOATS * 4 + // SLG guiding lobes
+  1 * 4 + // debug exec counter (read by surfelAgePass)
+  SURFEL_DEPTH_TEXELS * SURFEL_DEPTH_TEXELS * 4 * 4; // radial depth atlas tile
+
 export type SurfelPool = {
-  ensureCapacity: (capacity: number) => void;
+  /**
+   * Grows the pool to at least `capacity`. Returns true when it actually reallocated,
+   * which is the caller's signal that every compute pipeline holding these buffers is
+   * now stale — see the note on `ensureCapacity` below.
+   */
+  ensureCapacity: (capacity: number) => boolean;
+  getCapacity: () => number;
+  /** Bumped on every reallocation. Cheaper for a caller to compare than the buffers. */
+  getGeneration: () => number;
 
   getSurfelAttr: () => THREE.StorageBufferAttribute | null;
   getAliveAtomic: () => THREE.StorageBufferNode;
@@ -62,10 +87,9 @@ export type SurfelPool = {
     birth: number;
     alive: boolean;
   } | null>;
-  readAllAsync: (
-    renderer: THREE.WebGPURenderer,
-  ) => Promise<{ position: [number, number, number, number] }[] | null>;
   getDebugExecAttr: () => THREE.StorageBufferNode | null;
+  /** The allocator's stack pointer, for the CPU-side growth check. */
+  getPoolAllocAttr: () => THREE.BufferAttribute | null;
   swapMoments: () => void;
   getOffsets: () => { readOffset: number; writeOffset: number };
   getSurfelDepthAttr: () => THREE.StorageBufferAttribute | null;
@@ -73,6 +97,7 @@ export type SurfelPool = {
 
 export function createSurfelPool(): SurfelPool {
   let capacity = 0;
+  let generation = 0;
   let frameParity = 0; // to ping pong offsets in the double sized moments buffer
 
   let surfelAttr: THREE.StorageBufferAttribute | null = null; // packed struct (posb + normal + age int)
@@ -96,14 +121,36 @@ export function createSurfelPool(): SurfelPool {
 
   let debugReadAttr: THREE.StorageInstancedBufferAttribute | null = null; // StorageInstancedBufferAttribute(vec4)
   let debugReadStore: any = null;
-  let debugAllReadAttr: THREE.StorageInstancedBufferAttribute | null = null; // StorageInstancedBufferAttribute(vec4) per surfel
-  let debugAllReadStore: any = null;
 
   let surfelDepthAttr: THREE.StorageBufferAttribute | null = null;
 
-  function ensureCapacity(cap: number) {
-    if (capacity === cap && surfelAttr) return;
-    capacity = cap;
+  /**
+   * Allocates, or reallocates larger, every buffer in the pool.
+   *
+   * Grow-only, and it hands back whether it did anything, because the caller has work
+   * to do afterwards that it cannot be told about any other way. Three.js creates one
+   * `GPUBuffer` per `StorageBufferAttribute` at the size the array had when the
+   * attribute was first bound (`WebGPUAttributeUtils.createAttribute`), and
+   * `updateAttribute` afterwards only ever writes *into* that allocation. Swapping the
+   * backing array for a longer one therefore does not resize anything: the pipeline
+   * keeps the old, smaller buffer, and the shader's `capacity` — which several passes
+   * bake in as a WGSL literal, e.g. `int(capacity)` in surfelAllocatePass — keeps the
+   * old value too.
+   *
+   * So growth means new attribute objects, and new attribute objects mean every cached
+   * `ComputeNode` that referenced the old ones has to be thrown away and rebuilt. That
+   * is not something this module can do; it is `SurfelGI`'s, because `SurfelGI` is what
+   * constructs all of them. Hence the return value and `getGeneration`.
+   *
+   * The GPU-side contents do not survive. That is not a limitation to be worked around
+   * later — the cache lives in device memory and there is no copy of it here to carry
+   * across. It is why growth is a rare, deliberate event and not a per-frame policy.
+   */
+  function ensureCapacity(cap: number): boolean {
+    const wanted = Math.max(1, Math.floor(cap));
+    if (surfelAttr && wanted <= capacity) return false;
+    capacity = wanted;
+    generation++;
 
     // 1x vec4 per surfel: posb (xyz + age), 1x vec3 normal, 1x int age
     surfelAttr = new THREE.StorageBufferAttribute(
@@ -151,10 +198,12 @@ export function createSurfelPool(): SurfelPool {
     debugReadAttr = new THREE.StorageInstancedBufferAttribute(dbg, 4);
     debugReadStore = storage(debugReadAttr, 'vec4', 1);
 
-    // allocate debug readback for all surfels (vec4 per surfel: xyz=pos, w=radius; zeroed if not alive)
-    const dbgAll = new Float32Array(capacity * 4);
-    debugAllReadAttr = new THREE.StorageInstancedBufferAttribute(dbgAll, 4);
-    debugAllReadStore = storage(debugAllReadAttr, 'vec4', capacity);
+    // LOCAL CHANGE vs upstream: the per-surfel debug readback (one vec4 each, 4 MiB at
+    // the old fixed capacity, mirrored on the host) is gone. `readAllAsync` was its only
+    // reader and nothing in this build calls it — the surfel census in
+    // `SurfelGI.readSurfelStats` reads the packed struct directly, which is the same
+    // data without a second copy of it. Deleted rather than left dormant because a
+    // dormant buffer is indistinguishable from a live one in a memory table.
 
     debugExecAttr = instancedArray(new Int32Array(capacity), 'int').toAtomic();
 
@@ -171,6 +220,8 @@ export function createSurfelPool(): SurfelPool {
     );
     surfelDepthAttr.name = 'surfelDepth';
     surfelDepthAttr.needsUpdate = true; // initial upload
+
+    return true;
   }
 
   function getTouched() {
@@ -251,42 +302,6 @@ export function createSurfelPool(): SurfelPool {
     }
   }
 
-  async function readAllAsync(
-    renderer: THREE.WebGPURenderer,
-  ): Promise<{ position: [number, number, number, number] }[] | null> {
-    if (!surfelAttr || !debugAllReadAttr) return null;
-    const count = capacity;
-    if (count <= 0) return [];
-    const surfels = storage(surfelAttr, SurfelStruct, count);
-    const compute = Fn(() => {
-      const i = instanceIndex;
-      const s = surfels.element(i);
-
-      debugAllReadStore.element(i).assign(s.get('posb'));
-    })()
-      .compute(Math.max(1, count))
-      .setName('Surfel Pool Read All');
-
-    try {
-      await renderer.compute(compute);
-      const ab = await renderer.getArrayBufferAsync(debugAllReadAttr);
-      const arr = new Float32Array(ab);
-      const result: { position: [number, number, number, number] }[] =
-        new Array(count);
-      for (let i = 0; i < count; i++) {
-        const base = i * 4;
-        const px = arr[base + 0];
-        const py = arr[base + 1];
-        const pz = arr[base + 2];
-        const pr = arr[base + 3];
-        result[i] = { position: [px, py, pz, pr] };
-      }
-      return result;
-    } catch {
-      return null;
-    }
-  }
-
   function swapMoments() {
     frameParity = 1 - frameParity;
   }
@@ -302,6 +317,8 @@ export function createSurfelPool(): SurfelPool {
 
   return {
     ensureCapacity,
+    getCapacity: () => capacity,
+    getGeneration: () => generation,
     getSurfelAttr,
     getAliveAtomic,
     getPoolAttr,
@@ -311,8 +328,9 @@ export function createSurfelPool(): SurfelPool {
     getTouched,
     getGuidingAttr,
     readFirstAsync,
-    readAllAsync,
     getDebugExecAttr,
+    getPoolAllocAttr: () =>
+      (poolAllocCountAtomic?.value as THREE.BufferAttribute) ?? null,
     swapMoments,
     getOffsets,
     getSurfelDepthAttr,

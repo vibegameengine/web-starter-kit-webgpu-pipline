@@ -40,17 +40,23 @@ import {
 import {
   FADE_FRAMES,
   OFFSETS_AND_LIST_START,
+  RESOLVE_CELL_SCAN_CAP,
+  RESOLVE_FETCH_CAP,
   SURFEL_IMPORTANCE_DIRECT_MAX,
   SURFEL_IMPORTANCE_INDIRECT_MAX,
   SURFEL_NORMAL_DIRECTION_SQUISH,
   SURFEL_RADIUS_OVERSCALE,
   TARGET_SAMPLE_COUNT,
 } from './constants';
+import { giKnobs } from './knobs';
 import {
   surfelRadialDepthOcclusion,
   U_OCCLUSION_PARAMS,
 } from './surfelRadialDepth';
 import { radiusBasedEpsilon } from './surfelIntegratePass';
+import { createScreenProbePass } from '../probe/screenProbePass.ts';
+import { probeSettings, probeTextures } from '../probe/settings.ts';
+import { createReflectPass } from '../reflect/reflectPass.ts';
 
 // @ts-ignore Fn is mistyped
 export const resolveIrradiance = Fn(
@@ -131,12 +137,42 @@ export const resolveIrradiance = Fn(
   },
 );
 
+/**
+ * LOCAL CHANGE vs upstream: this factory now owns two final gathers, not one.
+ *
+ * Upstream's is below and unaltered — hash the pixel into one grid cell, average
+ * the surfels it holds, emit black when it holds none. That last clause is the
+ * whole problem: an empty cell produced `vec3(0)` with alpha 1, which is a hard
+ * cell-shaped patch rather than a falloff, and no amount of loosening the
+ * visibility gate fixes it because the cell really is empty. Surfels are spawned
+ * from a G-Buffer and a concave corner is never in one.
+ *
+ * The answer is Lumen's, and it is a tier rather than a tweak: screen probes,
+ * placed in screen space (so coverage holes cannot exist), tracing the near field
+ * for real (so contact-scale shadowing exists at all) and falling back to the
+ * surfel cache beyond a short-ray budget (so the cache is used as what it is, a
+ * world-space radiance cache). It lives in `gi/probe/` and is constructed here
+ * because this is the one place in the pipeline handed both the hash grid and the
+ * pool it needs to read.
+ *
+ * Both write RGBA16F at full screen resolution and `getOutputTexture()` names
+ * whichever is active, so the composite in `render/frameGraph.ts` is unchanged.
+ */
 export function createSurfelGIResolvePass(
   grid: SurfelHashGrid,
   pool: SurfelPool,
 ) {
   // Output Texture (RGBA16F)
   let outputTexture: THREE.Texture | null = null;
+  let activeTexture: THREE.Texture | null = null;
+
+  const probes = createScreenProbePass(grid, pool);
+  // Constructed here for the same reason the probes are: this factory is the one place
+  // in the pipeline handed both the hash grid and the surfel pool, and the specular
+  // gather reads the cache exactly as the diffuse one does. It does not write into
+  // `activeTexture` — reflections are a separate term in the composite, not a different
+  // opinion about the same one — so nothing below this line branches on it.
+  const reflections = createReflectPass(grid, pool);
 
   // Uniforms
   const U_PROJ_INV = uniform(new THREE.Matrix4());
@@ -148,7 +184,14 @@ export function createSurfelGIResolvePass(
   const U_GRID_ORIGIN = uniform(new THREE.Vector3());
 
   let computeNode: THREE.ComputeNode | null = null;
-  const maxFetchPerPixel = 64; // Limit neighbors for performance
+  /**
+   * LOCAL CHANGE vs upstream: upstream's `maxFetchPerPixel = 64` is now the `?resolvecap=1`
+   * path, not the default. Read once here rather than per frame because the compute graph
+   * is built once and a URL does not change under it.
+   */
+  const maxFetchPerPixel = giKnobs.deterministicResolve()
+    ? RESOLVE_CELL_SCAN_CAP
+    : RESOLVE_FETCH_CAP;
 
   function resize(width: number, height: number) {
     if (
@@ -160,6 +203,7 @@ export function createSurfelGIResolvePass(
       outputTexture.type = THREE.HalfFloatType;
       // @ts-ignore
       outputTexture.format = THREE.RGBAFormat;
+      probeTextures.legacy = outputTexture;
       computeNode = null; // Rebuild compute graph on resize
     }
   }
@@ -169,6 +213,23 @@ export function createSurfelGIResolvePass(
     camera: THREE.PerspectiveCamera,
     gbuffer: { target: THREE.RenderTarget },
   ) {
+    const probeRan = probeSettings.enabled
+      ? probes.run(renderer, camera, gbuffer)
+      : false;
+
+    // Before the early return below, deliberately: reflections are orthogonal to which
+    // diffuse gather won. They are also independent of the probes entirely — `?probes=0`
+    // must still get a mirror — so this is not nested inside that branch.
+    reflections.run(renderer, camera, gbuffer);
+
+    // The legacy gather still runs when the probes are off, and when a split pane
+    // is pointed at it so the two can be judged against each other in one frame.
+    // Nothing else keeps it alive: it is the reference, not a fallback.
+    if (probeRan && !probeSettings.compare) {
+      activeTexture = probes.getOutputTexture();
+      return;
+    }
+
     const width = gbuffer.target.width;
     const height = gbuffer.target.height;
     resize(width, height);
@@ -278,6 +339,12 @@ export function createSurfelGIResolvePass(
           const start = offsetsAndList.element(cellIdx);
           const end = offsetsAndList.element(cellIdx.add(int(1)));
           const count = end.sub(start).max(int(0));
+          // Whole cell by default. `count` is exact — the slot pass decrements each cell's
+          // offset back down to its own start, so `end - start` is that cell's population
+          // and never runs off the list — and summing all of it is what makes this pass a
+          // function of the cache rather than of the atomics: the accumulator below is a
+          // sum, and a sum does not care which order the entries arrived in. The old cap
+          // is one flag away and is the only thing here that reintroduces an ordering.
           const capped = min(int(maxFetchPerPixel), count);
 
           // 3. Accumulate Light
@@ -321,8 +388,26 @@ export function createSurfelGIResolvePass(
           });
 
           // 4. Normalize
+          //
+          // The alpha this writes is a coverage flag, not a constant. This pass already
+          // has an encoding for "no data" — every pixel whose depth fails the test above
+          // leaves `outColor` at vec4(0), including its alpha — and a cell that yielded no
+          // weight is the same statement: nothing in the cache speaks for this pixel. It
+          // used to write alpha 1 with rgb 0, which is the opposite claim, "I looked and
+          // the answer is black", and that is what turned a coverage hole into a hard
+          // cell-shaped patch instead of something a consumer could choose to fill.
+          //
+          // Summing the whole cell should make the zero branch unreachable from selection
+          // — a cell with any usable surfel in it now always contributes — but "should" is
+          // not a guarantee for a genuinely empty cell, and a branch that asserts black is
+          // not something to leave loaded on the strength of an argument. The composite in
+          // render/frameGraph.ts adds `gi * albedo`, so zero alpha there is inert today;
+          // the point is that the hole is now labelled rather than disguised.
           const invW = float(1.0).div(max(float(1e-5), sumWeight));
-          outColor.assign(vec4(sumLight.mul(invW), 1.0));
+          const covered = sumWeight.greaterThan(float(1e-5));
+          outColor.assign(
+            vec4(sumLight.mul(invW), covered.select(float(1.0), float(0.0))),
+          );
 
           // Range: 50 to 100
           const dominance = bestContrib.div(sumWeight.add(float(1e-5)));
@@ -365,10 +450,20 @@ export function createSurfelGIResolvePass(
     }
 
     renderer.compute(computeNode);
+
+    activeTexture = probeRan ? probes.getOutputTexture() : outputTexture;
   }
 
   return {
     run,
-    getOutputTexture: () => outputTexture,
+    getOutputTexture: () => activeTexture ?? outputTexture,
+    /** Upstream's gather, kept addressable so a split pane can show it. */
+    getLegacyTexture: () => outputTexture,
+    getProbeDebugTexture: () => probes.getDebugTexture(),
+    getReflectTexture: () => reflections.getOutputTexture(),
+    invalidateProbeHistory: () => {
+      probes.invalidate();
+      reflections.invalidate();
+    },
   };
 }

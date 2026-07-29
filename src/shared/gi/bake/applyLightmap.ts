@@ -74,12 +74,18 @@ export function applyLightmap(
       // sees it.
       const preview = texture(lightmap).toInspector('Lightmap / Atlas');
 
-      standard.emissiveNode = vec3(
-        texture(lightmap, attribute('uv1', 'vec2')).rgb,
-      )
+      // Added to whatever was already in the slot, not assigned over it. A material
+      // that is genuinely emissive — a lamp panel, which the tracer treats as a GI
+      // light source — has its emission in `emissiveNode` too, and overwriting it here
+      // put the lamp out the moment the scene switched to lightmap mode. The result
+      // was a glow on the wall with nothing visible casting it.
+      const existing = standard.emissiveNode ?? null;
+      const baked = vec3(texture(lightmap, attribute('uv1', 'vec2')).rgb)
         .mul(albedo)
         .mul(intensityUniform)
         .add(preview.rgb.mul(inspectorZero));
+
+      standard.emissiveNode = existing ? vec3(existing).add(baked) : baked;
       standard.needsUpdate = true;
       applied++;
     }

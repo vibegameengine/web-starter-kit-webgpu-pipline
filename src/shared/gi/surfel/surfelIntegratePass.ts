@@ -12,6 +12,15 @@ import {
   constants,
 } from '../bvh/webgpu/index.js';
 import {
+  dynBoundsHit,
+  dynBvhIntersectFirstHit,
+  getDynVertexAttribute,
+  sceneHitStruct,
+  traceScene,
+  traceSceneOccluded,
+  type DynamicBVHBundle,
+} from './dynamicBvh';
+import {
   snap_to_surfel_grid_origin,
   type SurfelHashGrid,
 } from './surfelHashGrid';
@@ -40,23 +49,49 @@ import {
   surfelRadialDepthOcclusionRW,
   U_OCCLUSION_PARAMS,
 } from './surfelRadialDepth';
+import {
+  giHitEmissive,
+  giLightConsts,
+  giOccluded,
+  giSampleLight,
+  giShadeHit,
+} from './hitShading';
+import {
+  U_GI_EMISSIVE_BASE,
+  U_GI_EMISSIVE_SCALE,
+  U_GI_LIGHT_COUNT,
+  U_GI_LIGHT_SAMPLES,
+  giLightsTexture,
+  syncSceneLights,
+} from './sceneLights';
+import { giKnobs } from './knobs';
 
 const MAX_SURFELS_PER_CELL_LOOKUP = 32;
 
 export type SurfelIntegratePass = {
+  /**
+   * `scene` rather than a light: the tracer reads every analytic light in the graph out
+   * of the storage buffer `sceneLights.ts` refreshes here. It used to take one
+   * `THREE.DirectionalLight`, which made "sun" and "light source" the same concept all
+   * the way down to the WGSL and left point lights, spot lights and emissive materials
+   * contributing exactly nothing to global illumination.
+   */
   run: (
     renderer: THREE.WebGPURenderer,
     pool: SurfelPool,
     bvh: SceneBVHBundle,
+    dynBvh: DynamicBVHBundle,
     grid: SurfelHashGrid,
     camera: THREE.PerspectiveCamera,
-    light: THREE.DirectionalLight,
+    scene: THREE.Object3D,
     dispatchArgs: THREE.IndirectStorageBufferAttribute,
+    options?: { includeDynamic?: boolean },
   ) => void;
   setBaseSampleCount: (count: number) => void;
   setAlbedoBoost: (boost: number) => void;
   setGiScales: (fromDirect: number, fromIndirect: number) => void;
   setEnvControls: (intensity: number, lod: number) => void;
+  setDynamicTracing: (enabled: boolean) => void;
 };
 
 // --- Grid helper functions (world → grid → hash) ---
@@ -144,12 +179,41 @@ const colorHelpers = wgsl(/* wgsl */ `
   }
 `);
 
+/**
+ * Mip level for one ray hit, from the footprint that hit represents.
+ *
+ * A compute shader has no derivatives, so there is no quad to take a gradient across
+ * and the level has to be reasoned about rather than measured. The reasoning: a ray
+ * leaving a surfel does not sample a point, it samples that surfel's disc smeared out
+ * over the distance it travelled — `sRad` at the origin, widening with `dist`. Feeding
+ * that footprint to the chain is the difference between a 200 m hit reading one texel
+ * of a full-rate texture and reading the average of the patch it actually covers.
+ *
+ * Why it matters beyond bandwidth: point-sampling at range makes successive frames
+ * disagree about a surface that has not changed, MSME reads the disagreement as
+ * variance, and its firefly clamp then removes light that was correct. Aliasing here
+ * comes out the other end as *darkening*, which is why it never looked like aliasing.
+ */
+const diffuseLodForHit = wgslFn(/* wgsl */ `
+  fn diffuseLodForHit(
+    tex: texture_2d_array<f32>,
+    surfelRadius: f32,
+    dist: f32,
+    lodScale: f32
+  ) -> f32 {
+    let maxLod = f32(max(1u, textureNumLevels(tex)) - 1u);
+    let footprint = max(0.0, surfelRadius) + max(0.0, dist);
+    return clamp(log2(max(1.0, footprint * max(1e-3, lodScale))), 0.0, maxLod);
+  }
+`);
+
 const sampleDiffuseArray = wgslFn(/* wgsl */ `
   fn sampleDiffuseArray(
     tex: texture_2d_array<f32>,
     texSampler: sampler,
     uvIn: vec2f,
-    layerIn: i32
+    layerIn: i32,
+    lod: f32
   ) -> vec3f {
     let uv = uvIn;
 
@@ -164,7 +228,8 @@ const sampleDiffuseArray = wgslFn(/* wgsl */ `
     // let y = i32(min(u32(uv.y * f32(h)), h - 1u));
     // let c = textureLoad(tex, vec2i(x, y), layer, 0);
 
-    let c = textureSampleLevel(tex, texSampler, uv, layer, 0.0);
+    let maxLod = f32(max(1u, textureNumLevels(tex)) - 1u);
+    let c = textureSampleLevel(tex, texSampler, uv, layer, clamp(lod, 0.0, maxLod));
     return c.rgb;
   }
 `);
@@ -544,8 +609,6 @@ export function createSurfelIntegratePass(
 
   // Uniforms
   const U_FRAME = uniform(0);
-  const U_LIGHT_DIR = uniform(new THREE.Vector3(0, 1, 0));
-  const U_LIGHT_COLOR = uniform(new THREE.Color(1, 1, 1));
   const U_CAM_POS = uniform(new THREE.Vector3());
   const U_READ_OFFSET = uniform(0);
   const U_WRITE_OFFSET = uniform(0);
@@ -554,6 +617,29 @@ export function createSurfelIntegratePass(
   const U_ALBEDO_BOOST = uniform(1.0);
   const U_GI_FROM_DIRECT = uniform(1.0);
   const U_GI_FROM_INDIRECT = uniform(1.0);
+  // Per-run gate on the second BVH. Separate from the bundle's own `enabled` flag,
+  // which only says whether the structure holds anything: a static bake has to trace
+  // a *populated* dynamic structure and still ignore it, or the pinned cache ends up
+  // with a mover's pose baked into it forever.
+  const U_DYN_TRACE = uniform(0.0);
+  /**
+   * Texels-per-metre the footprint in `diffuseLodForHit` is measured against.
+   *
+   * One number for every material, which is a real approximation: each layer bakes its
+   * own uv repeat flat, so the terrain's 16.7 tiles and a rock's 2 sit at very
+   * different densities behind the same scale. The alternative is a per-material
+   * density table, and that costs a second indirection on the hottest line in the
+   * integrator to move a level selection by a fraction of a mip. `?giLod=` overrides it.
+   */
+  const U_DIFFUSE_LOD_SCALE = uniform(giKnobs.diffuseLodScale());
+  /**
+   * Ablation switch. With it off, movers are still in the scene, still rastered, still
+   * spawn surfels and still take pool slots — only the rays stop seeing them. That is
+   * the only comparison that isolates what tracing movable geometry actually buys;
+   * removing the mover instead changes the G-Buffer and the surfel population too, and
+   * the resulting delta measures three things at once.
+   */
+  let dynamicTracing = true;
 
   const blueNoiseTexN = texture(blueNoiseTex);
   const envTexture = envTex ? texture(envTex).toInspector('Env') : null;
@@ -566,10 +652,12 @@ export function createSurfelIntegratePass(
     renderer: THREE.WebGPURenderer,
     pool: SurfelPool,
     bvh: SceneBVHBundle,
+    dynBvh: DynamicBVHBundle,
     grid: SurfelHashGrid,
     camera: THREE.PerspectiveCamera,
-    dirLight: THREE.DirectionalLight,
+    scene: THREE.Object3D,
     dispatchArgs: THREE.IndirectStorageBufferAttribute,
+    options: { includeDynamic?: boolean } = {},
   ) {
     const surfelAttr = pool.getSurfelAttr();
     const momentsAttr = pool.getMomentsAttr();
@@ -584,6 +672,7 @@ export function createSurfelIntegratePass(
       !momentsAttr ||
       !poolMax ||
       !bvh.bvhNode ||
+      !dynBvh?.bvhNode ||
       !offsetsAndListAttr ||
       !guidingAttr ||
       !surfelDepthAttr ||
@@ -595,14 +684,19 @@ export function createSurfelIntegratePass(
 
     // Update Uniforms
     U_FRAME.value = renderer.info.frame;
-    const lightDir = new THREE.Vector3()
-      .subVectors(dirLight.position, dirLight.target.position)
-      .normalize();
-
-    U_LIGHT_DIR.value.copy(lightDir);
-    U_LIGHT_COLOR.value.copy(dirLight.color).multiplyScalar(dirLight.intensity);
+    // Every frame, not once: the sun's angles are on a GUI slider and a torch can be
+    // carried. Sixteen lights is a scene walk and 256 float writes — cheaper than the
+    // first BVH node the next ray touches.
+    syncSceneLights(scene);
     U_CAM_POS.value.copy(camera.position);
     snap_to_surfel_grid_origin(U_GRID_ORIGIN.value, camera.position);
+
+    U_DYN_TRACE.value =
+      dynamicTracing &&
+      options.includeDynamic !== false &&
+      dynBvh.enabled.value > 0
+        ? 1
+        : 0;
 
     // 1. UPDATE OFFSETS
     const { readOffset, writeOffset } = pool.getOffsets();
@@ -817,9 +911,12 @@ export function createSurfelIntegratePass(
           envSampler: sampler,
           envIntensity: f32,
           envLod: f32,
-          frame: u32, 
-          lightDir: vec3f, 
-          lightColor: vec3f, 
+          frame: u32,
+          lightsTex: texture_2d<f32>,
+          lightCount: u32,
+          lightSamples: u32,
+          emissiveBase: i32,
+          emissiveScale: f32,
           camPos: vec3f,
           gridOrigin: vec3f,
           blueNoiseTex: texture_2d<f32>,
@@ -829,6 +926,9 @@ export function createSurfelIntegratePass(
           albedoBoost: f32,
           giFromDirect: f32,
           giFromIndirect: f32,
+          dynTrace: f32,
+          dynBounds: vec4f,
+          diffuseLodScale: f32,
         ) -> void {
           let index = instanceIndex;
           // let total = atomicLoad(&poolMax[0]);
@@ -961,7 +1061,7 @@ export function createSurfelIntegratePass(
 
             ray.direction = rayDirDepth;
 
-            let hitD = bvhIntersectFirstHit(ray);
+            let hitD = traceScene(ray, dynTrace, dynBounds);
 
             let maxDepth = sRad * 2.0;
             let dHit = clamp(hitD.dist, 0.0, maxDepth);
@@ -999,7 +1099,11 @@ export function createSurfelIntegratePass(
               let rayDir = basis * dirLocal;
 
               ray.direction = rayDir;
-              let hit = bvhIntersectFirstHit(ray);
+              // LOCAL CHANGE vs upstream: one BVH became two. traceScene keeps the
+              // nearer of the static and dynamic hits and resolves the interpolated
+              // uv/matId out of whichever structure won, so everything below this line
+              // is upstream's shading path with no knowledge of the split.
+              let hit = traceScene(ray, dynTrace, dynBounds);
               var bounceLi = vec3f(0.0);
               
               // ----------------------------------------------------------
@@ -1016,23 +1120,44 @@ export function createSurfelIntegratePass(
                 let hitPoint  = ray.origin + ray.direction * hit.dist;
                 let hitNormal = normalize(hit.normal);
                 if (i == 0u) { hitPos0 = hitPoint; }
-                let uvMat = getVertexAttribute(hit.barycoord, hit.indices.xyz);
+                let uvMat = hit.attrib;
                 // matId is constant per triangle because we made geometry non-indexed + filled per-tri.
                 let matId = i32(round(uvMat.z));
                 let hitUv = uvMat.xy;
-                var hitAlbedo = sampleDiffuseArray(diffuseTex, diffuseTexSampler, hitUv, matId);
+                let hitLod = diffuseLodForHit(diffuseTex, sRad, hit.dist, diffuseLodScale);
+                var hitAlbedo = sampleDiffuseArray(diffuseTex, diffuseTexSampler, hitUv, matId, hitLod);
                 let y = max(1e-4, dot(hitAlbedo, vec3f(0.2126, 0.7152, 0.0722)));
                 let y2 = 1.0 - pow(1.0 - y, max(0.0, albedoBoost));
                 let s = y2 / y;
                 hitAlbedo = clamp(hitAlbedo * s, vec3f(0.0), vec3f(1.0));
 
-                var shadowRay2: Ray; shadowRay2.origin = hitPoint + hitNormal * eps; 
-                shadowRay2.direction = lightDir;
-                let shadowHit2 = bvhIntersectFirstHit(shadowRay2);
-                if (!shadowHit2.didHit) {
-                  let NdotL2 = max(0.0, dot(hitNormal, lightDir));
-                  bounceLi += lightColor * hitAlbedo * NdotL2 * (1.0 / PI) * giFromDirect;
-                }
+                // Every analytic light in the scene, not just the sun, each with its own
+                // shadow ray. A mover that cannot occlude one of those rays casts no
+                // indirect shadow at all, which was the visible half of an earlier
+                // defect: the sphere sat 30cm off a wall and the wall did not know it
+                // was there. The whole of this now lives in hitShading.ts so the
+                // reflection pass shades its hits through the same code rather than
+                // growing a second, sun-only opinion of what a surface is worth.
+                // Purpose 2, not a channel of u4: u4.zw already steer lobe selection,
+                // and reusing them would correlate "which direction this ray went" with
+                // "which light it asked about" — a bias that shows up as one lamp being
+                // systematically brighter on surfaces facing a particular way.
+                let lightU = blueNoise4(index, frame * BLUE_NOISE_STRIDE + i, 2u, blueNoiseTex).x;
+                bounceLi += giShadeHit(
+                  lightsTex, hitPoint, hitNormal, hitAlbedo, eps,
+                  dynTrace, dynBounds,
+                  lightCount, lightSamples, lightU
+                ) * giFromDirect;
+
+                // Emission is added raw. It is not multiplied by the hit's albedo (a
+                // light does not reflect itself) and not scaled by giFromDirect (that
+                // knob asks for less *bouncing*, and turning it down must not put out
+                // the lamp).
+                bounceLi += giHitEmissive(
+                  diffuseTex, diffuseTexSampler, hitUv, matId, hitLod,
+                  emissiveBase, emissiveScale
+                );
+
                 let gi = lookupSurfelGI(hitPoint, hitNormal, camPos, gridOrigin, readOffset, occParams);
                 bounceLi += gi * hitAlbedo * giFromIndirect;
               } else {
@@ -1131,6 +1256,20 @@ export function createSurfelIntegratePass(
           rayStruct,
           bvhIntersectFirstHit,
           getVertexAttribute,
+          dynBvhIntersectFirstHit,
+          getDynVertexAttribute,
+          sceneHitStruct,
+          dynBoundsHit,
+          traceScene,
+          traceSceneOccluded,
+
+          // The shared hit-shading seam. Everything that fires a ray at this scene and
+          // asks what came back goes through these four; see hitShading.ts.
+          giLightConsts,
+          giOccluded,
+          giSampleLight,
+          giShadeHit,
+          giHitEmissive,
 
           blueNoise4,
 
@@ -1156,6 +1295,7 @@ export function createSurfelIntegratePass(
           update_surfel_depth2,
           radiusBasedEpsilon,
           surfelRadialDepthOcclusionRW,
+          diffuseLodForHit,
           sampleDiffuseArray,
           envEquirectUV,
           sampleEnvEquirectClamped,
@@ -1163,6 +1303,10 @@ export function createSurfelIntegratePass(
           bvh.positionNode,
           bvh.indexNode,
           bvh.colorNode,
+          dynBvh.bvhNode,
+          dynBvh.positionNode,
+          dynBvh.indexNode,
+          dynBvh.colorNode,
           surfelBuffer,
           momentsBuffer,
           offsetsAndList,
@@ -1182,8 +1326,11 @@ export function createSurfelIntegratePass(
         envLod: U_ENV_LOD,
 
         frame: U_FRAME,
-        lightDir: U_LIGHT_DIR,
-        lightColor: U_LIGHT_COLOR,
+        lightsTex: giLightsTexture,
+        lightCount: U_GI_LIGHT_COUNT,
+        lightSamples: U_GI_LIGHT_SAMPLES,
+        emissiveBase: U_GI_EMISSIVE_BASE,
+        emissiveScale: U_GI_EMISSIVE_SCALE,
         camPos: U_CAM_POS,
         gridOrigin: U_GRID_ORIGIN,
         blueNoiseTex: blueNoiseTexN,
@@ -1194,6 +1341,9 @@ export function createSurfelIntegratePass(
         albedoBoost: U_ALBEDO_BOOST,
         giFromDirect: U_GI_FROM_DIRECT,
         giFromIndirect: U_GI_FROM_INDIRECT,
+        dynTrace: U_DYN_TRACE,
+        dynBounds: dynBvh.influence,
+        diffuseLodScale: U_DIFFUSE_LOD_SCALE,
       });
 
       computeNode = computeCall
@@ -1219,6 +1369,9 @@ export function createSurfelIntegratePass(
     setEnvControls: (intensity: number, lod: number) => {
       U_ENV_INTENSITY.value = Math.max(0, intensity);
       U_ENV_LOD.value = Math.max(0, lod);
+    },
+    setDynamicTracing: (enabled: boolean) => {
+      dynamicTracing = enabled;
     },
   };
 }

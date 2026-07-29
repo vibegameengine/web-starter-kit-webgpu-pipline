@@ -4,11 +4,66 @@ import { Layer } from '../world/index.ts';
 import { createSurfelImmortaliser } from './immortalise.ts';
 import { createCacheAtlas } from './cacheAtlas.ts';
 import { createLightmapSurfels } from './bake/lightmapSurfels.ts';
+import {
+  createGeometrySeeder,
+  sampleStaticSurfaces,
+} from './bake/geometrySurfels.ts';
+import { createSurfelHoleFill } from './bake/holeFill.ts';
 import type { LightmapGBuffer } from './bake/lightmapGBuffer.ts';
 
-import { MAX_SURFELS, SURFEL_TTL } from './surfel/constants.ts';
+import {
+  CASCADES,
+  MAX_SURFELS,
+  MAX_TEMPORAL_M,
+  RESOLVE_FETCH_CAP,
+  SURFEL_CS,
+  SURFEL_POOL_BASE,
+  SURFEL_POOL_GROW_AT,
+  SURFEL_TTL,
+  TOTAL_CELLS,
+} from './surfel/constants.ts';
+import { BYTES_PER_SURFEL } from './surfel/surfelPool.ts';
+import { giKnobs } from './surfel/knobs.ts';
+
+/**
+ * Frames between pool-occupancy readbacks. ~1.5 s at 60 Hz: long enough that the
+ * readback is free, short enough that a camera walking into denser geometry gets more
+ * slots before the allocator has spent many frames refusing.
+ */
+const GROWTH_CHECK_FRAMES = 90;
+
+/**
+ * Window of the bake budget, as a fraction, during which the hole fill runs.
+ *
+ * Fractions rather than frame counts because the budget is wall-clock and the frame
+ * rate is not ours to predict. It opens late enough that the sweep has had a real go at
+ * the scene — filling from frame zero would spawn into places the very next view was
+ * about to cover, which is competing with find-missing rather than supplementing it.
+ * It closes early enough to leave a fifth of the budget for what it spawned to
+ * converge, because a surfel short of TARGET_SAMPLE_COUNT is one the immortaliser
+ * refuses to pin and the runtime then recycles — the hole would come back a few
+ * seconds after the bake claimed to have closed it.
+ *
+ * It is a window and not a handful of instants because the fill dilates: each pass
+ * grows the covered set by one step into a hole, so a hole wider than a step needs
+ * several, with a grid rebuild between them.
+ */
+const HOLE_FILL_FROM = 0.3;
+const HOLE_FILL_TO = 0.8;
+
+/**
+ * Wall-clock ceiling on a counted bake. A safety net and nothing else.
+ *
+ * Deliberately far above what either reference scene needs, because the moment this is
+ * what ends a bake the result stops being reproducible — how much of the schedule ran
+ * would again be a function of GPU scheduling. It is here so a pathological scene fails
+ * loudly instead of hanging the page, and firing it is reported as an error rather than
+ * as a completed bake.
+ */
+const BAKE_WALL_CLOCK_CAP_MS = 120000;
 import { createGBuffer } from './surfel/gbuffer.ts';
 import { createSceneBVH, type SceneBVHBundle } from './surfel/sceneBvh.ts';
+import { createDynamicBVH, type DynamicBVHBundle } from './surfel/dynamicBvh.ts';
 import { createSurfelPool } from './surfel/surfelPool.ts';
 import { createSurfelPreparePass } from './surfel/surfelPreparePass.ts';
 import { createSurfelAgePass } from './surfel/surfelAgePass.ts';
@@ -38,32 +93,50 @@ export interface SurfelGiAssets {
  *   GBuffer → prepare → find-missing → dispatch args → age → allocate
  *           → grid build → integrate (BVH RT) → resolve → composite
  *
- * The known limits are inherited too: the BVH is built once over static geometry, and
- * alpha-tested foliage has no representation. Both are Phase 6 problems.
+ * Geometry the tracer sees is split in two, the way UE splits mobility. The static BVH
+ * is built once and holds everything that will not move; a second, much smaller BVH
+ * holds `Mobility.Movable` geometry and is rebuilt on demand, so a mover occludes and
+ * bleeds onto its surroundings without the forest being re-accelerated every frame.
+ *
+ * What the split deliberately does NOT do is let dynamic radiance settle into the
+ * static pool: a bake pins its surfels, and pinned surfels are never re-integrated. A
+ * mover's own indirect lighting is the dynamic GI pass's job, not this one's.
+ *
+ * One inherited limit remains: alpha-tested foliage has no representation in either
+ * structure. That is a Phase 6 problem.
  */
 export class SurfelGI {
   private readonly gbuffer: ReturnType<typeof createGBuffer>;
   private readonly pool: ReturnType<typeof createSurfelPool>;
-  private readonly prepare = createSurfelPreparePass();
-  private readonly age = createSurfelAgePass();
-  private readonly findMissing = createSurfelFindMissingPass();
-  private readonly allocate = createSurfelAllocatePass();
-  private readonly dispatchArgs = createSurfelDispatchArgs();
-  private readonly grid = createSurfelHashGrid();
-  private readonly integratorArgs = createIntegratorDispatchArgs();
-  private readonly resolve: ReturnType<typeof createSurfelGIResolvePass>;
+  private prepare = createSurfelPreparePass();
+  private age = createSurfelAgePass();
+  private findMissing = createSurfelFindMissingPass();
+  private allocate = createSurfelAllocatePass();
+  private dispatchArgs = createSurfelDispatchArgs();
+  private grid = createSurfelHashGrid();
+  private integratorArgs = createIntegratorDispatchArgs();
+  private resolve: ReturnType<typeof createSurfelGIResolvePass>;
 
   private integrate: ReturnType<typeof createSurfelIntegratePass> | null = null;
   private bvh: SceneBVHBundle | null = null;
+  private dynamicBvh: DynamicBVHBundle | null = null;
 
   private readonly prevCameraPos = new THREE.Vector3();
   private lastOutput: THREE.Texture | null = null;
   private _frozen = false;
   /** Ray count restored after a bake finishes. */
   private runtimeSampleCount = 4;
-  private readonly immortaliser = createSurfelImmortaliser();
+  private immortaliser = createSurfelImmortaliser();
   private cacheAtlas: ReturnType<typeof createCacheAtlas> | null = null;
   private lightmapSurfels: ReturnType<typeof createLightmapSurfels> | null = null;
+
+  /** Frames between growth checks, and the readback in flight for the current one. */
+  private growthCheckPending = false;
+  private growthCheckedAtFrame = 0;
+  private poolSaturationReported = false;
+
+  /** Set for the duration of a counted bake; see `maybeGrowPool` and `bake`. */
+  private bakeFreezesPool = false;
 
   readonly envTexture: THREE.DataTexture;
 
@@ -75,7 +148,13 @@ export class SurfelGI {
     this.envTexture = envTexture;
     this.gbuffer = createGBuffer(renderer);
     this.pool = createSurfelPool();
-    this.pool.ensureCapacity(MAX_SURFELS);
+
+    const override = giKnobs.surfelBase();
+    const base = Math.min(
+      MAX_SURFELS,
+      Math.max(256, override > 0 ? override : SURFEL_POOL_BASE),
+    );
+    this.pool.ensureCapacity(base);
     this.resolve = createSurfelGIResolvePass(this.grid, this.pool);
   }
 
@@ -111,8 +190,228 @@ export class SurfelGI {
    */
   buildScene(renderer: THREE.WebGPURenderer, scene: THREE.Scene): void {
     this.bvh = createSceneBVH(renderer, scene);
+    // Built here rather than lazily: the buffers are bound into the integrator's
+    // pipeline the first time it runs, and a structure that appears after that point
+    // cannot be bound without recompiling the shader. It is created even when nothing
+    // in the scene moves, so there is exactly one shader variant to reason about.
+    this.dynamicBvh = createDynamicBVH(scene, this.bvh.materialIdByUUID);
     this.integrate = createSurfelIntegratePass(this.blueNoise, this.envTexture);
+    this.integrate.setDynamicTracing(this.dynamicTracing);
     this.prepare.run(renderer, this.pool, { forceClear: true });
+  }
+
+  /**
+   * Grows the surfel pool to at least `wanted` slots and rebuilds everything bound to
+   * it. Returns true if it grew.
+   *
+   * The rebuild is the whole cost of growth, and it is unavoidable. A pool buffer is a
+   * `StorageBufferAttribute`; three.js sizes its `GPUBuffer` once, when the attribute is
+   * first bound, and several passes additionally bake the capacity into their WGSL as a
+   * literal. So a larger pool is a different set of attributes, and every `ComputeNode`
+   * that closed over the old ones is now pointing at buffers of the wrong size. This
+   * class constructs all of them, which is the only reason growth is implementable at
+   * all: the fix is to drop the passes and let them lazily rebuild against the new
+   * buffers on their next `run`.
+   *
+   * What does not survive is the cache. The converged radiance is in device memory, in
+   * the buffers being replaced, and there is no host copy to carry over. So this is a
+   * deliberate, rare event — a safety net for a world bigger than the base guess, not a
+   * per-frame policy — and it says so out loud when it fires.
+   */
+  ensurePoolCapacity(renderer: THREE.WebGPURenderer, wanted: number): boolean {
+    const from = this.pool.getCapacity();
+    if (wanted <= from) return false;
+
+    if (from >= MAX_SURFELS) {
+      if (!this.poolSaturationReported) {
+        this.poolSaturationReported = true;
+        console.error(
+          `[gi] surfel pool is full at its ceiling of ${MAX_SURFELS} and ${wanted} were ` +
+            'asked for. Every surfel past the ceiling is refused by the allocator, and a ' +
+            'refused surfel is not an error anywhere downstream — the geometry that wanted ' +
+            'it simply resolves to no indirect light and comes out BLACK. Raise ' +
+            'MAX_SURFELS if the memory is there, or reduce what is asking (a lightmap ' +
+            'atlas edge, ?lm=, is the usual culprit).',
+        );
+      }
+      return false;
+    }
+
+    const target = Math.min(MAX_SURFELS, Math.max(wanted, from * 2));
+    console.warn(
+      `[gi] growing the surfel pool ${from} → ${target} slots ` +
+        `(${((target * BYTES_PER_SURFEL) / 1048576).toFixed(1)} MiB GPU). The cached ` +
+        'radiance does not survive this and the cache will re-converge from empty.',
+    );
+
+    this.pool.ensureCapacity(target);
+    this.rebuildPoolBoundPasses();
+    this.prepare.run(renderer, this.pool, { forceClear: true });
+    return true;
+  }
+
+  /**
+   * Drops every pass holding a binding to the pool so it rebuilds on next use.
+   *
+   * The list is exactly the set constructed by this class, which is also exactly the
+   * set that binds pool buffers — including the screen-probe chain, which is built
+   * inside `createSurfelGIResolvePass` and therefore replaced along with it. The
+   * G-Buffer is the one thing kept: it is sized by the screen, not by the pool.
+   */
+  private rebuildPoolBoundPasses(): void {
+    this.prepare = createSurfelPreparePass();
+    this.age = createSurfelAgePass();
+    this.findMissing = createSurfelFindMissingPass();
+    this.allocate = createSurfelAllocatePass();
+    this.dispatchArgs = createSurfelDispatchArgs();
+    this.grid = createSurfelHashGrid();
+    this.integratorArgs = createIntegratorDispatchArgs();
+    this.immortaliser = createSurfelImmortaliser();
+    this.resolve = createSurfelGIResolvePass(this.grid, this.pool);
+
+    // Null rather than rebuilt: both are lazily created by their getters against the
+    // pool's current capacity, and neither exists unless something asked for it.
+    this.cacheAtlas = null;
+    this.lightmapSurfels = null;
+    this.geometrySeeder = null;
+
+    if (this.blueNoise && this.envTexture) {
+      this.integrate = createSurfelIntegratePass(this.blueNoise, this.envTexture);
+      this.integrate.setDynamicTracing(this.dynamicTracing);
+      this.integrate.setBaseSampleCount(this.runtimeSampleCount);
+    }
+  }
+
+  /**
+   * Polls how full the pool is and grows it before the allocator starts refusing.
+   *
+   * The readback is one integer and runs at most every `GROWTH_CHECK_FRAMES`; the
+   * alternative signal — noticing that allocations failed — is only available *after*
+   * the frames that came out black.
+   */
+  private maybeGrowPool(renderer: THREE.WebGPURenderer): void {
+    if (this.bakeFreezesPool) return;
+    if (this.growthCheckPending) return;
+    if (this.pool.getCapacity() >= MAX_SURFELS) return;
+
+    const frame = renderer.info.frame;
+    if (frame - this.growthCheckedAtFrame < GROWTH_CHECK_FRAMES) return;
+    this.growthCheckedAtFrame = frame;
+
+    const attr = this.pool.getPoolAllocAttr();
+    if (!attr) return;
+
+    this.growthCheckPending = true;
+    const capacityAtRequest = this.pool.getCapacity();
+    renderer
+      .getArrayBufferAsync(attr)
+      .then((buffer) => {
+        // Capacity moving under the readback means somebody else already grew it, and
+        // acting on a count measured against the old ceiling would double the pool for
+        // no reason.
+        if (this.pool.getCapacity() !== capacityAtRequest) return;
+        const alive = new Int32Array(buffer)[0] ?? 0;
+        if (alive >= capacityAtRequest * SURFEL_POOL_GROW_AT) {
+          this.ensurePoolCapacity(renderer, capacityAtRequest * 2);
+        }
+      })
+      .catch((error) => {
+        // Not swallowed. A growth check that fails quietly is the same defect as an
+        // allocator that fails quietly: the pool stops growing and the only symptom is
+        // geometry that never gets lit.
+        console.error('[gi] surfel pool occupancy readback failed', error);
+      })
+      .finally(() => {
+        this.growthCheckPending = false;
+      });
+  }
+
+  /**
+   * Re-bakes `Mobility.Movable` geometry into the dynamic BVH. Returns true if it
+   * actually rebuilt, which it only does when a mover's world matrix changed.
+   *
+   * Call it from the animation loop next to whatever moves the movers. The cost is a
+   * matrix compare per mover when nothing moved, and a full re-transform plus BVH build
+   * when something did — which is why the mover set wants to stay small. It is the
+   * static structure, not this one, that holds the forest.
+   */
+  updateDynamicScene(options: { force?: boolean } = {}): boolean {
+    return this.dynamicBvh?.refresh(options) ?? false;
+  }
+
+  /**
+   * The dynamic acceleration structure itself: bindings, world bounds and the enable
+   * flag. Exposed so the dynamic GI pass can trace it without going back through the
+   * scene graph.
+   */
+  getDynamicBvh(): DynamicBVHBundle | null {
+    return this.dynamicBvh;
+  }
+
+  /**
+   * The static acceleration structure, for the same reason `getDynamicBvh` exists:
+   * there is exactly one static scene and it gets exactly one BVH.
+   *
+   * The screen-probe final gather traces this. It used to build its own copy — 600 ms
+   * and a duplicate set of node/position/index/attribute buffers on a 168k-triangle
+   * scene, plus a second copy of the per-material diffuse array — which is a price
+   * nobody should pay for the want of one getter. Null until `buildScene` has run.
+   */
+  getSceneBvh(): SceneBVHBundle | null {
+    return this.bvh;
+  }
+
+  /**
+   * Size of the static acceleration structure, as numbers rather than as buffers.
+   *
+   * `scaleProbe.ts` was reaching through TypeScript `private` at runtime to read
+   * `this.bvh` and measuring `byteLength` off the attributes it found. That works —
+   * `private` is a compile-time fence — right up until this field is renamed, at which
+   * point the harness silently reports zero and the report it feeds reads as an
+   * improvement. A measurement that fails quietly is worse than no measurement.
+   */
+  get bvhStats(): {
+    triangles: number;
+    nodes: number;
+    bytes: number;
+    breakdown: Record<string, number>;
+    fullDetail: number;
+    dropped: number;
+    proxied: number;
+    buildMs: number;
+  } | null {
+    if (!this.bvh) return null;
+    const bytesOf = (node: unknown): number => {
+      const attr = (node as { value?: { array?: { byteLength?: number } } })?.value;
+      return attr?.array?.byteLength ?? 0;
+    };
+    const breakdown = {
+      nodes: bytesOf(this.bvh.bvhNode),
+      position: bytesOf(this.bvh.positionNode),
+      normal: bytesOf(this.bvh.normalNode),
+      index: bytesOf(this.bvh.indexNode),
+      color: bytesOf(this.bvh.colorNode),
+    };
+    return {
+      triangles: this.bvh.stats.triangles,
+      nodes:
+        (this.bvh.bvhNode as unknown as { value?: { count?: number } })?.value?.count ?? 0,
+      bytes: Object.values(breakdown).reduce((sum, v) => sum + v, 0),
+      breakdown,
+      fullDetail: this.bvh.stats.fullDetailTriangles,
+      dropped: this.bvh.stats.droppedTriangles,
+      proxied: this.bvh.stats.proxiedTriangles,
+      buildMs: this.bvh.stats.buildMs,
+    };
+  }
+
+  /** Slots the pool currently holds, and what one slot costs. */
+  get poolStats(): { capacity: number; bytesPerSurfel: number; generation: number } {
+    return {
+      capacity: this.pool.getCapacity(),
+      bytesPerSurfel: BYTES_PER_SURFEL,
+      generation: this.pool.getGeneration(),
+    };
   }
 
   /**
@@ -152,7 +451,10 @@ export class SurfelGI {
     if (this.cacheAtlas) return this.cacheAtlas;
     const momentsAttr = this.pool.getMomentsAttr();
     if (!momentsAttr) return null;
-    this.cacheAtlas = createCacheAtlas(momentsAttr, MAX_SURFELS);
+    // The pool's live capacity, not MAX_SURFELS: the atlas is one texel per slot, and
+    // sizing it against the ceiling drew a mostly-empty square whose occupied corner
+    // shrank every time the pool got smaller.
+    this.cacheAtlas = createCacheAtlas(momentsAttr, this.pool.getCapacity());
     return this.cacheAtlas;
   }
 
@@ -184,10 +486,9 @@ export class SurfelGI {
     renderer: THREE.WebGPURenderer,
     scene: THREE.Scene,
     camera: THREE.PerspectiveCamera,
-    dirLight: THREE.DirectionalLight,
     options: { staticOnly?: boolean } = {},
   ): boolean {
-    if (!this.bvh || !this.integrate) {
+    if (!this.bvh || !this.dynamicBvh || !this.integrate) {
       this.prevCameraPos.copy(camera.position);
       return false;
     }
@@ -209,6 +510,10 @@ export class SurfelGI {
 
     // --- surfel lifecycle (skipped once frozen) ------------------------------
     this.prepare.run(renderer, this.pool);
+
+    // Ahead of spawning, not after: a pool that grows in response to allocations
+    // already having failed has produced black frames to get the signal.
+    if (!this._frozen) this.maybeGrowPool(renderer);
 
     if (!this._frozen) {
       const found = this.findMissing.run(
@@ -242,14 +547,21 @@ export class SurfelGI {
         renderer,
         this.pool,
         this.bvh,
+        this.dynamicBvh,
         this.grid,
         camera,
-        dirLight,
+        scene,
         this.integratorArgs.getIndirectAttr(),
+        // A bake writes into surfels that are about to be pinned, so it must see the
+        // static world and nothing else. Trace a mover here and its pose is frozen into
+        // the cache permanently -- the cache stops being a property of the level.
+        { includeDynamic: !options.staticOnly },
       );
     }
 
     this.resolve.run(renderer, camera, this.gbuffer);
+
+    this.reportGridOccupancy(renderer);
 
     this.prevCameraPos.copy(camera.position);
     if (!this._frozen) this.pool.swapMoments();
@@ -265,15 +577,104 @@ export class SurfelGI {
     return changed;
   }
 
+  private gridStatsDone = false;
+
   /**
-   * Converges the cache against static geometry under a wall-clock budget, then
-   * freezes it.
+   * Logs how many surfels each occupied grid cell holds, once, at `?gridstats=N`.
    *
-   * Surfels are spawned from the G-Buffer, so a bake from a single viewpoint only
-   * covers what that viewpoint sees — turn the camera afterwards and the rest of the
-   * world has no GI. The bake therefore sweeps a virtual camera around the static
-   * bounds on an orbit at several elevations, at a wide FOV, so coverage is driven by
-   * the geometry rather than by wherever the player happened to be standing.
+   * After the grid's slot pass has run, cell `i` occupies `[header[i], header[i+1])` of
+   * the list, so occupancy is a difference of adjacent header entries and needs no second
+   * structure. The number that matters is how many cells exceed the resolve's fetch cap:
+   * above it the resolve sees an arbitrary subset, and which subset is decided by atomic
+   * retirement order — so the frame stops being a function of the cache.
+   */
+  private reportGridOccupancy(renderer: THREE.WebGPURenderer): void {
+    const at = giKnobs.gridStatsAt();
+    if (at <= 0 || this.gridStatsDone || renderer.info.frame < at) return;
+    this.gridStatsDone = true;
+
+    const attr = this.grid.getOffsetsAndListAttr();
+    if (!attr) return;
+
+    void renderer
+      .getArrayBufferAsync(attr as unknown as THREE.BufferAttribute)
+      .then((buffer) => {
+        const ints = new Int32Array(buffer);
+        const header = TOTAL_CELLS + 1;
+        const counts: number[] = [];
+        let over = 0;
+        let inOver = 0;
+        let total = 0;
+        // Cell index is x + y*CS + z*CS² + cascade*CS³, so the cascade a cell belongs to
+        // is the quotient. Broken out because cell size doubles per cascade and therefore
+        // so does the density a cell has to hold: if the overfull cells are all coarse,
+        // no amount of thinning the cache fixes them for a camera standing further back.
+        const perCascade = new Array<number>(CASCADES).fill(0);
+        const overPerCascade = new Array<number>(CASCADES).fill(0);
+        const cascadeSpan = SURFEL_CS * SURFEL_CS * SURFEL_CS;
+        for (let i = 0; i < TOTAL_CELLS; i++) {
+          const n = ints[i + 1] - ints[i];
+          if (n <= 0) continue;
+          counts.push(n);
+          total += n;
+          const cascade = Math.floor(i / cascadeSpan);
+          perCascade[cascade] = (perCascade[cascade] ?? 0) + 1;
+          if (n > RESOLVE_FETCH_CAP) {
+            over++;
+            inOver += n;
+            overPerCascade[cascade] = (overPerCascade[cascade] ?? 0) + 1;
+          }
+        }
+        counts.sort((a, b) => a - b);
+        const pct = (p: number) => counts[Math.floor((counts.length - 1) * p)] ?? 0;
+        console.log(
+          `[gridstats] frame ${renderer.info.frame}: ${counts.length} occupied cells, ` +
+            `${total} entries, occupancy p50=${pct(0.5)} p90=${pct(0.9)} p99=${pct(0.99)} ` +
+            `max=${counts[counts.length - 1] ?? 0}; ${over} cells over the resolve's ` +
+            `fetch cap of ${RESOLVE_FETCH_CAP}, holding ${inOver} entries ` +
+            `(${((100 * inOver) / Math.max(1, total)).toFixed(1)}% of the grid). ` +
+            `cells/cascade [${perCascade}] over/cascade [${overPerCascade}]. ` +
+            `header ${header} ints`,
+        );
+      })
+      .catch((error) => console.error('[gridstats] readback failed', error));
+  }
+
+  /**
+   * Converges the cache against static geometry over a counted schedule, then freezes it.
+   *
+   * The schedule is the point. The old budget was wall-clock, and the objection to it
+   * that mattered was not jitter in how many views ran — that measured at ~1 %, and the
+   * cache it produced repeated to ~1 % too. It was that *spawning never stopped*. Every
+   * orbit view spawns wherever the last one lacked coverage, and the immortaliser pins
+   * whatever is alive when the clock runs out, so a longer sweep did not converge the
+   * cache, it thickened it: 23 views put 10,144 entries into the hash grid, 618 views put
+   * 41,809 into the same ~950 cells.
+   *
+   * Past a density, that cache cannot be read back deterministically at all.
+   * `surfelGIResolvePass` fetches at most `RESOLVE_FETCH_CAP` surfels out of the cell a
+   * pixel hashes into, and the grid fills a cell in whatever order its atomics retired —
+   * so a cell over the cap hands every frame a different subset, and a corner cell whose
+   * surfels face three different planes can hand back a subset that all weight to zero.
+   * At 618 views, 51.7 % of the grid sat in such cells and a wedge region flickered
+   * between 6 and 75 with the entire lifecycle frozen and the cache byte-identical. Seven
+   * captures of that flicker are what "the bake is non-deterministic" was measuring.
+   *
+   * So the loop is now two counted phases. `bakeSpawnViews` orbit views grow the
+   * population, then the population is held fixed and `bakeIntegrations` passes converge
+   * radiance with no G-Buffer, no find-missing, no ageing and no allocation — the same
+   * grid/args/integrate/swap loop `bakeLightmap` runs. Convergence stops costing density,
+   * which is what lets it run long enough to actually finish: 800 passes reach a wall
+   * value the old sweep only got to by quadrupling the surfel count. `?bakeclock=1` puts
+   * the old budget back, so this is an ablation rather than an argument.
+   *
+   * Growth is refused for the duration rather than handled. It replaces every pool buffer
+   * and the radiance in them does not survive, and whether it fires depends on where a
+   * periodic readback landed — a coin flip in the middle of a bake. `reportBakeOccupancy`
+   * says so afterwards instead.
+   *
+   * `?geoseed=1` replaces the spawn phase with area-sampled placement from the triangles
+   * the BVH holds; see the note on that knob for why it is off.
    *
    * Ray count is raised for the duration: convergence quality is paid for once here
    * instead of every frame forever.
@@ -281,15 +682,14 @@ export class SurfelGI {
   async bake(
     renderer: THREE.WebGPURenderer,
     scene: THREE.Scene,
-    dirLight: THREE.DirectionalLight,
     options: {
       durationMs?: number;
       raysPerSurfel?: number;
-      /** Orbit elevations cycled through, in radians. */
+      /** Orbit elevations cycled through, in radians. Only used by the fallback. */
       elevations?: number[];
       onProgress?: (fraction: number, frames: number) => void;
     } = {},
-  ): Promise<{ frames: number; ms: number }> {
+  ): Promise<{ frames: number; ms: number; seeded: number }> {
     const {
       durationMs = 5000,
       raysPerSurfel = 32,
@@ -304,37 +704,146 @@ export class SurfelGI {
     const centre = bounds.getCenter(new THREE.Vector3());
     const radius = Math.max(0.5, bounds.getBoundingSphere(new THREE.Sphere()).radius);
 
-    const bakeCamera = new THREE.PerspectiveCamera(100, 1, 0.05, radius * 20);
+    const seeded = giKnobs.geometrySeed()
+      ? this.seedFromGeometry(renderer, scene)
+      : 0;
 
-    const start = performance.now();
+    // Only ever alongside the orbit sweep. `geoseed` deletes the sweep, and a pass whose
+    // entire contract is "spawn where find-missing did not" has nothing to supplement
+    // when find-missing is not in the loop.
+    let holeFill: ReturnType<typeof createSurfelHoleFill> | null =
+      seeded === 0 && giKnobs.holeFill() ? this.createHoleFill(scene) : null;
+    let filling = false;
+
+    const deterministic = giKnobs.deterministicBake();
+
+    // geoseed places the entire population up front, so it has nothing to spawn and its
+    // whole budget is integration. The orbit sweep is the one that grows as it goes.
+    const spawnViews =
+      seeded > 0 ? 0 : Math.max(0, Math.round(giKnobs.bakeSpawnViews()));
+    const integrations = Math.max(1, Math.round(giKnobs.bakeIntegrations()));
+    const scheduled = spawnViews + integrations;
+
+    // Nothing may grow the pool between here and the immortaliser. Growth replaces every
+    // buffer and the converged radiance in them is gone; whether it fires at all depends
+    // on how many surfels happened to be alive when a periodic readback landed, which is
+    // GPU scheduling rather than scene content. Refusing outright and reporting occupancy
+    // afterwards turns a silent coin flip into a number.
+    this.bakeFreezesPool = deterministic;
+
+    let start = performance.now();
     let frames = 0;
+    let generation = this.pool.getGeneration();
+    let overran = false;
 
-    while (performance.now() - start < durationMs) {
-      const elapsed = performance.now() - start;
-      const fraction = elapsed / durationMs;
+    // The fixed viewpoint the grid and the bounce weighting are parameterised by.
+    const bakeCamera = new THREE.PerspectiveCamera(100, 1, 0.05, radius * 20);
+    bakeCamera.position.copy(centre);
+    bakeCamera.updateMatrixWorld();
 
-      // Golden-angle azimuth so successive views are spread out rather than
-      // sweeping slowly through one side of the room first.
-      // Inside the volume looking outward, not orbiting outside it. Surfels are
-      // spawned from the G-Buffer, so an exterior orbit never sees inward-facing
-      // surfaces -- which is precisely where a Cornell box needs coverage.
-      const azimuth = frames * 2.39996323;
-      const elevation = elevations[frames % elevations.length];
-      const inset = radius * 0.35;
+    for (;;) {
+      if (deterministic) {
+        if (frames >= scheduled) break;
+        if (performance.now() - start > BAKE_WALL_CLOCK_CAP_MS) {
+          overran = true;
+          break;
+        }
+      } else if (performance.now() - start >= durationMs) {
+        break;
+      }
 
-      bakeCamera.position.set(
-        centre.x + Math.cos(azimuth * 0.37) * inset,
-        centre.y + Math.sin(azimuth * 0.23) * inset * 0.5,
-        centre.z + Math.sin(azimuth * 0.37) * inset,
-      );
-      bakeCamera.lookAt(
-        centre.x + Math.cos(azimuth) * Math.cos(elevation) * radius * 4,
-        centre.y + Math.sin(elevation - 0.4) * radius * 4,
-        centre.z + Math.sin(azimuth) * Math.cos(elevation) * radius * 4,
-      );
-      bakeCamera.updateMatrixWorld();
+      // A pool that grows mid-bake takes the partially converged cache with it, so the
+      // frames spent so far bought nothing. Restarting the clock is the difference
+      // between "the bake was interrupted and shipped half-converged" and "the bake cost
+      // twice as long once, on a scene that needed a bigger pool".
+      const currentGeneration = this.pool.getGeneration();
+      if (currentGeneration !== generation) {
+        generation = currentGeneration;
+        console.warn(
+          `[gi] the surfel pool grew ${frames} views into the bake; the cache it had ` +
+            'built went with it. Restarting the bake budget against the new pool.',
+        );
+        start = performance.now();
+        frames = 0;
+        // The fill's nodes bind the pool that just went away, and the surfels it had
+        // spawned went with it. Both have to start over, or `keepAlive` pays rent on
+        // slot indices that now belong to somebody else.
+        holeFill = giKnobs.holeFill() ? this.createHoleFill(scene) : null;
+        filling = false;
+      }
 
-      this.update(renderer, scene, bakeCamera, dirLight, { staticOnly: true });
+      // Spawning is a phase, not the whole bake. Every orbit view adds surfels wherever
+      // the previous one lacked coverage and nothing ever calls that finished, so a
+      // longer sweep does not converge the cache — it thickens it, until a hash-grid cell
+      // holds more surfels than the resolve will read out of one and the pixels it feeds
+      // are drawn from an arbitrary subset. Coverage is reached in a few dozen views;
+      // everything after that is spent on radiance instead.
+      const spawning = frames < spawnViews;
+      const fraction = deterministic
+        ? frames / scheduled
+        : (performance.now() - start) / durationMs;
+
+      if (seeded > 0 || (deterministic && !spawning)) {
+        if (frames === spawnViews) {
+          // Back to the centre for the convergence phase, for the same reason the geoseed
+          // path never leaves it: the grid and the bounce weighting are parameterised by a
+          // viewpoint, and a bake needs that parameter to be a constant rather than
+          // whichever way the sweep happened to stop looking.
+          bakeCamera.position.copy(centre);
+          bakeCamera.updateMatrixWorld();
+        }
+        // The integrator keys its blue-noise sequence off the frame counter and nothing
+        // renders here, so without advancing it by hand every iteration would cast the
+        // same directions and the estimate would never move.
+        renderer.info.frame++;
+        this.grid.build(renderer, this.pool, bakeCamera);
+        this.integratorArgs.run(renderer, this.pool);
+        this.integrate!.run(
+          renderer,
+          this.pool,
+          this.bvh!,
+          this.dynamicBvh!,
+          this.grid,
+          bakeCamera,
+          scene,
+          this.integratorArgs.getIndirectAttr(),
+          { includeDynamic: false },
+        );
+        this.pool.swapMoments();
+      } else {
+        // Fallback (`?geoseed=0`): the original orbit sweep, kept whole so the coverage
+        // claim can be measured against the thing it replaced.
+        const azimuth = frames * 2.39996323;
+        const elevation = elevations[frames % elevations.length];
+        const inset = radius * 0.35;
+
+        bakeCamera.position.set(
+          centre.x + Math.cos(azimuth * 0.37) * inset,
+          centre.y + Math.sin(azimuth * 0.23) * inset * 0.5,
+          centre.z + Math.sin(azimuth * 0.37) * inset,
+        );
+        bakeCamera.lookAt(
+          centre.x + Math.cos(azimuth) * Math.cos(elevation) * radius * 4,
+          centre.y + Math.sin(elevation - 0.4) * radius * 4,
+          centre.z + Math.sin(azimuth) * Math.cos(elevation) * radius * 4,
+        );
+        bakeCamera.updateMatrixWorld();
+
+        this.update(renderer, scene, bakeCamera, { staticOnly: true });
+
+        if (holeFill) {
+          // After `update`, so the coverage query reads a grid that already contains
+          // everything this view spawned.
+          const sweep = deterministic
+            ? frames / Math.max(1, spawnViews)
+            : fraction;
+          if (sweep >= HOLE_FILL_FROM && sweep <= HOLE_FILL_TO) {
+            holeFill.fill(renderer, this.pool, this.grid, bakeCamera);
+            filling = true;
+          }
+          if (filling) holeFill.keepAlive(renderer);
+        }
+      }
 
       frames++;
       onProgress?.(Math.min(1, fraction), frames);
@@ -344,21 +853,171 @@ export class SurfelGI {
     }
 
     const ms = performance.now() - start;
+    this.bakeFreezesPool = false;
     this.setBaseSampleCount(this.runtimeSampleCount);
+
+    if (overran) {
+      console.error(
+        `[gi] the bake hit its ${(BAKE_WALL_CLOCK_CAP_MS / 1000).toFixed(0)}s wall-clock ` +
+          `safety cap after ${frames} of ${scheduled} scheduled iterations. This result is ` +
+          'NOT reproducible — how much of the schedule ran was decided by the clock, which ' +
+          'is exactly what the counted schedule exists to avoid. Treat every number taken ' +
+          'from this cache as noise.',
+      );
+    }
+
+    // The pool was not allowed to grow above, so if the bake filled it past the point the
+    // runtime allocator would have doubled at, the first frames after this will do the
+    // growing instead — and take the cache that was just paid for with them.
+    if (deterministic) await this.reportBakeOccupancy(renderer);
+
+    // Read before pinning, so the number reported is what the fill actually placed
+    // rather than what survived the immortaliser's convergence test.
+    const filled = holeFill ? await holeFill.readSpawned(renderer) : 0;
 
     // Everything alive at this point is the static cache: make it immortal so it
     // survives without re-integration, then hand the lifecycle back so movable
     // geometry can still get surfels of its own.
-    const surfelAttr = this.pool.getSurfelAttr();
-    if (surfelAttr) this.immortaliser.run(renderer, surfelAttr);
+    this.immortaliser.run(renderer, this.pool);
 
     this._frozen = this.freezeCompletely;
 
+    const schedule = !deterministic
+      ? `${frames} orbit views under a ${(durationMs / 1000).toFixed(1)}s clock`
+      : seeded > 0
+        ? `${frames} integrations of ${seeded} geometry-seeded surfels`
+        : `${spawnViews} spawn views + ${integrations} integrations`;
+
     console.log(
-      `[gi] baked in ${(ms / 1000).toFixed(2)}s over ${frames} views; static cache pinned` +
+      `[gi] baked in ${(ms / 1000).toFixed(2)}s over ${schedule}` +
+        (holeFill
+          ? `, ${filled} surfels hole-filled from ${holeFill.candidates} candidates`
+          : '') +
+        '; static cache pinned' +
         (this._frozen ? ', all passes frozen' : ', lifecycle live for movers'),
     );
-    return { frames, ms };
+    return { frames, ms, seeded };
+  }
+
+  /**
+   * Reports how full the pool is once a counted bake has finished.
+   *
+   * Growth is refused for the duration of such a bake, so this is where the refusal gets
+   * paid for: if the population landed above the threshold the runtime allocator doubles
+   * at, the frames immediately after this will grow and take the cache with them. Loud,
+   * because the symptom — a cache that vanishes a second after it was built — looks
+   * nothing like its cause.
+   */
+  private async reportBakeOccupancy(renderer: THREE.WebGPURenderer): Promise<void> {
+    const attr = this.pool.getPoolAllocAttr();
+    if (!attr) return;
+    try {
+      const buffer = await renderer.getArrayBufferAsync(attr);
+      const alive = new Int32Array(buffer)[0] ?? 0;
+      const capacity = this.pool.getCapacity();
+      if (alive >= capacity * SURFEL_POOL_GROW_AT) {
+        console.error(
+          `[gi] the bake left ${alive}/${capacity} pool slots in use, at or above the ` +
+            `${(SURFEL_POOL_GROW_AT * 100).toFixed(0)}% mark the runtime allocator doubles ` +
+            'at. It will double on one of the next few frames and the cache just baked ' +
+            'does not survive that. Raise ?surfels= past ' +
+            `${Math.ceil(alive / (SURFEL_POOL_GROW_AT * 0.9))} and bake again.`,
+        );
+      }
+    } catch (error) {
+      console.error('[gi] post-bake pool occupancy readback failed', error);
+    }
+  }
+
+  /**
+   * Fills the pool from the static geometry, growing it first if the sample set needs
+   * more slots than it currently holds.
+   *
+   * The budget handed to the sampler is the pool's ceiling rather than its current
+   * size, because a bake is the one consumer that genuinely wants the ceiling — the
+   * same argument `bakeLightmap` makes — and because discovering the shortfall during
+   * seeding means the tail of the world bakes black.
+   */
+  private seedFromGeometry(
+    renderer: THREE.WebGPURenderer,
+    scene: THREE.Scene,
+  ): number {
+    if (!this.bvh) return 0;
+
+    const override = giKnobs.geometrySeedBudget();
+    const budget = Math.min(
+      MAX_SURFELS,
+      override > 0 ? override : Math.max(SURFEL_POOL_BASE, 65536),
+    );
+
+    const seeds = sampleStaticSurfaces(scene, this.bvh.materialIdByUUID, { budget });
+    if (seeds.count === 0) {
+      console.error(
+        '[geoseed] the static scene sampled to zero surfels. Falling back to the orbit ' +
+          'sweep, which covers what a camera can see and leaves concave corners empty.',
+      );
+      return 0;
+    }
+
+    // Headroom above the growth threshold, not just above the seed count. A pool that
+    // the seeds fill to 99 % is a pool `maybeGrowPool` doubles on the first runtime
+    // frame after the bake — and growth throws the cache away, so the entire bake would
+    // be spent and then discarded a frame later. Sizing so occupancy lands under
+    // `SURFEL_POOL_GROW_AT` is what stops that.
+    this.ensurePoolCapacity(
+      renderer,
+      Math.min(MAX_SURFELS, Math.ceil(seeds.count / (SURFEL_POOL_GROW_AT * 0.9)) + 256),
+    );
+
+    if (!this.geometrySeeder) {
+      // Sized against what was actually sampled, not against the budget: the sampler
+      // solves a spacing and then deduplicates, so its output overshoots the budget by
+      // whatever the dedup did not remove, and a seed buffer sized to the budget
+      // silently drops the tail.
+      this.geometrySeeder = createGeometrySeeder(this.pool, seeds.count);
+    }
+    return this.geometrySeeder.run(renderer, seeds);
+  }
+
+  private geometrySeeder: ReturnType<typeof createGeometrySeeder> | null = null;
+
+  /**
+   * Builds the candidate set the hole fill tests for coverage.
+   *
+   * It borrows `sampleStaticSurfaces` — the same area sampler `geoseed` uses, and the
+   * same one the BVH's own gather feeds, so a candidate always stands on a triangle a
+   * ray can actually hit. What it does *not* borrow is geoseed's conclusion. There the
+   * sample set became the cache; here it is only a list of questions, and all but a few
+   * hundred of them are answered "already covered, do nothing".
+   *
+   * The budget is therefore about candidate density, not about pool spend: it decides
+   * how finely the fill can resolve a hole, and the surfels it costs are bounded by how
+   * much of the world the sweep missed rather than by how many points are on this list.
+   */
+  private createHoleFill(
+    scene: THREE.Scene,
+  ): ReturnType<typeof createSurfelHoleFill> | null {
+    if (!this.bvh) return null;
+
+    const override = giKnobs.holeFillBudget();
+    const budget = Math.min(
+      MAX_SURFELS,
+      override > 0 ? override : Math.max(SURFEL_POOL_BASE, 65536),
+    );
+    const seeds = sampleStaticSurfaces(scene, this.bvh.materialIdByUUID, { budget });
+    if (seeds.count === 0) {
+      console.error(
+        '[holefill] the static scene sampled to zero candidates; the bake is back on ' +
+          'the orbit sweep alone and concave corners will stay empty.',
+      );
+      return null;
+    }
+
+    return createSurfelHoleFill(seeds, {
+      coverage: giKnobs.holeFillCoverage(),
+      rate: giKnobs.holeFillRate(),
+      edge: giKnobs.holeFillEdge(),
+    });
   }
 
   /**
@@ -438,7 +1097,6 @@ export class SurfelGI {
     renderer: THREE.WebGPURenderer,
     scene: THREE.Scene,
     gbuffer: LightmapGBuffer,
-    dirLight: THREE.DirectionalLight,
     size: number,
     options: {
       iterations?: number;
@@ -461,20 +1119,26 @@ export class SurfelGI {
     seeded: number;
     stats: Awaited<ReturnType<ReturnType<typeof createLightmapSurfels>['readStats']>>;
   } | null> {
-    if (!this.bvh || !this.integrate) return null;
+    if (!this.bvh || !this.dynamicBvh || !this.integrate) return null;
 
-    // 200, not 64: MSME accumulates to MAX_TEMPORAL_M = 200 samples, so anything
-    // less leaves every texel short of the temporal convergence the runtime reaches
-    // in a few hundred frames -- and the shortfall is visible as per-texel grain,
-    // because unlike the runtime resolve a bake has nothing averaging texels together.
+    // MSME accumulates to MAX_TEMPORAL_M samples and no further, so that is what the
+    // default is -- not a number that happens to resemble it. See the note on the
+    // constant for why this stopped being written out by hand in two places.
     const {
-      iterations = 200,
+      iterations = MAX_TEMPORAL_M,
       raysPerSurfel = 32,
       viewpoint,
       denoise,
       dilate,
       onProgress,
     } = options;
+
+    // A lightmap bake is the one consumer that genuinely wants the ceiling: it spends
+    // one surfel per covered atlas texel, and a 512 atlas on a 400 m landscape covers
+    // ~143 k of them. Growing here rather than discovering the shortfall during seeding
+    // is what stops the tail of the atlas baking black — and this is the safe moment to
+    // do it, because `resetCache` has already thrown the runtime cache away.
+    this.ensurePoolCapacity(renderer, Math.min(MAX_SURFELS, size * size));
 
     if (!this.lightmapSurfels) {
       this.lightmapSurfels = createLightmapSurfels(this.pool, size);
@@ -510,11 +1174,15 @@ export class SurfelGI {
       this.integrate.run(
         renderer,
         this.pool,
-        this.bvh,
+        this.bvh!,
+        this.dynamicBvh!,
         this.grid,
         camera,
-        dirLight,
+        scene,
         this.integratorArgs.getIndirectAttr(),
+        // A lightmap is by definition the static half. Anything movable in it is a
+        // stain that no amount of re-baking removes.
+        { includeDynamic: false },
       );
       this.pool.swapMoments();
 
@@ -561,4 +1229,16 @@ export class SurfelGI {
   setAlbedoBoost(boost: number): void {
     this.integrate?.setAlbedoBoost(boost);
   }
+
+  /**
+   * Turns tracing of the dynamic BVH on and off without touching the scene. The mover
+   * stays rastered and stays in the surfel population, so a pair of captures taken
+   * across this switch differs in exactly one thing: whether a ray can see it.
+   */
+  setDynamicTracing(enabled: boolean): void {
+    this.dynamicTracing = enabled;
+    this.integrate?.setDynamicTracing(enabled);
+  }
+
+  private dynamicTracing = true;
 }

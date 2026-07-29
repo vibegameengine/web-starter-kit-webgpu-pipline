@@ -24,11 +24,17 @@ export async function initRenderer(
     antialias: false,
     forceWebGL: false,
     // The surfel GI passes need more than the WebGPU defaults: the integrator binds
-    // 10 storage buffers in one compute stage, and the grid build dispatches
+    // 14 storage buffers in one compute stage, and the grid build dispatches
     // 512-wide workgroups. Without these the pipelines fail to create and every
     // compute pass silently drops.
+    //
+    // 14 rather than 10 because tracing movable geometry means a second acceleration
+    // structure bound alongside the first — node/position/index/attribute again. WGSL
+    // cannot take a storage binding as a function argument, so there is no way to
+    // reuse one set of bindings for two structures; the count is the price of the
+    // static/dynamic split.
     requiredLimits: {
-      maxStorageBuffersPerShaderStage: 10,
+      maxStorageBuffersPerShaderStage: 14,
       maxComputeWorkgroupSizeX: 1024,
       maxComputeInvocationsPerWorkgroup: 1024,
     },

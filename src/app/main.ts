@@ -18,11 +18,23 @@ import {
   setLightAnglesFromEnvMapSunUVLocation,
 } from '../shared/gi/surfel/lighting.ts';
 import { applyOcclusionSettings } from '../shared/gi/surfel/surfelRadialDepth.ts';
+import {
+  applyProbeScene,
+  applyProbeSettings,
+  probeSettings,
+  probeStats,
+  probeTextures,
+} from '../shared/gi/probe/index.ts';
 import type { DynamicObject } from '../shared/gi/surfel/content.ts';
+import { MAX_TEMPORAL_M } from '../shared/gi/surfel/constants.ts';
+import { giLightSummary } from '../shared/gi/surfel/sceneLights.ts';
 import {
   addDynamicSphere,
   createCornellScene,
+  createLargeScene,
+  installScaleProbe,
   populateCornell,
+  populateLargeScene,
 } from '../widgets/world/index.ts';
 
 const loadingOverlay = document.querySelector<HTMLElement>('#loading-overlay');
@@ -78,7 +90,12 @@ async function boot(): Promise<void> {
   setLoading('Building scene');
   const world = new WorldState();
   const stats = new CacheStats();
-  const { scene, camera, controls, sun } = createCornellScene(renderer);
+  // `?scene=large` swaps the forty-triangle reference box for a landscape-scale one.
+  // Both builders return the same bundle, so nothing below this line branches again
+  // except the populate call.
+  const sceneName = params.get('scene') === 'large' ? 'large' : 'cornell';
+  const { scene, camera, controls, sun } =
+    sceneName === 'large' ? createLargeScene(renderer) : createCornellScene(renderer);
 
   setLoading('Loading GI assets');
   const gi = await SurfelGI.create(renderer);
@@ -93,10 +110,17 @@ async function boot(): Promise<void> {
     gui,
     sun,
   );
+  // `?sun=0` puts the sun out without removing it, which is the only way to show that
+  // an emissive surface is a *light source* rather than a surface that happens to look
+  // bright when something else is lighting it. Pair with `?env=0`; the sky is the other
+  // thing in this frame that emits.
+  const sunIntensity = num('sun');
+  if (sunIntensity !== null) lightCfg.intensity = sunIntensity;
   applyOcclusionSettings({ shadowStrength: 0.5 });
 
-  setLoading('Building Cornell box');
-  populateCornell(scene, sun);
+  setLoading(sceneName === 'large' ? 'Building landscape' : 'Building Cornell box');
+  if (sceneName === 'large') await populateLargeScene(scene, sun, camera, controls);
+  else populateCornell(scene, sun);
 
   // AFTER populate, deliberately: buildCornellScene ends by hard-coding
   // dirLight.position to (1,3,1), which throws away the env-derived sun and leaves
@@ -114,9 +138,11 @@ async function boot(): Promise<void> {
   // the pool holds MAX_SURFELS of them. A 1024 atlas at current chart density wants
   // more texels than that, and the overflow would silently come out black.
   const lightmapSize = num('lm') ?? 512;
-  // 200 to match MAX_TEMPORAL_M: below that every texel is short of the temporal
-  // convergence the runtime reaches, and the shortfall shows up as per-texel grain.
-  const lightmapIterations = num('iters') ?? 200;
+  // MAX_TEMPORAL_M, read from the constant rather than typed out: below it every texel
+  // is short of the temporal convergence the runtime reaches, and the shortfall shows
+  // up as per-texel grain. This used to be a literal here and a different literal in
+  // `bakeLightmap`'s argument for it, which is worse than either number on its own.
+  const lightmapIterations = num('iters') ?? MAX_TEMPORAL_M;
   const lightmapRays = num('rays') ?? 32;
   // Default is webgiya's surfel GI: that path is verified against upstream
   // pixel-for-pixel (mean 0.79/255, inside the build's own run-to-run noise).
@@ -129,18 +155,66 @@ async function boot(): Promise<void> {
   // by the time the BVH merges it. Before the BVH because the unwrapper gives uv1 to
   // some meshes and not others, and the merge is what has to cope with that.
   setLoading('Unwrapping lightmap UVs');
-  assignLightmapUvs(scene, { padding: num('pad') ?? 0.12 });
+  assignLightmapUvs(scene, {
+    padding: num('pad') ?? 0.12,
+    // The atlas edge is what turns cells into texels, so the density report is
+    // meaningless without it. It is only used for reporting and refusal — the layout
+    // itself is resolution-independent.
+    atlasSize: lightmapSize,
+  });
+
+  // Before the BVH now, not after. It used to be added afterwards because that was the
+  // only way to keep it out of the static structure; the structure itself now decides,
+  // by mobility. Being in the scene at build time is what gets the mover's material an
+  // id in the shared diffuse array, without which a ray that hits it cannot be shaded.
+  // `?mover=0` still leaves it out entirely, so a runtime-vs-bake diff can measure the
+  // static lighting on its own.
+  // `?moverRadius=` exists because the default sphere is small and orbits nowhere near
+  // a wall: its indirect contribution at that size sits under the frame's own run-to-run
+  // noise, so a capture cannot tell a working tracer from a broken one. Sizing it up is
+  // how the dynamic BVH gets measured without moving the demo's furniture.
+  const dynamic: DynamicObject | null =
+    params.get('mover') === '0'
+      ? null
+      : addDynamicSphere(scene, { radius: num('moverRadius') ?? undefined });
+
+  // `?dyntrace=0` keeps the mover in the scene and stops rays from seeing it. It is the
+  // ablation the fix is measured against: everything else about the frame is identical.
+  gi.setDynamicTracing(params.get('dyntrace') !== '0');
 
   setLoading('Building static BVH');
   gi.buildScene(renderer, scene);
 
-  // After the BVH: the mover is raster + shadows only, never part of the static world.
-  // `?mover=0` leaves it out entirely, which is what makes a runtime-vs-bake diff
-  // measure the *static* lighting: the bake has no representation for movable
-  // geometry at all, so leaving the sphere in would drown the number it is meant to
-  // report in a difference nobody is claiming to have fixed yet.
-  const dynamic: DynamicObject | null =
-    params.get('mover') === '0' ? null : addDynamicSphere(scene);
+  // Applied here, not with the rest of the GUI defaults further down: the bake runs
+  // before those exist, and a knob that only takes effect after the cache has converged
+  // is a knob that does nothing.
+  const envIntensityParam = num('env') ?? 1;
+  gi.setEnvControls(envIntensityParam, 4);
+
+  // --- screen probes ---------------------------------------------------------
+  // The probe tracer needs both acceleration structures, the sun and the scene, and
+  // holds none of them: it is constructed inside the resolve pass, which is handed
+  // the hash grid and the pool and nothing else. Everything it traces is the *same*
+  // structure the surfel integrator traces — one static scene, one BVH.
+  applyProbeScene({
+    scene,
+    bvh: gi.getSceneBvh(),
+    dynBvh: gi.getDynamicBvh(),
+    env: gi.envTexture,
+    light: sun,
+  });
+  const probesRequested = params.get('probes') !== '0';
+  applyProbeSettings({
+    enabled: probesRequested,
+    nearField: num('near') ?? probeSettings.nearField,
+    temporalAlpha: num('probeBlend') ?? probeSettings.temporalAlpha,
+    traceStride: num('probeStride') ?? probeSettings.traceStride,
+    planeEpsilon: num('probeEps') ?? probeSettings.planeEpsilon,
+    adaptive: params.get('probeAdaptive') !== '0',
+    spatialFilter: params.get('probeFilter') !== '0',
+    // Same switch the integrator answers to, so an ablation moves both tiers.
+    dynamicTracing: params.get('dyntrace') !== '0',
+  });
 
   const lightmapIntensity = uniform(0);
   // Read by the mode switch, written by the GUI slider: a plain const here meant the
@@ -204,7 +278,6 @@ async function boot(): Promise<void> {
       renderer,
       scene,
       lightmapGBuffer,
-      sun,
       lightmapSize,
       {
         iterations,
@@ -244,7 +317,7 @@ async function boot(): Promise<void> {
     gi.resetCache(renderer);
     if (durationMs <= 0) return;
     setLoading(`Warming surfel cache (${(durationMs / 1000).toFixed(0)}s)`);
-    await gi.bake(renderer, scene, sun, {
+    await gi.bake(renderer, scene, {
       durationMs,
       onProgress: (fraction, frames) => {
         setLoading(`Warming ${(fraction * 100).toFixed(0)}% · ${frames} views`);
@@ -268,6 +341,10 @@ async function boot(): Promise<void> {
     const previous = lightingMode;
     switching = true;
     baked = false;
+    // A bake runs the resolve chain a few hundred times from a camera nobody will
+    // ever look through. Probes there are pure cost, and worse, they would spend
+    // the budget the cache is supposed to be converging with.
+    applyProbeSettings({ enabled: false });
     try {
       lightingMode = next;
       if (next === 'lightmap') {
@@ -276,10 +353,17 @@ async function boot(): Promise<void> {
         frameGraph.setGiTextures(null, null);
         await prepareLightmap(bakeParams.passes);
         lightmapIntensity.value = lightmapParams.intensity;
+        // Frozen, then run anyway. The whole surfel lifecycle stays off -- the pool
+        // is full of atlas texels and must stay that way -- but the camera-shaped
+        // tail still runs each frame: G-Buffer, camera-centred grid rebuild, gather.
+        // That is what gives the probes a populated world-space cache to fall back
+        // to, and it is why a mover is no longer a black hole in this mode.
+        gi.setFrozen(true);
       } else {
         lightmapIntensity.value = 0;
         await prepareSurfel(bakeParams.seconds * 1000);
       }
+      applyProbeSettings({ mode: next, enabled: probesRequested });
       bakedSunVersion = world.sunVersion;
       baked = true;
     } catch (error) {
@@ -287,6 +371,7 @@ async function boot(): Promise<void> {
       // neither GI chain running and nothing on screen would say so.
       lightingMode = previous;
       lightmapIntensity.value = previous === 'lightmap' ? lightmapParams.intensity : 0;
+      applyProbeSettings({ mode: previous, enabled: probesRequested });
       throw error;
     } finally {
       switching = false;
@@ -318,7 +403,7 @@ async function boot(): Promise<void> {
     mode: frameGraph.giMode,
     indirectIntensity: frameGraph.indirectIntensity.value,
     baseSamples: 4,
-    envIntensity: 1,
+    envIntensity: envIntensityParam,
     envLod: 4,
     fromDirect: 1,
     fromIndirect: 1,
@@ -350,11 +435,24 @@ async function boot(): Promise<void> {
     right: (params.get('split') as SplitView) ?? SplitView.Gi,
     at: frameGraph.splitPosition,
   };
+  // Both comparison panes cost a whole extra pass, so they are paid for only while
+  // something is actually looking at them.
+  const applySplitCost = (view: SplitView) => {
+    applyProbeSettings({
+      compare: view === SplitView.Surfel,
+      debug: view === SplitView.Probes,
+    });
+  };
+  applySplitCost(splitParams.right);
+
   const splitFolder = gui.addFolder('Split view');
   splitFolder
     .add(splitParams, 'right', Object.values(SplitView))
     .name('right pane')
-    .onChange((v: SplitView) => frameGraph.setSplitView(v));
+    .onChange((v: SplitView) => {
+      applySplitCost(v);
+      frameGraph.setSplitView(v);
+    });
   if (atlas) {
     splitFolder
       .add({ rows: atlas.rows.value as number }, 'rows', 1, atlas.side, 1)
@@ -438,6 +536,41 @@ async function boot(): Promise<void> {
     .name('albedo boost')
     .onChange((v: number) => gi.setAlbedoBoost(v));
 
+  // --- screen probes ---------------------------------------------------------
+  const probeFolder = gui.addFolder('GI (screen probes)');
+  probeFolder
+    .add(probeSettings, 'enabled')
+    .name('probes on')
+    .onChange((v: boolean) => applyProbeSettings({ enabled: v }));
+  probeFolder
+    .add(probeSettings, 'nearField', 0.25, 12, 0.05)
+    .name('near-field m')
+    .onChange((v: number) => applyProbeSettings({ nearField: v }));
+  probeFolder
+    .add(probeSettings, 'temporalAlpha', 0.02, 1, 0.01)
+    .name('temporal blend')
+    .onChange((v: number) => applyProbeSettings({ temporalAlpha: v }));
+  probeFolder
+    .add(probeSettings, 'traceStride', 1, 8, 1)
+    .name('retrace 1 in N')
+    .onChange((v: number) => applyProbeSettings({ traceStride: v }));
+  probeFolder
+    .add(probeSettings, 'planeEpsilon', 0.005, 0.5, 0.005)
+    .name('plane eps')
+    .onChange((v: number) => applyProbeSettings({ planeEpsilon: v }));
+  probeFolder
+    .add(probeSettings, 'normalThreshold', 0, 0.99, 0.01)
+    .name('normal cut')
+    .onChange((v: number) => applyProbeSettings({ normalThreshold: v }));
+  probeFolder
+    .add(probeSettings, 'spatialFilter')
+    .name('spatial filter')
+    .onChange((v: boolean) => applyProbeSettings({ spatialFilter: v }));
+  probeFolder
+    .add(probeSettings, 'adaptive')
+    .name('adaptive probes')
+    .onChange((v: boolean) => applyProbeSettings({ adaptive: v }));
+
   // Freeze time-of-day by default: the sun is derived from the env map, and moving it
   // would put the analytic light out of step with the image-based ambient.
   lightCfg.animate = params.get('animate') === '1';
@@ -474,7 +607,32 @@ async function boot(): Promise<void> {
     exposure: renderer.toneMappingExposure,
     lightCfg: { ...lightCfg },
     gi: { ...giParams },
+    // What the ray tracer thinks the lights are, as opposed to what the scene graph
+    // holds. The two disagreeing silently is exactly the failure this list exists to
+    // make visible: a light past MAX_GI_LIGHTS still rasters and stops bouncing.
+    giLights: giLightSummary(),
+    probes: { ...probeSettings, ...probeStats },
   });
+
+  // Puts the camera somewhere exactly, which driving OrbitControls with synthetic
+  // mouse events cannot: a wheel-and-drag path lands a slightly different distance
+  // every run, and a close-up whose framing moves between runs cannot measure a
+  // contact gradient of a few units per 255. Same shape as __freeze — a hook that
+  // exists so a measurement is repeatable.
+  (window as unknown as Record<string, unknown>).__camera = (
+    px: number,
+    py: number,
+    pz: number,
+    tx: number,
+    ty: number,
+    tz: number,
+  ) => {
+    camera.position.set(px, py, pz);
+    controls.target.set(tx, ty, tz);
+    controls.update();
+    camera.updateMatrixWorld();
+    return true;
+  };
 
   // Pins the mover to a fixed pose so a diff against webgiya measures the renderer
   // rather than two animation clocks that were never in step.
@@ -496,6 +654,10 @@ async function boot(): Promise<void> {
   (window as unknown as Record<string, unknown>).__surfels = () =>
     gi.readSurfelStats(renderer);
 
+  // `window.__scale()` — everything the scale report needs, in one readback. Sits on
+  // top of the two probes above rather than beside them; see widgets/world/scaleProbe.
+  installScaleProbe({ renderer, scene, camera, gi, sceneName, lightmapSize });
+
   let previous = performance.now();
   let firstFrame = true;
 
@@ -512,12 +674,21 @@ async function boot(): Promise<void> {
     camera.updateMatrixWorld();
     if (!frozen) dynamic?.update(now * 0.001);
 
-    // In lightmap mode the statics are lit from the baked texture, so the entire
-    // surfel chain is skipped -- no spawn, no trace, no resolve, nothing per frame.
-    // Skipped during a switch too: the pool is being rebuilt underneath.
-    if (lightingMode === 'surfel' && !switching) {
-      gi.update(renderer, scene, camera, sun);
+    // In lightmap mode the surfel *lifecycle* is off -- no spawn, no ageing, no
+    // integration -- but the chain still runs when screen probes are on, because a
+    // mover has no lightmap and used to render as a black hole. `gi.frozen` is what
+    // makes that safe: everything that would disturb the baked pool is skipped.
+    // Skipped entirely during a switch: the pool is being rebuilt underneath.
+    const runGi =
+      !switching && (lightingMode === 'surfel' || probeSettings.enabled);
+    if (runGi) {
+      // Immediately after the movers moved and before anything traces: the dynamic BVH
+      // is what makes them visible to a ray at all. It self-gates on the world matrices,
+      // so a still scene pays a matrix compare and nothing else.
+      gi.updateDynamicScene();
+      gi.update(renderer, scene, camera);
       frameGraph.setGiTextures(gi.outputTexture, gi.albedoTexture);
+      frameGraph.setProbeTextures(probeTextures.legacy, probeTextures.debug);
     }
 
     scene.background = gi.envTexture;

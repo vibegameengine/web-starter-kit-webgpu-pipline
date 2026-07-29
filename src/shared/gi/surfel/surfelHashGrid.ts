@@ -248,6 +248,65 @@ export const surfel_intersects_grid_coord = Fn(
   },
 );
 
+/** One `queue.writeBuffer` per 16 MiB. See `adoptUnmappedBuffer` for why it is chunked. */
+const WRITE_CHUNK_INTS = 1 << 22;
+
+/**
+ * Allocate this attribute's `GPUBuffer` ourselves, unmapped, and hand it to three.
+ *
+ * three's attribute path always passes `mappedAtCreation: true`. Blink honours that by
+ * reserving a host shared-memory region the full size of the buffer *before* the GPU
+ * allocation is attempted, and for the offsets+list buffer that is 65 MiB in one piece.
+ * That reservation is a coin flip: about one run in six it fails and `createBuffer`
+ * throws `RangeError: ... too large for the implementation when mappedAtCreation ==
+ * true`, which takes the whole frame graph down with a pipeline-error overlay. The GPU
+ * has the memory — the browser cannot find the contiguous host mapping.
+ *
+ * Shrinking the buffer would not fix it. The list is sized for the pool's 262,144
+ * ceiling, and `bakeLightmap` deliberately grows the pool to exactly that ceiling, so
+ * the worst case is a supported path, not an accident to be sized away. Instead we
+ * sidestep the mapping entirely: allocate unmapped and push the initial contents through
+ * `queue.writeBuffer`, which streams and never asks for one big host region. Chunking
+ * that write keeps the wire's staging allocation bounded too — a single 65 MiB
+ * `writeBuffer` would only move the same "one huge host allocation" problem downstream.
+ *
+ * Populating `bufferData.buffer` before three ever sees the attribute makes its own
+ * `createAttribute` find the buffer already present and return early, so the rest of the
+ * renderer is none the wiser and the buffer's contents are byte-identical to the mapped
+ * path. Usage flags therefore have to match `WebGPUBackend.createStorageAttribute`
+ * exactly; a narrower set would surface much later as a bind-group validation error.
+ */
+function adoptUnmappedBuffer(
+  renderer: THREE.WebGPURenderer,
+  attr: THREE.StorageBufferAttribute,
+): boolean {
+  const backend = renderer.backend as any;
+  const device = backend?.device;
+  if (!device || typeof backend.get !== 'function') return false;
+
+  const bufferData = backend.get(attr);
+  if (bufferData.buffer) return true;
+
+  const array = attr.array as Int32Array;
+  const buffer = device.createBuffer({
+    label: attr.name,
+    size: array.byteLength,
+    usage:
+      GPUBufferUsage.STORAGE |
+      GPUBufferUsage.VERTEX |
+      GPUBufferUsage.COPY_SRC |
+      GPUBufferUsage.COPY_DST,
+  });
+
+  for (let i = 0; i < array.length; i += WRITE_CHUNK_INTS) {
+    const n = Math.min(WRITE_CHUNK_INTS, array.length - i);
+    device.queue.writeBuffer(buffer, i * 4, array, i, n);
+  }
+
+  bufferData.buffer = buffer;
+  return true;
+}
+
 export function createSurfelHashGrid(): SurfelHashGrid {
   const totalCells = TOTAL_CELLS;
 
@@ -292,7 +351,7 @@ export function createSurfelHashGrid(): SurfelHashGrid {
     computeSlot = null;
   }
 
-  function ensure() {
+  function ensure(renderer: THREE.WebGPURenderer) {
     let buffersRecreated = false;
 
     const headerSize = totalCells + 1;
@@ -306,6 +365,7 @@ export function createSurfelHashGrid(): SurfelHashGrid {
       const inst = instancedArray(arr, 'int');
       offsetsAndListAtomic = inst.toAtomic();
       offsetsAndListAttr = inst.value as THREE.StorageBufferAttribute;
+      adoptUnmappedBuffer(renderer, offsetsAndListAttr);
       buffersRecreated = true;
     }
 
@@ -335,7 +395,7 @@ export function createSurfelHashGrid(): SurfelHashGrid {
     const poolAlloc = pool.getPoolAllocAtomic();
     if (!surfelAttr || !poolMax || !poolAlloc) return;
 
-    ensure(); // Might invalidate pipelines if buffers resized
+    ensure(renderer); // Might invalidate pipelines if buffers resized
 
     // Update Uniforms (Cheap)
     U_CAM_POS.value.copy(camera.position);

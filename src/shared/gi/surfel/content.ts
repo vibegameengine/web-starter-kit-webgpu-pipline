@@ -825,10 +825,25 @@ export function addDynamicDemoObject(
   const dyn: DynamicObject = {
     mesh,
     update(t: number) {
-      // Cornell group is scaled ×4 @ y=-0.5 → stay inside the open box
+      // The comment below used to say this stays inside the open box. It did not:
+      // the horizontal sweep is ±2.2 in x and the two Cornell blocks occupy x from
+      // -2.6 to 0.21 and 0.75 to 2.45 once the group's ×4 scale is applied, so there
+      // is no height below the tall block at which this path misses them. At t=3.2
+      // the sphere's centre sat at (-0.82, 1.23, 0.01) — inside the tall block on all
+      // three axes — and at t=1.6 it was buried in the short block's top face.
+      //
+      // That is why the mover looked unlit and black underneath: half of it was
+      // inside geometry, so the rays that should have lit it started occluded. It
+      // also quietly poisoned every dynamic-GI measurement taken at those poses.
+      //
+      // Room is floor y=-0.5, ceiling y=5.5, blocks top out at y=2.3. Orbiting above
+      // them keeps the sphere in open air at every t, 0.35 m clear of the tall block
+      // at the low point and 0.65 m below the ceiling at the high one — and a mover
+      // that floats over the blocks casts its indirect shadow down onto them, which
+      // is the thing worth being able to see.
       const x = Math.sin(t * 1.1) * 2.2;
       const z = 1.5 + Math.cos(t * 1.1) * 1.6;
-      const y = 1.0 + Math.abs(Math.sin(t * 2.0)) * 2.0;
+      const y = 3.1 + Math.abs(Math.sin(t * 2.0)) * 1.3;
       mesh.position.set(x, y, z);
       mesh.rotation.y = t * 1.5;
     },
