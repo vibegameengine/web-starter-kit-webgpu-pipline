@@ -235,4 +235,32 @@ export const giKnobs = {
 
   /** `?emissive=0` stops emissive materials injecting radiance, same ablation shape. */
   emissiveLights: () => flag('emissive', true),
+
+  /**
+   * `?dynsurfel=1` keeps the surfel lifecycle running for movable geometry after a
+   * lightmap bake, instead of freezing the entire pool.
+   *
+   * The default freezes everything, and that is a measurable defect rather than a
+   * conservative choice. A lightmap bake spends the whole pool on atlas texels, and the
+   * atlas is by construction the *static* half — so a `Mobility.Movable` mesh ends up
+   * with no surfel anywhere on it, and its indirect light comes entirely from the screen
+   * probes, which trace one or two rays per texel per frame. The surfel accumulator that
+   * normally hides that noise (MSME, up to `MAX_TEMPORAL_M` moments) is switched off with
+   * the rest of the lifecycle. Measured on the moving ball with `scripts/_flicker.mjs`,
+   * mean frame-to-frame over six frames: 3.83 / 4.03 frozen, against 2.14 for the live
+   * surfel+probe path and 1.87 for surfels alone. The measurement floor on that region is
+   * 0.20, so the frozen build is running at roughly twice the noise of either.
+   *
+   * On, the atlas surfels are pinned by the immortaliser the moment the bake finishes —
+   * exactly what `bake()` already does to its own cache — and the freeze is declined. A
+   * pinned surfel is skipped by the age pass and by the integrator, and is never returned
+   * to the free list, so the atlas occupies stack slots `[0, seeded)` permanently and the
+   * runtime allocator can only ever hand out the tail. That is the reserved-tail-segment
+   * split, obtained from state the pool already has rather than from a second free list.
+   *
+   * Off by default because it is new, and because the thing it changes — whether the
+   * lifecycle runs at all in lightmap mode — is not something a report should have to
+   * guess at from a build date.
+   */
+  dynamicSurfels: () => flag('dynsurfel', false),
 };

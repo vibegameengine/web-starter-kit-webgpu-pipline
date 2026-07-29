@@ -138,6 +138,16 @@ export class SurfelGI {
   /** Set for the duration of a counted bake; see `maybeGrowPool` and `bake`. */
   private bakeFreezesPool = false;
 
+  /**
+   * Set once a lightmap bake has pinned its atlas surfels under `?dynsurfel=1`.
+   *
+   * It is what splits the pool in two without the pool needing to know: pinned slots are
+   * never recycled, so `[0, seeded)` belongs to the atlas forever and the allocator can
+   * only reach the tail. See `setFrozen` and `maybeGrowPool` for the two behaviours that
+   * change, and `giKnobs.dynamicSurfels` for the measurement.
+   */
+  private atlasPinned = false;
+
   readonly envTexture: THREE.DataTexture;
 
   private constructor(
@@ -291,6 +301,11 @@ export class SurfelGI {
    */
   private maybeGrowPool(renderer: THREE.WebGPURenderer): void {
     if (this.bakeFreezesPool) return;
+    // Same argument as `bakeFreezesPool`, held permanently: growth replaces every pool
+    // buffer, and the atlas cache pinned into them has no host copy. Under `?dynsurfel=1`
+    // the pool is mostly atlas and the runtime population is a few thousand surfels in
+    // the tail, so there is nothing growth could buy that is worth the whole bake.
+    if (this.atlasPinned) return;
     if (this.growthCheckPending) return;
     if (this.pool.getCapacity() >= MAX_SURFELS) return;
 
@@ -425,6 +440,9 @@ export class SurfelGI {
    */
   resetCache(renderer: THREE.WebGPURenderer): void {
     this._frozen = false;
+    // The clear rewrites the free list and every age to the recycled sentinel, so the
+    // pins go with it and the pool is one undivided region again.
+    this.atlasPinned = false;
     this.prepare.run(renderer, this.pool, { forceClear: true });
   }
 
@@ -471,6 +489,15 @@ export class SurfelGI {
   }
 
   setFrozen(frozen: boolean): void {
+    // A freeze asked for after the atlas has been pinned is declined, not obeyed. The
+    // caller's intent is "hold the baked cache still", and the pins already do exactly
+    // that for the half of the pool the bake owns — while a blanket freeze would also
+    // stop spawning on the half it does not, which is where every movable surface lives.
+    // Under `?dynsurfel=0` nothing is ever pinned this way and this branch never runs.
+    if (frozen && this.atlasPinned) {
+      this._frozen = false;
+      return;
+    }
     this._frozen = frozen;
   }
 
@@ -1201,12 +1228,31 @@ export class SurfelGI {
     const stats = await lm.readStats(renderer);
     this.setBaseSampleCount(this.runtimeSampleCount);
 
+    // Pin the atlas, so the lifecycle can be left running for everything that is not in
+    // it. This is `bake()`'s last step, applied to the other kind of bake for the same
+    // reason: a pinned surfel is skipped by the age pass and by the integrator and is
+    // never pushed back onto the free list, so the atlas holds pool slots `[0, seeded)`
+    // for good and the allocator's only reachable region is the tail. Movable geometry
+    // then gets real surfels — with MSME behind them — instead of nothing at all.
+    //
+    // After `writeAtlas`, which is deliberate: the atlas texture is finished and read
+    // back before anything is allowed to change the pool's meaning, so `?dynsurfel=1`
+    // cannot alter a single texel of the lightmap it is bolted onto.
+    if (giKnobs.dynamicSurfels()) {
+      this.immortaliser.run(renderer, this.pool);
+      this.atlasPinned = true;
+      this._frozen = false;
+    }
+
     const ms = performance.now() - start;
     console.log(
       `[lightmap] ${iterations} integrations × ${raysPerSurfel} rays in ${(ms / 1000).toFixed(2)}s — ` +
         `${stats.lit}/${stats.total} texels lit, ${stats.filled} gutter-filled, ` +
         `${stats.black} black, ` +
-        `mean ${stats.meanLuma.toFixed(4)}, max ${stats.maxLuma.toFixed(3)}`,
+        `mean ${stats.meanLuma.toFixed(4)}, max ${stats.maxLuma.toFixed(3)}` +
+        (this.atlasPinned
+          ? `; ${seeded} atlas surfels pinned, lifecycle live for movers`
+          : ''),
     );
 
     return { texture: lm.lightmap, seeded, stats };
