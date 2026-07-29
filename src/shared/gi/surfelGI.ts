@@ -3,6 +3,8 @@ import { HDRLoader } from 'three/examples/jsm/Addons.js';
 import { Layer } from '../world/index.ts';
 import { createSurfelImmortaliser } from './immortalise.ts';
 import { createCacheAtlas } from './cacheAtlas.ts';
+import { createLightmapSurfels } from './bake/lightmapSurfels.ts';
+import type { LightmapGBuffer } from './bake/lightmapGBuffer.ts';
 
 import { MAX_SURFELS, SURFEL_TTL } from './surfel/constants.ts';
 import { createGBuffer } from './surfel/gbuffer.ts';
@@ -61,6 +63,7 @@ export class SurfelGI {
   private runtimeSampleCount = 4;
   private readonly immortaliser = createSurfelImmortaliser();
   private cacheAtlas: ReturnType<typeof createCacheAtlas> | null = null;
+  private lightmapSurfels: ReturnType<typeof createLightmapSurfels> | null = null;
 
   readonly envTexture: THREE.DataTexture;
 
@@ -109,6 +112,20 @@ export class SurfelGI {
   buildScene(renderer: THREE.WebGPURenderer, scene: THREE.Scene): void {
     this.bvh = createSceneBVH(renderer, scene);
     this.integrate = createSurfelIntegratePass(this.blueNoise, this.envTexture);
+    this.prepare.run(renderer, this.pool, { forceClear: true });
+  }
+
+  /**
+   * Empties the surfel pool: free list refilled, every surfel marked dead, allocator
+   * and high-water mark back to zero.
+   *
+   * There is exactly one pool, and the lightmap bake spends all of it on atlas texels.
+   * Switching back to runtime GI therefore has to reclaim it first — otherwise the
+   * allocator has nothing to hand out, no surfel is ever spawned for the current view,
+   * and the screen resolve quietly returns black.
+   */
+  resetCache(renderer: THREE.WebGPURenderer): void {
+    this._frozen = false;
     this.prepare.run(renderer, this.pool, { forceClear: true });
   }
 
@@ -298,16 +315,23 @@ export class SurfelGI {
 
       // Golden-angle azimuth so successive views are spread out rather than
       // sweeping slowly through one side of the room first.
+      // Inside the volume looking outward, not orbiting outside it. Surfels are
+      // spawned from the G-Buffer, so an exterior orbit never sees inward-facing
+      // surfaces -- which is precisely where a Cornell box needs coverage.
       const azimuth = frames * 2.39996323;
       const elevation = elevations[frames % elevations.length];
-      const dist = radius * 1.15;
+      const inset = radius * 0.35;
 
       bakeCamera.position.set(
-        centre.x + Math.cos(azimuth) * Math.cos(elevation) * dist,
-        centre.y + Math.sin(elevation) * dist,
-        centre.z + Math.sin(azimuth) * Math.cos(elevation) * dist,
+        centre.x + Math.cos(azimuth * 0.37) * inset,
+        centre.y + Math.sin(azimuth * 0.23) * inset * 0.5,
+        centre.z + Math.sin(azimuth * 0.37) * inset,
       );
-      bakeCamera.lookAt(centre);
+      bakeCamera.lookAt(
+        centre.x + Math.cos(azimuth) * Math.cos(elevation) * radius * 4,
+        centre.y + Math.sin(elevation - 0.4) * radius * 4,
+        centre.z + Math.sin(azimuth) * Math.cos(elevation) * radius * 4,
+      );
       bakeCamera.updateMatrixWorld();
 
       this.update(renderer, scene, bakeCamera, dirLight, { staticOnly: true });
@@ -393,6 +417,131 @@ export class SurfelGI {
       else recycled++;
     }
     return { capacity, alive: pinned + live, pinned, live, recycled };
+  }
+
+  /**
+   * Bakes the lightmap by running webgiya's integrator on surfels that live in the
+   * atlas instead of on screen.
+   *
+   * The loop below is `update()` with the screen half deleted. What is gone is only
+   * ever the camera-shaped part — the G-Buffer render, find-missing, allocate, age,
+   * resolve. What remains is upstream's, verbatim and in upstream's order:
+   *
+   *   grid build → integrator args → integrate (BVH RT, SLG, MSME) → swap moments
+   *
+   * The one camera that remains is a fixed point at the centre of the static bounds,
+   * because the grid is camera-centred and `lookupSurfelGI` weights the *bounce* by
+   * distance to it. Fixed, so that weighting is a constant property of the bake
+   * rather than a function of where anyone was standing.
+   */
+  async bakeLightmap(
+    renderer: THREE.WebGPURenderer,
+    scene: THREE.Scene,
+    gbuffer: LightmapGBuffer,
+    dirLight: THREE.DirectionalLight,
+    size: number,
+    options: {
+      iterations?: number;
+      raysPerSurfel?: number;
+      /**
+       * Viewpoint the hash grid is centred on. The bake does not render from it --
+       * it exists because `surfel_radius_for_pos` and therefore the weighting inside
+       * `lookupSurfelGI` are parameterised by a camera, so the bounce term needs one.
+       * Defaults to the centre of the static bounds.
+       */
+      viewpoint?: THREE.Vector3;
+      /** Bilateral filter passes over the finished atlas. */
+      denoise?: number;
+      /** Gutter-fill passes, so bilinear at a chart border never reads a hole. */
+      dilate?: number;
+      onProgress?: (fraction: number, iteration: number) => void;
+    } = {},
+  ): Promise<{
+    texture: THREE.Texture;
+    seeded: number;
+    stats: Awaited<ReturnType<ReturnType<typeof createLightmapSurfels>['readStats']>>;
+  } | null> {
+    if (!this.bvh || !this.integrate) return null;
+
+    // 200, not 64: MSME accumulates to MAX_TEMPORAL_M = 200 samples, so anything
+    // less leaves every texel short of the temporal convergence the runtime reaches
+    // in a few hundred frames -- and the shortfall is visible as per-texel grain,
+    // because unlike the runtime resolve a bake has nothing averaging texels together.
+    const {
+      iterations = 200,
+      raysPerSurfel = 32,
+      viewpoint,
+      denoise,
+      dilate,
+      onProgress,
+    } = options;
+
+    if (!this.lightmapSurfels) {
+      this.lightmapSurfels = createLightmapSurfels(this.pool, size);
+    }
+    const lm = this.lightmapSurfels;
+
+    const start = performance.now();
+
+    if (!lm.seed(renderer, gbuffer)) return null;
+    const seeded = await lm.countSeeded(renderer);
+    console.log(`[lightmap] seeded ${seeded} surfels from the atlas`);
+    if (seeded === 0) return null;
+
+    this.setBaseSampleCount(raysPerSurfel);
+
+    // A fixed viewpoint at the centre of the static world. Nothing is rendered from
+    // it — it exists because the hash grid and the bounce lookup are parameterised
+    // by a camera position, and a bake needs that parameter to be a constant.
+    const bounds = this.staticBounds(scene);
+
+    const camera = new THREE.PerspectiveCamera();
+    camera.position.copy(viewpoint ?? bounds.getCenter(new THREE.Vector3()));
+    camera.updateMatrixWorld();
+
+    for (let i = 0; i < iterations; i++) {
+      // The integrator keys its blue-noise sequence and MSME window off the frame
+      // counter, and nothing renders during a bake — so without advancing it by hand
+      // every iteration would cast the *same* directions and never converge.
+      renderer.info.frame++;
+
+      this.grid.build(renderer, this.pool, camera);
+      this.integratorArgs.run(renderer, this.pool);
+      this.integrate.run(
+        renderer,
+        this.pool,
+        this.bvh,
+        this.grid,
+        camera,
+        dirLight,
+        this.integratorArgs.getIndirectAttr(),
+      );
+      this.pool.swapMoments();
+
+      onProgress?.((i + 1) / iterations, i + 1);
+      // Yield so the GPU actually executes and the page stays responsive; a whole
+      // bake submitted in one tick is how a driver reset happens.
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    }
+
+    // Plane epsilon scales with the world: it decides which neighbouring texels are
+    // "the same surface", and a fixed constant would either bleed across faces in a
+    // small scene or reject valid neighbours in a large one.
+    const planeEpsilon =
+      bounds.getSize(new THREE.Vector3()).length() * 0.0025;
+    lm.writeAtlas(renderer, gbuffer, { denoise, dilate, planeEpsilon });
+    const stats = await lm.readStats(renderer);
+    this.setBaseSampleCount(this.runtimeSampleCount);
+
+    const ms = performance.now() - start;
+    console.log(
+      `[lightmap] ${iterations} integrations × ${raysPerSurfel} rays in ${(ms / 1000).toFixed(2)}s — ` +
+        `${stats.lit}/${stats.total} texels lit, ${stats.filled} gutter-filled, ` +
+        `${stats.black} black, ` +
+        `mean ${stats.meanLuma.toFixed(4)}, max ${stats.maxLuma.toFixed(3)}`,
+    );
+
+    return { texture: lm.lightmap, seeded, stats };
   }
 
   /** Ray count to fall back to after a bake. */

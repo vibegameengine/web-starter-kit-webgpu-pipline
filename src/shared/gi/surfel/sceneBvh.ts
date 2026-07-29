@@ -94,6 +94,17 @@ export function createSceneBVH(
       geom.setAttribute('color', new THREE.BufferAttribute(packed, 3));
       // -----------------------------------------------------
 
+      // LOCAL ADDITION vs upstream: mergeGeometries requires an identical attribute
+      // set on every input. Once uv/matId are packed into `color`, nothing else is
+      // read by the tracer — and dropping the rest is what keeps the merge from
+      // failing the moment the lightmap unwrapper has given uv1 to some meshes and
+      // not others.
+      for (const name of Object.keys(geom.attributes)) {
+        if (name !== 'position' && name !== 'normal' && name !== 'color') {
+          geom.deleteAttribute(name);
+        }
+      }
+
       geometries.push(geom);
     }
   });

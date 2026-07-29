@@ -263,7 +263,7 @@ export class FrameGraph {
           // Remap the pane to a full square so the atlas is shown whole.
           const lmUv = vec2(
             screenUV.x.sub(this.splitPosition).div(1 - this.splitPosition),
-            screenUV.y.oneMinus(),
+            screenUV.y,
           );
           right = vec4(texture(this.lightmapTexture, lmUv).rgb, 1);
         }

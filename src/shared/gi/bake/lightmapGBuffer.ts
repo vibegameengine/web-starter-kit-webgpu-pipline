@@ -7,7 +7,6 @@ import {
   normalGeometry,
   positionGeometry,
   varying,
-  vec2,
   vec4,
 } from 'three/tsl';
 import { Layer } from '../../world/index.ts';
@@ -91,11 +90,22 @@ export function rasteriseLightmapGBuffer(
     normal: vec4(worldNormal, 0),
   });
 
-  // uv1 spans 0..1 across the atlas; clip space is -1..1. Y is flipped so the atlas
-  // matches the orientation a texture fetch uses at runtime.
+  // uv1 spans 0..1 across the atlas; clip space is -1..1, and Y is negated because
+  // clip y = +1 is row 0 of the render target while a fetch at v = 0 lands on row 0
+  // too. Without the negation the atlas comes out mirrored against the very UVs used
+  // to sample it, so every fetch lands in a *different chart* — which does not look
+  // like a mirrored image at all. It looks like wrong colours (a green wall lit red)
+  // and hard black regions where a chart maps onto empty atlas space. That is what
+  // this build shipped until it was measured: the sun-shadowed half of the left wall
+  // was pure black at any lightmap intensity, because it was sampling a gutter.
   const atlasUv = attribute('uv1', 'vec2');
   const bakeMaterial = new THREE.MeshBasicNodeMaterial();
-  bakeMaterial.vertexNode = vec4(atlasUv.mul(2).sub(1).mul(vec2(1, -1)), 0, 1);
+  bakeMaterial.vertexNode = vec4(
+    atlasUv.x.mul(2).sub(1),
+    atlasUv.y.mul(2).sub(1).negate(),
+    0,
+    1,
+  );
   bakeMaterial.side = THREE.DoubleSide;
   bakeMaterial.depthTest = false;
   bakeMaterial.depthWrite = false;
