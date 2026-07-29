@@ -56,11 +56,26 @@ export function createRocks(options: RocksOptions): Rocks {
   geometry.computeVertexNormals();
 
   const material = new THREE.MeshStandardNodeMaterial({
-    color: new THREE.Color(0x8d8a84),
     roughness: 0.92,
     metalness: 0,
   });
-  if (map) material.map = map;
+  // `color` is a *multiplier* on `map`, not the surface colour, and it multiplies in
+  // the linear working space. `new THREE.Color(0x8d8a84)` reads as "light grey,
+  // 141/138/132" only in sRGB; as a linear factor it is 0.26, so it threw away 74 % of
+  // the map. Stacked on a rock photograph that already averages 0.076 linear, the
+  // compound albedo came out at 0.020 — darker than coal — and the boulders rendered as
+  // holes in the ground while the terrain, whose tint is written straight into the
+  // linear space by `Color.setHSL()` and is therefore ~2.4× brighter as a factor, did
+  // not. When a map supplies the reflectance the tint has to be white; the map is put
+  // into a physical albedo range by `normaliseAlbedoRange` in `widgets/world/largeScene`.
+  if (map) {
+    material.map = map;
+    material.color.setRGB(1, 1, 1);
+  } else {
+    // No map: now `color` really is the albedo, and 0x8d8a84 (linear 0.26) is a
+    // reasonable dry-granite reflectance on its own.
+    material.color.set(0x8d8a84);
+  }
   material.name = 'rock';
 
   const mesh = new THREE.InstancedMesh(geometry, material, count);
