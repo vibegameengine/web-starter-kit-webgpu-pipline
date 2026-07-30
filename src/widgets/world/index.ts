@@ -1,4 +1,5 @@
 export {
+  addDynamicSphere,
   createCornellScene,
   populateCornell,
   type CornellScene,

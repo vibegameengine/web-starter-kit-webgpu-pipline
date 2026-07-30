@@ -20,7 +20,11 @@ import {
 import { applyOcclusionSettings } from '../shared/gi/surfel/surfelRadialDepth.ts';
 import { MAX_TEMPORAL_M } from '../shared/gi/surfel/constants.ts';
 import { giLightSummary } from '../shared/gi/surfel/sceneLights.ts';
-import { createCornellScene, populateCornell } from '../widgets/world/index.ts';
+import {
+  addDynamicSphere,
+  createCornellScene,
+  populateCornell,
+} from '../widgets/world/index.ts';
 
 const loadingOverlay = document.querySelector<HTMLElement>('#loading-overlay');
 const loadingMessage = document.querySelector<HTMLElement>('#loading-message');
@@ -142,8 +146,17 @@ async function boot(): Promise<void> {
     atlasSize: lightmapSize,
   });
 
+  // Before the BVH, deliberately: being in the scene at build time is what gets the
+  // sphere's material an id in the shared diffuse array, without which a ray that hits
+  // it cannot be shaded. `?mover=0` leaves it out entirely.
+  const dynamic =
+    params.get('mover') === '0'
+      ? null
+      : addDynamicSphere(scene, { radius: num('moverRadius') ?? undefined });
+
   setLoading('Building static BVH');
   gi.buildScene(renderer, scene);
+  gi.setDynamicTracing(params.get('dyntrace') !== '0');
 
   // Applied here, not with the rest of the GUI defaults further down: the bake runs
   // before those exist, and a knob that only takes effect after the cache has converged
@@ -517,6 +530,20 @@ async function boot(): Promise<void> {
   (window as unknown as Record<string, unknown>).__surfels = () =>
     gi.readSurfelStats(renderer);
 
+  // Pins the sphere to a fixed pose so a diff against webgiya measures the renderer
+  // rather than two animation clocks that were never in step.
+  let frozen = false;
+  (window as unknown as Record<string, unknown>).__freeze = (t: number) => {
+    dynamic?.update(t);
+    frozen = true;
+    return true;
+  };
+  const freezeAt = num('freezeAt');
+  if (freezeAt !== null) {
+    dynamic?.update(freezeAt);
+    frozen = true;
+  }
+
   let previous = performance.now();
   let firstFrame = true;
 
@@ -531,11 +558,16 @@ async function boot(): Promise<void> {
     controls.update();
     updateAnimation();
     camera.updateMatrixWorld();
+    if (!frozen) dynamic?.update(now * 0.001);
 
     // In lightmap mode the surfel cache is frozen and the scene reads the baked atlas,
-    // so the chain has nothing to do. Skipped during a switch too: the pool is being
-    // rebuilt underneath.
+    // so the chain has nothing to do — including the sphere, which has no lightmap of
+    // its own. Skipped during a switch too: the pool is being rebuilt underneath.
     if (!switching && lightingMode === 'surfel') {
+      // Immediately after the sphere moved and before anything traces: the dynamic BVH
+      // is what makes it visible to a ray at all. It self-gates on the world matrix, so
+      // a still scene pays a matrix compare and nothing else.
+      gi.updateDynamicScene();
       gi.update(renderer, scene, camera);
       frameGraph.setGiTextures(gi.outputTexture, gi.albedoTexture);
     }
