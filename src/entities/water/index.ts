@@ -228,7 +228,10 @@ export function createWater(options: WaterOptions): Water {
         const b = (texture(heightTexture, q).level(float(0.0)) as ReturnType<typeof vec4>).r;
         // A thin film on high ground (a boulder's flank) must not lift the sheet into
         // a wall: the surface never rises past the level plus the largest wave.
-        return select(d.greaterThan(0.003), min(b.add(d), waterLevel.add(0.12)), waterLevel.sub(0.15));
+        // Ground above the water line (a boulder's flank, the upper beach) only carries
+        // a surface once the run-up is deep enough to be one; a film there is wet stone.
+        const needed = float(0.003).add(max(b.sub(waterLevel), 0.0).mul(0.6));
+        return select(d.greaterThan(needed), min(b.add(d), waterLevel.add(0.06)), waterLevel.sub(0.15));
       })
     : null;
   /** Wind waves at (x, z): height and slope, shoaled by the local depth. */
@@ -565,6 +568,13 @@ export function createWater(options: WaterOptions): Water {
   // `?waterInspect=1` (or `=z:<metres>`) draws the map and a section on screen.
   (window as unknown as Record<string, unknown>).__water = {
     simStats: async () => (sim ? sim.readStats() : null),
+    foamDebug: () => ({ isRenderTarget: (foamRead as unknown as { isRenderTarget?: boolean }).isRenderTarget, textures: foamRead.textures?.length, width: foamRead.width }),
+    foamStats: async () => {
+      const { size, foam, wetness } = await water.readFoamField();
+      let foamMax = 0, wetMax = 0, wetCount = 0;
+      for (let i = 0; i < size * size; i++) { foamMax = Math.max(foamMax, foam[i]); wetMax = Math.max(wetMax, wetness[i]); if (wetness[i] > 0.2) wetCount++; }
+      return { foamMax, wetMax, wetFraction: wetCount / (size * size) };
+    },
   };
   const inspectParam = params.get('waterInspect');
   const inspector = sim && inspectParam

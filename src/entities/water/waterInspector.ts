@@ -46,7 +46,15 @@ export class WaterInspector {
     if (this.busy || now < this.nextReadAt) return;
     this.busy = true;
     this.nextReadAt = now + 1000;
-    void Promise.all([this.sim.readState(), this.readFoam ? this.readFoam() : Promise.resolve(null)]).then(([state, foamField]) => {
+    // Off the render loop: a readback issued while the frame's targets are bound
+    // reads the wrong texture.
+    const read = async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const state = await this.sim.readState();
+      const foamField = this.readFoam ? await this.readFoam() : null;
+      return { state, foamField };
+    };
+    void read().then(({ state, foamField }) => {
       this.foamField = foamField;
       this.draw(state);
       this.busy = false;
