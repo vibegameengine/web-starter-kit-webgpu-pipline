@@ -6,7 +6,7 @@ import {
   sin,
   exp,
   sqrt,
-  time,
+  uniform,
   uniformArray,
   vec2,
   vec3,
@@ -60,6 +60,8 @@ function tmaFactor(omega: number, h: number): number {
 
 export class WindWaves {
   readonly count: number;
+  /** Seconds on the water's own clock (the solver's), not the renderer's. */
+  readonly clock = uniform(0);
   /** (kx, kz, omega, amplitude) per component. */
   private readonly params: THREE.Vector4[] = [];
   private readonly phases: number[] = [];
@@ -158,7 +160,7 @@ export class WindWaves {
       // ω² = g k tanh(k h): k = k_deep / tanh(k h), one fixed-point step from k_deep.
       const k = kDeep.div(tanhOf(kDeep.mul(h)).max(float(0.05)));
       const dir = vec2(c.x, c.y).div(kDeep.max(float(1e-4)));
-      const theta = dir.x.mul(xz.x).add(dir.y.mul(xz.y)).mul(k).sub(c.z.mul(time)).add(phase0);
+      const theta = dir.x.mul(xz.x).add(dir.y.mul(xz.y)).mul(k).sub(c.z.mul(this.clock)).add(phase0);
       const a = c.w.mul(shoal);
       height.addAssign(sin(theta).mul(a));
       const d = cos(theta).mul(a).mul(k);
