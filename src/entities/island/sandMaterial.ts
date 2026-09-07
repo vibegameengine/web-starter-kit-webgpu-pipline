@@ -1,8 +1,6 @@
 import * as THREE from 'three/webgpu';
 import {
   Fn,
-  pow,
-  sqrt,
   color,
   exp,
   float,
@@ -77,10 +75,8 @@ export function createSandMaterial(u: SandMaterialUniforms): THREE.MeshStandardN
   const wet = max(smoothstep(0.08, 0.0, aboveWater), smoothstep(0.04, 0.35, swash));
   const submerged = smoothstep(0.02, -0.06, aboveWater);
 
-  // Coral sand: pale, nearly white (the reference's cream), not a yellow beach; the
-  // lagoon's cyan is this albedo seen through water that absorbs red.
-  const dry = color(0.87, 0.77, 0.58);
-  const wetTint = color(0.51, 0.44, 0.34);
+  const dry = color(0.86, 0.71, 0.48);
+  const wetTint = color(0.50, 0.42, 0.30);
   const dark = grainCoarse.mul(0.20).add(grainFine.mul(0.05)).add(mottle.mul(0.10)).add(streaks.mul(0.03));
   // Shell fragments and dark grains, sparse.
   const speck = step(0.78, mx_noise_float(p.mul(60.0).add(vec3(0.0, 13.0, 0.0))));
@@ -88,14 +84,8 @@ export function createSandMaterial(u: SandMaterialUniforms): THREE.MeshStandardN
   const albedo = mix(albedoBase, albedoBase.mul(0.55), speck.mul(0.6));
   // Below the water line the sun arrives through the water: the floor is lit by what
   // the medium let through, same absorption the tracer and the water surface use.
-  // The sun refracts at the surface (n = 1.333): the path to depth d is d / cos θ′ with
-  // sin θ′ = sin θ / n, and a Fresnel share (Schlick) stays outside.
-  const sunCos = vec3(u.sunDir).y.max(0.05);
-  const sunSin2 = float(1.0).sub(sunCos.mul(sunCos));
-  const refractedCos = sqrt(float(1.0).sub(sunSin2.div(1.333 * 1.333)));
-  const sunFresnel = float(0.02).add(float(0.98).mul(pow(float(1.0).sub(sunCos), 5.0)));
-  const sunPath = u.waterLevel.sub(p.y).max(0.0).div(refractedCos);
-  const litThroughWater = exp(vec3(u.absorb).mul(sunPath).negate()).mul(float(1.0).sub(sunFresnel.mul(submerged)));
+  const sunPath = u.waterLevel.sub(p.y).max(0.0).div(vec3(u.sunDir).y.max(0.08));
+  const litThroughWater = exp(vec3(u.absorb).mul(sunPath).negate());
   material.colorNode = albedo.mul(litThroughWater);
 
   material.roughnessNode = mix(float(0.92), float(0.30), wet);
