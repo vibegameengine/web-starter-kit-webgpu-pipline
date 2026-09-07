@@ -46,3 +46,26 @@ Numbers computed by the grill from the code; decisions below supersede Round 1 w
 | Q30 | Landing order | **(a)** shading-first: ① field bake D + mesh/fragment read D (pixel-identical, fps up) → ② Snell + path + (1−F)/n² → ③ medium parameters → ④ depth seed + unlit material → ⑤ caustic map → ⑥ KP + characteristic boundary + fixed step → ⑦ foam sources/field → ⑧ SSR + α_eff → ⑨ wet sand. Each step verified in a frame (①–⑤, ⑧, ⑨) or in the inspector with the stated acceptance (⑥, ⑦). |
 
 Superseded: Q4 primitive velocities → Q18 conservative; Q5 step/lag → Q17; Q6 boundary → Q19; Q9 Jerlov-II → Q25.
+
+## Round 3 — implementation frontier
+
+Preliminary corrections accepted: the run-up `ceiling` clips and the dry-cell `min(b, level+0.02)` are transitional clamps that go with KP; the film gate must use the **unrefracted** depth sample; Manning becomes semi-implicit under KP with no linear friction; the generator is replaced by Q36; the wind clock must be the sim clock.
+
+| # | Question | Decision |
+|---|----------|----------|
+| Q31 | Step ① textures and pass list | **(a)** as tabled: `B_corner` 385² R32F (corners), `B_field` 1024² R32F, state `S` 384² (format Q34), `K_lut` 48×64 R32F rebuilt in `setWind`, `D` 1024² RGBA16F (η−level, ∂η/∂x, ∂η/∂z, breakingSrc), `P` 1024² RGBA16F ping-pong (foam thickness, wet saturation), `C` 1024² R16F with mips. Order: KP substeps → D → P → C (+mips) → scene → composite → depth seed → overlay. `toTexture` gains an R32F variant. Acceptance for ①: water pixels mean |ΔRGB| ≤ 1/255, p99 ≤ 4/255 vs the per-vertex path at the same sim clock; fps at `?cam=water` before/after. |
+| Q32 | KP time step, integrator | **(b)** SSP-RK2, Δt = 1.5 ms, ≤ 12 substeps/frame, |u| clamped to 2√(gh)+1 after desingularisation. Supersedes Q17's 2.0 ms / 9 substeps. |
+| Q33 | Desingularisation ε | **(b)** ε = (1 mm)⁴; hu ← h·u re-stored after desingularising (KP 2.21). |
+| Q34 | State precision | **(a)** RGBA32F state, `textureLoad` (nearest) in the KP passes; readback decodes Float32. |
+| Q35 | KP bed, source, friction | **(a)** corner bed, faces = corner means, cell = mean of 4 corners; generalized minmod θ = 1.3 on (w, hu, hv); hydrostatic correction KP 2.15–2.16; central-upwind flux with a± as given; source KP 2.23; Manning semi-implicit n = 0.025 (sand), no linear term; `friction` uniform and its GUI row replaced by Manning n. (c) only if the front oscillates in the ×25 section. |
+| Q36 | Characteristic ghost cells | **(a)** ghost state from R⁺ exterior / R⁻ interior as given; one h_ref per open face (mean depth on that face), single plane wave; `WaterSpec` asserts kh(h_ref) ≤ 1. Relax strip removed. |
+| Q37 | Foam sources under KP; `impactAt` | **(b), amended by the user**: energy of an impact goes to *both* foam and spray. The bore dissipation D (D_ref 0.045 m²/s³) and the run-up front are the physical sources into P; `impactAt` keeps its foam half as the declared heuristic for flank impacts with the momentum sink removed, and additionally feeds a **spray emitter**: a particle layer (step ⑩, new) spawned where impact·h·|u|² exceeds a threshold, launched at the impact speed, ballistic, rendered as lit sprites on `Layer.Overlay`, landing back as foam thickness in P. Its formula lives in `WaterSpec`. |
+| Q38 | η at 1024² and the film gate | **(a)** cubic B-spline of η in D (16 loads, analytic slope); wet where bilinear h > ε_dry; dry mesh cells at B; ceiling clips removed; film drawn iff `p.y − floor(sceneDepth0) ≥ 3 mm` (unrefracted sample), fade to 3 cm. |
+| Q39 | Snell reprojection | **(b)** as given, with the G-buffer normal: `onScreenTextures(color, depth, normal)`; two iterations, then the 8-step march only where |F₂ − Q₂| > 10 cm. |
+| Q40 | Single scatter | **(a)** implement the closed form as written; lagoon colour = floor × transmission; "no multiple scattering" is in the ceiling; revisit with (b)/(d) only if the deep corner reads wrong in a frame. |
+| Q41 | Caustic gather and entry | **(a)** gather with one fixed-point step, C = clamp(1/|det J|, 0, 8), mips sampled at LOD from σ_floor = h·(1−1/n)·α_eff; C and `litThroughWater` both in `receivedShadowNode` of sand and rock; albedo stays dry sand; the tracer's medium attenuation stays (no double count). |
+| Q42 | Declared ceiling | **(b)** adopted as the ceiling list, with items 3 (Doppler k·u in the D pass) and 6 (C sampled at the receiver's own height) scheduled. Item 2 amended: spray exists as the particle layer of Q37; still no plunging breakers or bubble column. |
+
+Removal checklist (from settled rounds): `envStrength`, `sunLight` fudge, `+1.5` path, `surge`, glitter, `peakGlow`, noise ripple normals, Worley caustics (+ dead sand caustic code), ad-hoc scatter colour, `roughness 0.07`, linear `friction`, `ceiling` clips, foam τ → 3.85 s, wetness → saturation model, one-step k → LUT, blanket `h^-1/4` → Green's law with c_g, sim 512 → 384.
+
+Implementation order (Round 2 Q30, amended): ① field bake D → ② Snell + path + (1−F)/n² → ③ medium → ④ depth seed + unlit material → ⑤ caustic map → ⑥ KP + characteristic boundary + fixed step → ⑦ foam sources/field → ⑧ SSR + α_eff → ⑨ wet sand → ⑩ spray particles.
