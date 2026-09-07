@@ -18,6 +18,7 @@ import { VirtualLightmap } from '../shared/render/virtualTexture/virtualLightmap
 import { createLightmapDemand } from '../shared/render/virtualTexture/lightmapDemand.ts';
 import { bakeKey, loadBake, saveBake } from '../shared/gi/bake/persistedBake.ts';
 import { loadStreamedBake } from '../shared/gi/bake/streamedBake.ts';
+import { dilateUnlitTexels } from '../shared/gi/bake/dilateLightmap.ts';
 import { giKnobs } from '../shared/gi/surfel/knobs.ts';
 import {
   createLightControls,
@@ -122,12 +123,12 @@ async function boot(): Promise<void> {
   else if (beach) lightCfg.intensity = 2.6;
   // The diorama is art-directed: `?sunAz=&sunEl=` override the env-derived angles.
   // The sky still lights and reflects from where it is; only the key light moves.
-  const sunAz = num('sunAz') ?? (beach ? 28 : null);
-  const sunEl = num('sunEl') ?? (beach ? 52 : null);
+  const sunAz = num('sunAz') ?? (beach ? 185 : null);
+  const sunEl = num('sunEl') ?? (beach ? 48 : null);
   if (sunAz !== null && sunEl !== null) setLightAngles(sunAz, sunEl);
   const exposure = num('exposure');
   if (exposure !== null) renderer.toneMappingExposure = exposure;
-  else if (beach) renderer.toneMappingExposure = 1.15;
+  else if (beach) renderer.toneMappingExposure = 1.0;
   applyOcclusionSettings({ shadowStrength: 0.5 });
 
   if (!beach) {
@@ -179,9 +180,21 @@ async function boot(): Promise<void> {
   // it cannot be shaded. `?mover=0` leaves it out entirely.
   // The beach has no mover in its reference; `?mover=1` puts the sphere in anyway.
   const wantMover = beach ? params.get('mover') === '1' : params.get('mover') !== '0';
-  const dynamic = wantMover
-    ? addDynamicSphere(scene, { radius: num('moverRadius') ?? undefined })
-    : null;
+  const moverCount = wantMover ? Math.max(1, Math.min(64, Math.floor(num('movers') ?? 1))) : 0;
+  const movers = Array.from({ length: moverCount }, () =>
+    addDynamicSphere(scene, { radius: num('moverRadius') ?? (moverCount > 1 ? 0.22 : undefined) }));
+  const dynamic = movers.length ? {
+    update(t: number) {
+      movers.forEach((mover, i) => {
+        if (moverCount === 1) { mover.update(t); return; }
+        // Multi-receiver fixture: separate surfaces, shared static lighting and pool.
+        mover.mesh.position.set((i % 4 - 1.5) * 1.25 + Math.sin(t + i) * .15,
+          3 + Math.floor(i / 4) * .8, 2.8 + Math.sin(t * .7 + i) * .2);
+        mover.mesh.rotation.set(t * .3, t * 1.5 + i, 0);
+      });
+    },
+  } : null;
+  dynamic?.update(0);
 
   setLoading('Building static BVH');
   gi.buildScene(renderer, scene);
@@ -190,9 +203,9 @@ async function boot(): Promise<void> {
   // Applied here, not with the rest of the GUI defaults further down: the bake runs
   // before those exist, and a knob that only takes effect after the cache has converged
   // is a knob that does nothing.
-  // The diorama sits under an open sky: a stronger skylight is what keeps the shaded
-  // side of a boulder pale rather than black.
-  const envIntensityParam = num('env') ?? (beach ? 1.6 : 1);
+  // The diorama's skylight: measured against the reference, a boulder's lit/shaded
+  // ratio is 2.0, which the sky HDR at 0.7 plus the studio-floor bounce reproduces.
+  const envIntensityParam = num('env') ?? (beach ? 0.7 : 1);
   gi.setEnvControls(envIntensityParam, 4);
 
   const lightmapIntensity = uniform(0);
@@ -240,6 +253,7 @@ async function boot(): Promise<void> {
    */
   type LightingMode = 'surfel' | 'lightmap' | 'hybrid';
   let lightingMode: LightingMode = requestedLightingMode === 'lightmap' || requestedLightingMode === 'surfel' ? requestedLightingMode : 'hybrid';
+  const bakedHitTransport = params.get('bakedHits') !== '0';
 
   async function prepareLightmap(iterations: number, forceBake = false): Promise<void> {
     const persistent = lightingMode === 'hybrid' && params.get('bakeCache') !== '0';
@@ -255,10 +269,12 @@ async function boot(): Promise<void> {
         });
         bakeCache.key = key;
         if (!forceBake && params.get('vt') !== '0') {
-          const streamed = await loadStreamedBake(key);
+          const usePagesForGi = bakedHitTransport && lightingMode === 'hybrid';
+          const streamed = await loadStreamedBake(key, !usePagesForGi);
           if (streamed) {
-            gi.restoreStaticBake(renderer, streamed.surfels);
+            if (streamed.surfels) gi.restoreStaticBake(renderer, streamed.surfels);
             publishPages(streamed.pages);
+            if (usePagesForGi) gi.useBakedLightmap(renderer, virtualLightmap!);
             bakeCache.source = 'saved'; bakeCache.storage = 'streamed'; bakeCache.saved = true;
             console.log(`[bake-cache] restored ${key}; lightmap pages load on demand`);
             return;
@@ -272,6 +288,7 @@ async function boot(): Promise<void> {
           texture.magFilter = texture.minFilter = THREE.LinearFilter; texture.needsUpdate = true;
           renderer.initTexture(texture);
           await publishLightmap(texture, saved.pixels);
+          if (bakedHitTransport && virtualLightmap) gi.useBakedLightmap(renderer, virtualLightmap);
           bakeCache.source = 'saved'; bakeCache.storage = 'bundle'; bakeCache.saved = true;
           console.log(`[bake-cache] restored ${key}`);
           return;
@@ -333,7 +350,20 @@ async function boot(): Promise<void> {
     }
 
     const pixels = (await readFloatTexture(renderer, result.texture)).data;
-    await publishLightmap(result.texture, pixels);
+    // Texels seeded inside other geometry (sand under a boulder) integrate to black
+    // and bleed into the surface around them; fill them from lit neighbours before
+    // the map is published or saved, so pages, fallback and bundle all agree.
+    const filled = dilateUnlitTexels(pixels, lightmapSize);
+    let published: THREE.Texture = result.texture;
+    if (filled > 0) {
+      console.log(`[lightmap] filled ${filled} unlit texels from their neighbours`);
+      const texture = new THREE.DataTexture(Uint16Array.from(pixels, THREE.DataUtils.toHalfFloat), lightmapSize, lightmapSize, THREE.RGBAFormat, THREE.HalfFloatType);
+      texture.magFilter = texture.minFilter = THREE.LinearFilter;
+      texture.needsUpdate = true;
+      renderer.initTexture(texture);
+      published = texture;
+    }
+    await publishLightmap(published, pixels);
     bakeCache.source = 'baked'; bakeCache.storage = 'computed';
     if (key) {
       setLoading('Saving static lighting in project');
@@ -347,6 +377,8 @@ async function boot(): Promise<void> {
         console.warn(`[bake-cache] bake is usable but could not be saved: ${error}`);
       }
     }
+    // Persistence captures authoring data before its GPU pool is released.
+    if (bakedHitTransport && virtualLightmap) gi.useBakedLightmap(renderer, virtualLightmap);
   }
 
   async function publishLightmap(texture: THREE.Texture, pixels: Float32Array): Promise<void> {
@@ -696,6 +728,7 @@ async function boot(): Promise<void> {
   (window as unknown as Record<string, unknown>).__audit = {
     bakeCache: () => ({ ...bakeCache }),
     lighting: () => ({ mode: lightingMode, baked, staticFrozen: baked && lightingMode !== 'surfel', runtimeFrozen: gi.frozen }),
+    bakedTransport: () => gi.bakedTransportStats,
     async rigidSurfels() {
       if (!auditPaused) throw new Error('Pause before reading rigid surfel state');
       return gi.readRigidSurfelState(renderer);

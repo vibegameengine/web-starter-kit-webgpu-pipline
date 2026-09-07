@@ -102,8 +102,8 @@ export function createIsland(options: IslandOptions): Island {
         const reach = Math.max(0, Math.min(1, sub / 0.6)) * (1 - 0.6 * v * v);
         const rockField = n.ridged3(bx * 0.9 + 3, y * 1.4, bz * 0.9, 4);
         const lumps = n.fbm3(bx * 1.6, y * 2.2 + 11, bz * 1.6, 3);
-        const rockMask = Math.max(0, Math.min(1, (rockField - 0.45) * 3.0));
-        const bulge = 0.10 * lumps + 0.5 * rockMask * (0.5 + 0.5 * lumps) + 0.05 * n.noise3(bx * 6, y * 6, bz * 6);
+        const rockMask = Math.max(0, Math.min(1, (rockField - 0.6) * 4.0));
+        const bulge = 0.04 * lumps + 0.7 * rockMask * (0.5 + 0.5 * lumps);
         const out = reach * bulge;
 
         const i = r * (wallCols + 1) + c;

@@ -54,7 +54,7 @@ export function createSandMaterial(u: SandMaterialUniforms): THREE.MeshStandardN
 
   const p = positionWorld;
   const grainFine = mx_noise_float(p.mul(220.0));
-  const grainCoarse = mx_noise_float(p.mul(48.0).add(vec3(7.0, 0.0, 3.0)));
+  const grainCoarse = mx_noise_float(p.mul(22.0).add(vec3(7.0, 0.0, 3.0)));
   const mottle = mx_fractal_noise_float(p.xz.mul(0.45), 3, 2.0, 0.55);
   const streaks = mx_fractal_noise_float(vec3(p.x.mul(0.9), p.z.mul(4.5), 2.0), 2, 2.0, 0.5);
 
@@ -65,9 +65,9 @@ export function createSandMaterial(u: SandMaterialUniforms): THREE.MeshStandardN
 
   const dry = color(0.86, 0.71, 0.48);
   const wetTint = color(0.50, 0.42, 0.30);
-  const dark = grainCoarse.mul(0.07).add(grainFine.mul(0.05)).add(mottle.mul(0.06)).add(streaks.mul(0.03));
+  const dark = grainCoarse.mul(0.20).add(grainFine.mul(0.05)).add(mottle.mul(0.10)).add(streaks.mul(0.03));
   // Shell fragments and dark grains, sparse.
-  const speck = step(0.78, mx_noise_float(p.mul(160.0).add(vec3(0.0, 13.0, 0.0))));
+  const speck = step(0.78, mx_noise_float(p.mul(60.0).add(vec3(0.0, 13.0, 0.0))));
   const albedoBase = mix(dry, wetTint, wet).mul(float(1.0).add(dark));
   const albedo = mix(albedoBase, albedoBase.mul(0.55), speck.mul(0.6));
   // Below the water line the sun arrives through the water: the floor is lit by what
@@ -81,8 +81,8 @@ export function createSandMaterial(u: SandMaterialUniforms): THREE.MeshStandardN
   // Grain-scale bump: a gradient of the same noise, in world space, tilted into view space.
   const bump = Fn(() => {
     const e = float(0.02);
-    const s = float(0.35);
-    const q = p.mul(90.0);
+    const s = float(0.9);
+    const q = p.mul(30.0);
     const h0 = mx_noise_float(q);
     const hx = mx_noise_float(q.add(vec3(e, 0.0, 0.0)));
     const hz = mx_noise_float(q.add(vec3(0.0, 0.0, e)));
@@ -97,18 +97,18 @@ export function createSandMaterial(u: SandMaterialUniforms): THREE.MeshStandardN
   const caustic = Fn(() => {
     const t = u.time;
     const depth = u.waterLevel.sub(p.y);
-    const q1 = vec3(p.x.mul(3.0).add(t.mul(0.12)), p.z.mul(3.0).sub(t.mul(0.09)), t.mul(0.30));
-    const q2 = vec3(p.x.mul(4.2).sub(t.mul(0.08)), p.z.mul(4.2).add(t.mul(0.13)), t.mul(0.24).add(5.0));
+    const q1 = vec3(p.x.mul(8.0).add(t.mul(0.12)), p.z.mul(8.0).sub(t.mul(0.09)), t.mul(0.30));
+    const q2 = vec3(p.x.mul(11.5).sub(t.mul(0.08)), p.z.mul(11.5).add(t.mul(0.13)), t.mul(0.24).add(5.0));
     const w1 = mx_worley_noise_vec2(q1, 1.0);
     const w2 = mx_worley_noise_vec2(q2, 1.0);
-    const line1 = smoothstep(0.12, 0.0, w1.y.sub(w1.x));
-    const line2 = smoothstep(0.12, 0.0, w2.y.sub(w2.x));
+    const line1 = smoothstep(0.06, 0.0, w1.y.sub(w1.x));
+    const line2 = smoothstep(0.06, 0.0, w2.y.sub(w2.x));
     const filaments = line1.mul(0.7).add(line2.mul(0.7)).add(line1.mul(line2).mul(1.6));
     // Fade in just below the surface, decay with depth (light spreads and absorbs).
     const fade = smoothstep(0.0, 0.06, depth).mul(exp(depth.mul(-1.4)));
     return filaments.mul(fade).mul(submerged);
   });
-  material.emissiveNode = albedo.mul(vec3(u.sunColor)).mul(caustic()).mul(0.55);
+  material.emissiveNode = albedo.mul(vec3(u.sunColor)).mul(caustic()).mul(0.85);
 
   return material;
 }

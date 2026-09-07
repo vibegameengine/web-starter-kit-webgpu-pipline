@@ -87,10 +87,10 @@ export function createCliffMaterial(tex: CliffTextures): THREE.MeshStandardNodeM
   const soilTexture = triColor(tex.dirtColor, 0.55);
   const soilLuma = soilTexture.r.mul(0.3).add(soilTexture.g.mul(0.59)).add(soilTexture.b.mul(0.11));
   // Pale compacted sand near the top, darker packed earth toward the underside.
-  const soilTint = mix(color(0.46, 0.36, 0.25), color(0.80, 0.66, 0.46), smoothstep(-2.6, -0.4, p.y));
+  const soilTint = mix(color(0.40, 0.34, 0.29), color(0.76, 0.64, 0.52), smoothstep(-2.6, -0.4, p.y));
   const soil = soilTint.mul(soilLuma.mul(2.4).add(0.35));
   // Rock030 averages 0.08 linear; lift it to the pale limestone of the reference.
-  const rock = triColor(tex.rockColor, 0.45).mul(color(4.6, 4.3, 3.9)).clamp(0.0, 0.9);
+  const rock = triColor(tex.rockColor, 0.45).mul(color(2.4, 2.3, 2.3)).clamp(0.0, 0.55);
   const rockMask = smoothstep(0.3, 0.7, strata);
 
   // Sediment bands: dark thin lines at varying y, wobbling with x/z.
@@ -101,7 +101,7 @@ export function createCliffMaterial(tex: CliffTextures): THREE.MeshStandardNodeM
 
   // Sand crust at the top of the wall, where the beach surface turns over the edge.
   const crust = smoothstep(-0.6, 0.15, p.y).mul(rockMask.oneMinus());
-  const sand = color(0.84, 0.72, 0.52);
+  const sand = color(0.82, 0.72, 0.58);
 
   const albedoBase = mix(soil.mul(bandDark), rock, rockMask).mul(mottle);
   const albedo = mix(albedoBase, sand.mul(mottle), crust.mul(0.8));
@@ -110,7 +110,7 @@ export function createCliffMaterial(tex: CliffTextures): THREE.MeshStandardNodeM
   const roughRock = texture(tex.rockRoughness, p.xy.mul(0.45)).r;
   material.roughnessNode = mix(float(0.95), roughRock.mul(0.3).add(0.65), rockMask);
 
-  const nSoil = triNormal(tex.dirtNormal, 0.55, 0.6);
+  const nSoil = triNormal(tex.dirtNormal, 0.55, 0.25);
   const nRock = triNormal(tex.rockNormal, 0.45, 1.0);
   material.normalNode = transformNormalToView(normalize(mix(nSoil, nRock, rockMask)));
 

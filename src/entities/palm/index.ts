@@ -223,7 +223,7 @@ function buildBarkTexture(noise: ReturnType<typeof createNoise>): { texture: THR
   const size = 256;
   const linear = new Float32Array(size * size * 3);
   // Linear ≈ sRGB (0.55, 0.50, 0.42): a light, slightly warm grey.
-  const base: RGB = [0.262, 0.214, 0.148];
+  const base: RGB = [0.24, 0.12, 0.035];
   const ringsPerTile = 4;
   for (let y = 0; y < size; y++) {
     const v = y / size;
@@ -241,7 +241,7 @@ function buildBarkTexture(noise: ReturnType<typeof createNoise>): { texture: THR
       const groove = Math.pow(clamp01(1 - Math.abs(ringFrac - 0.06) / 0.07), 1.1);
       const mottle = noise.fbm3(cu * 3, su * 3, v * 9, 4) * 0.12;
       const fibre = noise.fbm3(cu * 16, su * 16, v * 2, 3) * 0.07;
-      const scar = band * 0.38 - groove * 0.4;
+      const scar = band * 0.38 - groove * 0.6;
       const k = 1 + mottle + fibre + scar;
       // Scar bands are greyer (less warm) than the internodes.
       const warmth = 1 + 0.08 * noise.noise3(cu * 2, su * 2, v * 3 + 7) - band * 0.1;
