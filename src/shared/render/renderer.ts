@@ -20,9 +20,17 @@ export async function initRenderer(
   const container = document.querySelector<HTMLElement>(containerSelector);
   if (!container) throw new Error(`Container ${containerSelector} not found`);
 
+  // `?gputime=1` turns on GPU timestamp queries so a caller can read
+  // `renderer.resolveTimestampsAsync('render' | 'compute')`. Off by default: the
+  // queries themselves are not free, and reading them for a build that never asked
+  // for them would answer a question nobody is measuring.
+  const trackTimestamp =
+    new URLSearchParams(window.location.search).get('gputime') === '1';
+
   const renderer = new THREE.WebGPURenderer({
     antialias: false,
     forceWebGL: false,
+    trackTimestamp,
     // The surfel GI passes need more than the WebGPU defaults: the integrator binds
     // 14 storage buffers in one compute stage, and the grid build dispatches
     // 512-wide workgroups. Without these the pipelines fail to create and every

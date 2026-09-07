@@ -12,9 +12,17 @@ import {
   rasteriseLightmapGBuffer,
 } from '../shared/gi/bake/index.ts';
 import { uniform } from 'three/tsl';
+import { readFloatTexture, readValidationTexture } from '../shared/render/gpuReadback.ts';
+import { createLightmapPages, type LightmapPageSource } from '../shared/render/virtualTexture/lightmapPages.ts';
+import { VirtualLightmap } from '../shared/render/virtualTexture/virtualLightmap.ts';
+import { createLightmapDemand } from '../shared/render/virtualTexture/lightmapDemand.ts';
+import { bakeKey, loadBake, saveBake } from '../shared/gi/bake/persistedBake.ts';
+import { loadStreamedBake } from '../shared/gi/bake/streamedBake.ts';
+import { giKnobs } from '../shared/gi/surfel/knobs.ts';
 import {
   createLightControls,
   findSunPositionWeighted,
+  setLightAngles,
   setLightAnglesFromEnvMapSunUVLocation,
 } from '../shared/gi/surfel/lighting.ts';
 import { applyOcclusionSettings } from '../shared/gi/surfel/surfelRadialDepth.ts';
@@ -22,6 +30,7 @@ import { MAX_TEMPORAL_M } from '../shared/gi/surfel/constants.ts';
 import { giLightSummary } from '../shared/gi/surfel/sceneLights.ts';
 import {
   addDynamicSphere,
+  createBeachScene,
   createCornellScene,
   populateCornell,
 } from '../widgets/world/index.ts';
@@ -76,13 +85,19 @@ async function boot(): Promise<void> {
   const gui = new GUI({ title: 'Elderwood' });
   if (!showChrome) gui.hide();
 
+  setLoading('Loading GI assets');
+  const gi = await SurfelGI.create(renderer);
+  gi.liveCoverage = params.get('liveCoverage') !== 'legacy';
+
   setLoading('Building scene');
   const world = new WorldState();
   const stats = new CacheStats();
-  const { scene, camera, controls, sun } = createCornellScene(renderer);
-
-  setLoading('Loading GI assets');
-  const gi = await SurfelGI.create(renderer);
+  // `?scene=beach` is the diorama lab (concepts/beach.png); the Cornell box stays the
+  // reference frame every earlier measurement was taken against.
+  const sceneName = params.get('scene') === 'beach' ? 'beach' : 'cornell';
+  const beach = sceneName === 'beach' ? await createBeachScene(renderer, gi.envTexture) : null;
+  const { scene, camera, controls, sun } = beach ?? createCornellScene(renderer);
+  gi.rigidSurfels = params.get('rigidSurfels') !== '0';
 
   // Sun direction comes from the brightest region of the environment map, not from
   // authored angles — that is what keeps the analytic sun and the image-based
@@ -100,10 +115,21 @@ async function boot(): Promise<void> {
   // thing in this frame that emits.
   const sunIntensity = num('sun');
   if (sunIntensity !== null) lightCfg.intensity = sunIntensity;
+  else if (beach) lightCfg.intensity = 2.6;
+  // The diorama is art-directed: `?sunAz=&sunEl=` override the env-derived angles.
+  // The sky still lights and reflects from where it is; only the key light moves.
+  const sunAz = num('sunAz') ?? (beach ? 28 : null);
+  const sunEl = num('sunEl') ?? (beach ? 52 : null);
+  if (sunAz !== null && sunEl !== null) setLightAngles(sunAz, sunEl);
+  const exposure = num('exposure');
+  if (exposure !== null) renderer.toneMappingExposure = exposure;
+  else if (beach) renderer.toneMappingExposure = 1.15;
   applyOcclusionSettings({ shadowStrength: 0.5 });
 
-  setLoading('Building Cornell box');
-  populateCornell(scene, sun);
+  if (!beach) {
+    setLoading('Building Cornell box');
+    populateCornell(scene, sun);
+  }
 
   // AFTER populate, deliberately: buildCornellScene ends by hard-coding
   // dirLight.position to (1,3,1), which throws away the env-derived sun and leaves
@@ -127,10 +153,8 @@ async function boot(): Promise<void> {
   // `bakeLightmap`'s argument for it, which is worse than either number on its own.
   const lightmapIterations = num('iters') ?? MAX_TEMPORAL_M;
   const lightmapRays = num('rays') ?? 32;
-  // Default is webgiya's surfel GI: that path is verified against upstream
-  // pixel-for-pixel (mean 0.79/255, inside the build's own run-to-run noise).
-  // The lightmap bake is opt-in via ?mode=lightmap until it reaches the same bar.
-  const useLightmap = params.get('mode') === 'lightmap';
+  // Default: frozen static atlas plus live GI for unbaked receivers.
+  const requestedLightingMode = params.get('mode');
   gi.freezeCompletely = params.get('freezeAll') === '1';
 
   // Unconditionally, and before the BVH. Unconditionally because the mode is a
@@ -149,10 +173,11 @@ async function boot(): Promise<void> {
   // Before the BVH, deliberately: being in the scene at build time is what gets the
   // sphere's material an id in the shared diffuse array, without which a ray that hits
   // it cannot be shaded. `?mover=0` leaves it out entirely.
-  const dynamic =
-    params.get('mover') === '0'
-      ? null
-      : addDynamicSphere(scene, { radius: num('moverRadius') ?? undefined });
+  // The beach has no mover in its reference; `?mover=1` puts the sphere in anyway.
+  const wantMover = beach ? params.get('mover') === '1' : params.get('mover') !== '0';
+  const dynamic = wantMover
+    ? addDynamicSphere(scene, { radius: num('moverRadius') ?? undefined })
+    : null;
 
   setLoading('Building static BVH');
   gi.buildScene(renderer, scene);
@@ -161,7 +186,9 @@ async function boot(): Promise<void> {
   // Applied here, not with the rest of the GUI defaults further down: the bake runs
   // before those exist, and a knob that only takes effect after the cache has converged
   // is a knob that does nothing.
-  const envIntensityParam = num('env') ?? 1;
+  // The diorama sits under an open sky: a stronger skylight is what keeps the shaded
+  // side of a boulder pale rather than black.
+  const envIntensityParam = num('env') ?? (beach ? 1.6 : 1);
   gi.setEnvControls(envIntensityParam, 4);
 
   const lightmapIntensity = uniform(0);
@@ -171,9 +198,14 @@ async function boot(): Promise<void> {
   let lightmapTexture: THREE.Texture | null = null;
   let lightmapGBuffer: ReturnType<typeof rasteriseLightmapGBuffer> | null = null;
   let lightmapCoverage = 0;
-  let lightmapApplied = false;
+  let virtualLightmap: VirtualLightmap | null = null;
+  let lightmapDemand: ReturnType<typeof createLightmapDemand> | null = null;
+  let nextPageDemandAt = 0;
+  let pausePageStreaming = false;
   let bakedSunVersion = -1;
   let baked = false;
+  const bakeCache = { source: 'none', storage: 'none', key: '', saved: false, error: '' };
+  let readBakeControls = () => ({ envIntensity: envIntensityParam, envLod: 4, fromDirect: 1, fromIndirect: 1, albedoBoost: 1 });
 
   // Declared here rather than with the rest of the GUI because the mode switch reads
   // them: switching to lightmap means "bake with the current settings".
@@ -187,7 +219,7 @@ async function boot(): Promise<void> {
   const frameGraph = new FrameGraph(renderer, scene, camera, {
     giMode: (params.get('giMode') as GiMode) ?? GiMode.Combined,
     indirectIntensity: num('gi') ?? 1,
-    splitView: (params.get('split') as SplitView) ?? SplitView.Gi,
+    splitView: (params.get('split') as SplitView) ?? SplitView.Off,
   });
 
   /**
@@ -199,10 +231,49 @@ async function boot(): Promise<void> {
    * toggle — each direction has to re-prepare the pool for its own occupant, which is
    * why this is async and shows the loading overlay rather than flipping instantly.
    */
-  type LightingMode = 'surfel' | 'lightmap';
-  let lightingMode: LightingMode = useLightmap ? 'lightmap' : 'surfel';
+  type LightingMode = 'surfel' | 'lightmap' | 'hybrid';
+  let lightingMode: LightingMode = requestedLightingMode === 'lightmap' || requestedLightingMode === 'surfel' ? requestedLightingMode : 'hybrid';
 
-  async function prepareLightmap(iterations: number): Promise<void> {
+  async function prepareLightmap(iterations: number, forceBake = false): Promise<void> {
+    const persistent = lightingMode === 'hybrid' && params.get('bakeCache') !== '0';
+    let key = '';
+    bakeCache.source = 'none'; bakeCache.storage = 'none'; bakeCache.saved = false; bakeCache.error = '';
+    if (persistent) {
+      setLoading('Checking saved static lighting');
+      try {
+        key = await bakeKey(scene, gi.envTexture, gi.bakeNoiseTexture, {
+          size: lightmapSize, iterations, rays: lightmapRays, controls: readBakeControls(),
+          knobs: Object.fromEntries(Object.entries(giKnobs).map(([name, read]) => [name, read()])),
+          viewpoint: params.get('bakecam') === 'view' ? camera.position.toArray() : null,
+        });
+        bakeCache.key = key;
+        if (!forceBake && params.get('vt') !== '0') {
+          const streamed = await loadStreamedBake(key);
+          if (streamed) {
+            gi.restoreStaticBake(renderer, streamed.surfels);
+            publishPages(streamed.pages);
+            bakeCache.source = 'saved'; bakeCache.storage = 'streamed'; bakeCache.saved = true;
+            console.log(`[bake-cache] restored ${key}; lightmap pages load on demand`);
+            return;
+          }
+        }
+        const saved = forceBake ? null : await loadBake(key);
+        if (saved) {
+          setLoading('Restoring saved static lighting');
+          gi.restoreStaticBake(renderer, saved.surfels);
+          const texture = new THREE.DataTexture(Uint16Array.from(saved.pixels, THREE.DataUtils.toHalfFloat), saved.size, saved.size, THREE.RGBAFormat, THREE.HalfFloatType);
+          texture.magFilter = texture.minFilter = THREE.LinearFilter; texture.needsUpdate = true;
+          renderer.initTexture(texture);
+          await publishLightmap(texture, saved.pixels);
+          bakeCache.source = 'saved'; bakeCache.storage = 'bundle'; bakeCache.saved = true;
+          console.log(`[bake-cache] restored ${key}`);
+          return;
+        }
+      } catch (error) {
+        bakeCache.error = String(error);
+        console.warn(`[bake-cache] cannot reuse saved data: ${error}`);
+      }
+    }
     if (!lightmapGBuffer) {
       setLoading('Rasterising lightmap G-Buffer');
       lightmapGBuffer = rasteriseLightmapGBuffer(renderer, scene, lightmapSize);
@@ -230,6 +301,7 @@ async function boot(): Promise<void> {
       {
         iterations,
         raysPerSurfel: lightmapRays,
+        dynamicReceivers: lightingMode === 'hybrid',
         viewpoint:
           params.get('bakecam') === 'view' ? camera.position.clone() : undefined,
         onProgress: (fraction, iteration) => {
@@ -241,9 +313,9 @@ async function boot(): Promise<void> {
     );
 
     if (result && result.seeded < lightmapCoverage) {
-      console.warn(
+      throw new Error(
         `[lightmap] surfel pool exhausted: ${result.seeded}/${lightmapCoverage} ` +
-          'covered texels got a surfel; the rest will bake black. Lower ?lm=',
+          'covered texels got a surfel. Cannot publish an incomplete bake. Lower ?lm=',
       );
     }
 
@@ -253,12 +325,47 @@ async function boot(): Promise<void> {
       );
     }
 
-    lightmapTexture = result.texture;
-    if (lightmapTexture && !lightmapApplied) {
-      applyLightmap(scene, lightmapTexture, lightmapIntensity);
-      lightmapApplied = true;
+    const pixels = (await readFloatTexture(renderer, result.texture)).data;
+    await publishLightmap(result.texture, pixels);
+    bakeCache.source = 'baked'; bakeCache.storage = 'computed';
+    if (key) {
+      setLoading('Saving static lighting in project');
+      try {
+        const surfels = await gi.captureStaticBake(renderer, result.seeded);
+        await saveBake(key, { size: lightmapSize, pixels, surfels });
+        bakeCache.saved = true;
+        console.log(`[bake-cache] saved ${key}`);
+      } catch (error) {
+        bakeCache.error = String(error);
+        console.warn(`[bake-cache] bake is usable but could not be saved: ${error}`);
+      }
     }
+  }
+
+  async function publishLightmap(texture: THREE.Texture, pixels: Float32Array): Promise<void> {
+    if (params.get('vt') !== '0' && lightingMode === 'hybrid') {
+      setLoading('Preparing virtual lightmap pages');
+      const pageSize = Math.min(128, lightmapSize / 2);
+      publishPages(createLightmapPages(pixels, lightmapSize, pageSize, pageSize));
+    } else {
+      const previousVirtual = virtualLightmap;
+      virtualLightmap = null; lightmapDemand = null;
+      lightmapTexture = texture;
+      applyLightmap(scene, lightmapTexture, lightmapIntensity);
+      frameGraph.setLightmapTexture(lightmapTexture);
+      previousVirtual?.dispose();
+    }
+  }
+
+  function publishPages(pages: LightmapPageSource): void {
+    const previousVirtual = virtualLightmap;
+    virtualLightmap = new VirtualLightmap(renderer, pages, num('vtSlots') ?? 8);
+    lightmapDemand = createLightmapDemand(scene, pages);
+    applyLightmap(scene, virtualLightmap.fallback, lightmapIntensity, virtualLightmap);
+    lightmapTexture = virtualLightmap.fallback;
+    nextPageDemandAt = 0;
     frameGraph.setLightmapTexture(lightmapTexture);
+    previousVirtual?.dispose();
   }
 
   async function prepareSurfel(durationMs: number): Promise<void> {
@@ -277,7 +384,7 @@ async function boot(): Promise<void> {
   /** Set by the GUI so a failed or refused switch can put the control back. */
   let onModeSettled: ((mode: LightingMode) => void) | null = null;
 
-  async function setLightingMode(next: LightingMode): Promise<void> {
+  async function setLightingMode(next: LightingMode, forceBake = false): Promise<void> {
     // Refusing silently would leave the dropdown showing a mode the app is not in,
     // and every later action would target the wrong one. Refuse loudly instead.
     if (switching) {
@@ -291,14 +398,16 @@ async function boot(): Promise<void> {
     baked = false;
     try {
       lightingMode = next;
-      if (next === 'lightmap') {
+      frameGraph.hybridReceivers.value = next === 'hybrid' ? 1 : 0;
+      if (next !== 'surfel') {
         // The composite still holds the last resolve output; without dropping it the
         // scene would be lit by a frozen screen-space GI texture *and* the lightmap.
         frameGraph.setGiTextures(null, null);
-        await prepareLightmap(bakeParams.passes);
+        await prepareLightmap(bakeParams.passes, forceBake);
         lightmapIntensity.value = lightmapParams.intensity;
-        // The pool is full of atlas texels and must stay that way.
-        gi.setFrozen(true);
+        // Hybrid pins the baked entries while webgiya continues spawning and
+        // integrating live surfels for objects without a baked chart.
+        gi.setFrozen(next === 'lightmap');
       } else {
         lightmapIntensity.value = 0;
         await prepareSurfel(bakeParams.seconds * 1000);
@@ -309,7 +418,8 @@ async function boot(): Promise<void> {
       // A half-applied mode is worse than the old one: the scene would render with
       // neither GI chain running and nothing on screen would say so.
       lightingMode = previous;
-      lightmapIntensity.value = previous === 'lightmap' ? lightmapParams.intensity : 0;
+      lightmapIntensity.value = previous !== 'surfel' ? lightmapParams.intensity : 0;
+      frameGraph.hybridReceivers.value = previous === 'hybrid' ? 1 : 0;
       throw error;
     } finally {
       switching = false;
@@ -322,13 +432,13 @@ async function boot(): Promise<void> {
     ? new Hud(world, stats, () =>
         !baked
           ? 'converging'
-          : lightingMode === 'lightmap'
+          : lightingMode !== 'surfel'
             ? // The sun is bakeable state. Moving it does not invalidate anything
               // automatically -- re-baking on every slider tick would be unusable --
               // so the only honest thing is to say the texture is now out of date.
               world.sunVersion !== bakedSunVersion
               ? `lightmap ${lightmapSize}px · STALE (sun moved, re-bake)`
-              : `lightmap ${lightmapSize}px · surfel bake`
+              : `lightmap ${lightmapSize}px · static frozen${lightingMode === 'hybrid' ? ' · dynamics live' : ''}`
             : gi.frozen
               ? 'surfel · fully frozen'
               : 'surfel · movers live',
@@ -347,6 +457,7 @@ async function boot(): Promise<void> {
     fromIndirect: 1,
     albedoBoost: 1,
   };
+  readBakeControls = () => ({ envIntensity: giParams.envIntensity, envLod: giParams.envLod, fromDirect: giParams.fromDirect, fromIndirect: giParams.fromIndirect, albedoBoost: giParams.albedoBoost });
   gi.setBaseSampleCount(giParams.baseSamples);
 
   const giFolder = gui.addFolder('GI (surfel)');
@@ -370,7 +481,7 @@ async function boot(): Promise<void> {
   frameGraph.setLightmapTexture(lightmapTexture);
 
   const splitParams = {
-    right: (params.get('split') as SplitView) ?? SplitView.Gi,
+    right: (params.get('split') as SplitView) ?? SplitView.Off,
     at: frameGraph.splitPosition,
   };
   const splitFolder = gui.addFolder('Split view');
@@ -397,22 +508,24 @@ async function boot(): Promise<void> {
   const modeFolder = gui.addFolder('Lighting');
   const modeParams = { mode: lightingMode as LightingMode };
   const modeCtrl = modeFolder
-    .add(modeParams, 'mode', ['surfel', 'lightmap'])
+    .add(modeParams, 'mode', ['surfel', 'lightmap', 'hybrid'])
     .name('mode')
     .onChange((v: LightingMode) => void setLightingMode(v).catch(showError));
   const intensityCtrl = modeFolder
     .add(lightmapParams, 'intensity', 0, 8, 0.05)
     .name('lightmap mul')
     .onChange((v: number) => {
-      if (lightingMode === 'lightmap') lightmapIntensity.value = v;
+      if (lightingMode !== 'surfel') lightmapIntensity.value = v;
     });
 
   // The control is the app's state, so it has to follow the app rather than lead it.
+  let refreshFrozenControl = () => {};
   onModeSettled = (mode) => {
     modeParams.mode = mode;
     modeCtrl.updateDisplay?.();
-    if (mode === 'lightmap') intensityCtrl.enable?.();
+    if (mode !== 'surfel') intensityCtrl.enable?.();
     else intensityCtrl.disable?.();
+    refreshFrozenControl();
   };
   onModeSettled(lightingMode);
 
@@ -424,8 +537,20 @@ async function boot(): Promise<void> {
   const frozenCtrl = bakeFolder
     .add(bakeParams, 'frozen')
     .name('frozen')
-    .onChange((v: boolean) => gi.setFrozen(v))
+    .onChange((v: boolean) => {
+      if (lightingMode === 'surfel') gi.setFrozen(v);
+      refreshFrozenControl();
+    })
     .listen?.();
+  refreshFrozenControl = () => {
+    const staticBaked = lightingMode !== 'surfel';
+    bakeParams.frozen = staticBaked || gi.frozen;
+    frozenCtrl?.name(staticBaked ? 'static frozen' : 'freeze all GI');
+    if (staticBaked) frozenCtrl?.disable();
+    else frozenCtrl?.enable();
+    frozenCtrl?.updateDisplay();
+  };
+  refreshFrozenControl();
   bakeFolder
     .add(
       {
@@ -433,10 +558,7 @@ async function boot(): Promise<void> {
         // Re-baking means whatever the *current* mode needs -- more integration
         // passes into the atlas, or another warm-up of the runtime cache.
         rebake: () => {
-          void setLightingMode(lightingMode).then(() => {
-            bakeParams.frozen = gi.frozen;
-            frozenCtrl?.updateDisplay?.();
-          });
+          void setLightingMode(lightingMode, true).catch(showError);
         },
       },
       'rebake',
@@ -530,6 +652,21 @@ async function boot(): Promise<void> {
   (window as unknown as Record<string, unknown>).__surfels = () =>
     gi.readSurfelStats(renderer);
 
+  // GPU time for the last resolved render/compute pass, in ms. Only meaningful with
+  // `?gputime=1` — without it the renderer never enabled timestamp queries and this
+  // resolves to `undefined` for both, which is the honest answer to "how expensive is
+  // this frame" when nobody asked the GPU to time itself.
+  (window as unknown as Record<string, unknown>).__gpuTime = async () => ({
+    render: await renderer.resolveTimestampsAsync('render'),
+    compute: await renderer.resolveTimestampsAsync('compute'),
+    // Whether *this* frame submitted any compute work — `.calls` is a lifetime total
+    // that never resets, so it stays > 0 forever after the bake's own compute passes.
+    // `.frameCalls` is cleared at the top of every rAF and is what actually answers
+    // "did this frame do compute", which a stale timestamp from the bake would
+    // otherwise misreport as a live per-frame cost.
+    computeCalls: renderer.info.compute.frameCalls,
+  });
+
   // Pins the sphere to a fixed pose so a diff against webgiya measures the renderer
   // rather than two animation clocks that were never in step.
   let frozen = false;
@@ -546,24 +683,67 @@ async function boot(): Promise<void> {
 
   let previous = performance.now();
   let firstFrame = true;
+  let auditPaused = false;
+  let auditRecording = false;
+  let auditIntervals: number[] = [];
+  (window as unknown as Record<string, unknown>).__audit = {
+    bakeCache: () => ({ ...bakeCache }),
+    lighting: () => ({ mode: lightingMode, baked, staticFrozen: baked && lightingMode !== 'surfel', runtimeFrozen: gi.frozen }),
+    async rigidSurfels() {
+      if (!auditPaused) throw new Error('Pause before reading rigid surfel state');
+      return gi.readRigidSurfelState(renderer);
+    },
+    async bakedPixels() {
+      if (!auditPaused || !lightmapTexture) throw new Error('Pause a baked scene before lightmap readback');
+      return readValidationTexture(renderer, lightmapTexture);
+    },
+    pages: () => virtualLightmap?.stats() ?? null,
+    pageDetail(value: boolean) { if (virtualLightmap) virtualLightmap.enabled.value = value ? 1 : 0; },
+    pageStreaming(value: boolean) { pausePageStreaming = !value; },
+    clearPages() { virtualLightmap?.clear(); },
+    realtimeContribution(value: number) { frameGraph.indirectIntensity.value = value; },
+    hideOverlay() { (renderer.inspector as unknown as { domElement: HTMLElement }).domElement.style.display = 'none'; },
+    pause(value = true) { auditPaused = value; previous = performance.now(); },
+    measure() { auditIntervals = []; auditRecording = true; },
+    stopMeasure() { auditRecording = false; return auditIntervals.slice(); },
+    async read() {
+      if (!auditPaused) throw new Error('Pause the renderer before coherent buffer readback');
+      return {
+        base: await readValidationTexture(renderer, frameGraph.scenePass.getTexture('output')),
+        normal: await readValidationTexture(renderer, frameGraph.scenePass.getTexture('normal')),
+        gi: gi.outputTexture ? await readValidationTexture(renderer, gi.outputTexture) : null,
+        albedo: gi.outputTexture ? await readValidationTexture(renderer, gi.albedoTexture) : null,
+        receivers: await readValidationTexture(renderer, frameGraph.scenePass.getTexture('albedo')),
+        composite: { mode: lightingMode, giMode: frameGraph.giMode, indirectIntensity: frameGraph.indirectIntensity.value, hybridReceivers: frameGraph.hybridReceivers.value },
+      };
+    },
+  };
 
   renderer.setAnimationLoop(() => {
-    if (fatal) return;
+    if (fatal || auditPaused) return;
 
     const now = performance.now();
     const dt = (now - previous) / 1000;
     previous = now;
+    if (auditRecording && auditIntervals.length < 100000) auditIntervals.push(dt * 1000);
 
     world.beginFrame(dt);
     controls.update();
     updateAnimation();
     camera.updateMatrixWorld();
     if (!frozen) dynamic?.update(now * 0.001);
+    beach?.update(now * 0.001);
+    if (!switching && lightingMode === 'hybrid' && virtualLightmap && lightmapDemand) {
+      if (now >= nextPageDemandAt) {
+        virtualLightmap.setDemand(lightmapDemand(camera, renderer.domElement.width, renderer.domElement.height));
+        nextPageDemandAt = now + 150;
+      }
+      if (!pausePageStreaming) virtualLightmap.update(now);
+    }
 
-    // In lightmap mode the surfel cache is frozen and the scene reads the baked atlas,
-    // so the chain has nothing to do — including the sphere, which has no lightmap of
-    // its own. Skipped during a switch too: the pool is being rebuilt underneath.
-    if (!switching && lightingMode === 'surfel') {
+    // Hybrid retains the atlas for static receivers and runs the existing surfel
+    // chain for unbaked receivers. Skip during an asynchronous pool rebuild.
+    if (!switching && lightingMode !== 'lightmap') {
       // Immediately after the sphere moved and before anything traces: the dynamic BVH
       // is what makes it visible to a ray at all. It self-gates on the world matrix, so
       // a still scene pays a matrix compare and nothing else.
@@ -572,7 +752,8 @@ async function boot(): Promise<void> {
       frameGraph.setGiTextures(gi.outputTexture, gi.albedoTexture);
     }
 
-    scene.background = gi.envTexture;
+    // The diorama sits in front of its own backdrop; the sky is lighting only there.
+    scene.background = beach ? null : gi.envTexture;
     frameGraph.render();
 
     stats.endFrame(world.dt);

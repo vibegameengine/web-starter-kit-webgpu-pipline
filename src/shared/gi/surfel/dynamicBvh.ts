@@ -419,7 +419,7 @@ export function createDynamicBVH(
   const gathered = gatherBvhGeometries(scene, {
     materialIdByUUID,
     label: 'dynamic',
-    include: (mesh) => mesh.userData.mobility === Mobility.Movable,
+    include: (mesh) => mesh.userData.mobility === Mobility.Movable && mesh.userData.giExclude !== true,
     triangleBudget: options.triangleBudget,
   });
 

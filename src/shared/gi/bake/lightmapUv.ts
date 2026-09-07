@@ -3,14 +3,14 @@ import { Layer } from '../../world/index.ts';
 
 export interface LightmapChart {
   mesh: THREE.Mesh;
-  /** Index of the first atlas cell this mesh occupies. */
+  /** Index of the first atlas texel this mesh occupies (charts are counted in texels). */
   firstCell: number;
   cellCount: number;
 }
 
 export interface LightmapLayout {
   charts: LightmapChart[];
-  /** Cells per atlas row/column. */
+  /** Texels per atlas row/column. */
   gridSide: number;
   cellCount: number;
   /** Static world area that got a chart, in m². */
@@ -19,20 +19,9 @@ export interface LightmapLayout {
   refusedArea: number;
   /** Atlas resolution the density figures below were reported against. */
   atlasSize: number;
-  /** Aggregate metres per texel: `sqrt(mappedArea) / atlasSize`, near enough. */
+  /** Metres per texel the charts were laid out at. */
   metresPerTexel: number;
 }
-
-/**
- * Largest block, in cells per side, one quad may be given.
- *
- * The cap is what stops the whole atlas going to the single biggest surface in an
- * outdoor scene: a 400 m terrain chunk is ~10^4 times the area of a fence post, and
- * proportional sizing without a ceiling would hand it the entire grid. Four is a
- * 16:1 texel ratio, which covers the spread inside a room and deliberately does not
- * pretend to cover the spread inside a landscape — see the refusal below.
- */
-const MAX_BLOCK = 4;
 
 /**
  * Metres per texel past which this atlas is not worth baking.
@@ -44,88 +33,78 @@ const MAX_BLOCK = 4;
  */
 const REFUSE_METRES_PER_TEXEL = 0.5;
 
-const _v0 = new THREE.Vector3();
-const _v1 = new THREE.Vector3();
-const _v2 = new THREE.Vector3();
-const _v3 = new THREE.Vector3();
+/** Fraction of the atlas the packer aims to fill before it starts coarsening. */
+const TARGET_FILL = 0.78;
+
+/** Empty texels kept between neighbouring charts. */
+const CHART_GAP = 1;
+
+const _a = new THREE.Vector3();
+const _b = new THREE.Vector3();
+const _c = new THREE.Vector3();
 const _e1 = new THREE.Vector3();
 const _e2 = new THREE.Vector3();
+const _n = new THREE.Vector3();
 
-/** World area of the quad formed by four consecutive vertices, as two triangles. */
-function quadArea(
-  position: THREE.BufferAttribute,
-  matrix: THREE.Matrix4,
-  base: number,
-  vertexCount: number,
-): number {
-  const i0 = base;
-  const i1 = Math.min(base + 1, vertexCount - 1);
-  const i2 = Math.min(base + 2, vertexCount - 1);
-  const i3 = Math.min(base + 3, vertexCount - 1);
-
-  _v0.fromBufferAttribute(position, i0).applyMatrix4(matrix);
-  _v1.fromBufferAttribute(position, i1).applyMatrix4(matrix);
-  _v2.fromBufferAttribute(position, i2).applyMatrix4(matrix);
-  _v3.fromBufferAttribute(position, i3).applyMatrix4(matrix);
-
-  // BoxGeometry triangulates a face as (0,1,3) and (1,2,3); anything that is not a
-  // box is outside this unwrapper's contract anyway and this is a reasonable guess.
-  let area = 0;
-  _e1.subVectors(_v1, _v0);
-  _e2.subVectors(_v3, _v0);
-  area += _e1.cross(_e2).length() * 0.5;
-  _e1.subVectors(_v2, _v1);
-  _e2.subVectors(_v3, _v1);
-  area += _e1.cross(_e2).length() * 0.5;
-  return area;
+/**
+ * One rectangle in the atlas. Every chart is described the same way whatever produced
+ * it, so the packer has one job: `extentU × extentV` metres go into `w × h` texels, and
+ * `write` receives the placement and fills `uv1` for the vertices it owns.
+ */
+interface ChartRequest {
+  mesh: THREE.Mesh;
+  /** World extent of the chart along its two atlas axes, in metres. */
+  extentU: number;
+  extentV: number;
+  /** Assigned by the layout pass. */
+  w: number;
+  h: number;
+  x: number;
+  y: number;
+  /** Maps a vertex index to its position inside the chart, in metres from the corner. */
+  local: (vertex: number, out: THREE.Vector2) => void;
+  vertices: number[];
 }
 
 /**
- * Assigns lightmap UVs by giving every quad of every static mesh a block of cells in a
- * square atlas, sized by the quad's world area.
+ * Assigns lightmap UVs to every static mesh, one atlas for the whole scene.
  *
- * This is not a general unwrapper. It relies on the input being box geometry, where
- * each of the six faces already carries a clean 0..1 UV — so remapping that UV into a
- * cell produces a continuous, non-overlapping, distortion-free chart per face. That
- * covers the Cornell scene exactly, and it fails loudly (rather than subtly) on
- * anything else: a mesh without per-face 0..1 UVs is skipped and reported.
+ * Two kinds of chart:
  *
- * A real content pipeline would run xatlas here. The point of this file is to make the
- * bake itself real, not to solve unwrapping.
+ *   quads     — box-like geometry whose faces already carry a clean 0..1 UV per four
+ *               vertices (BoxGeometry, the Cornell set). Each quad becomes one square
+ *               chart, distortion-free.
+ *   projected — anything else. Triangles are binned by the dominant axis of their
+ *               world normal and each bin is projected onto the plane perpendicular to
+ *               it. A heightfield gives one +Y chart with no distortion worth naming; a
+ *               rock gives up to six charts whose only defect is a stretch on faces
+ *               that lean past 45°, and an overlap where the surface folds back on
+ *               itself along the same axis. Both are bounded and visible, unlike the
+ *               failures a scene without any chart at all produces.
  *
- * ---------------------------------------------------------------------------
- * WHY THIS IS AN INTERIORS-ONLY PATH, STATED PLAINLY
- * ---------------------------------------------------------------------------
- * Two of the failures measured in `docs/scale-report.md` §2 are fixed here and two are
- * not, because they cannot be:
+ * Every chart is laid out at ONE density (`metresPerTexel`), found by packing: start
+ * from the density that would fill `TARGET_FILL` of the atlas and coarsen until the
+ * shelf packer succeeds. Vertices are inset half a texel from the chart edge so a
+ * bilinear fetch on the boundary lands on the chart's own texel centre and never reads
+ * the gap.
  *
- *   FIXED   — every quad got the same number of texels regardless of world area, so a
- *             400 m terrain chunk and a 4 cm wall lip were equals. Blocks are now sized
- *             by area, capped at MAX_BLOCK.
- *   FIXED   — the density was never reported, so a scene the atlas could not represent
- *             baked quietly and looked merely dim. It is measured and refused now.
- *   NOT     — `InstancedMesh` has one `uv1` shared by every instance, and a lightmap
- *             stores *world-space* radiance. Four thousand grass clumps standing in
- *             four thousand different places cannot share one chart; this is a category
- *             error, not a resolution shortfall. Instanced meshes are therefore refused
- *             a chart outright and say so, which leaves them lit by the runtime surfel
- *             path — the only correct answer available.
- *   NOT     — atlas area is proportional to world area at fixed density. That is the
- *             structural failure, and no packer fixes it. Lumen has no lightmap at all:
- *             its surface cache is allocated by *screen* size, so texel density tracks
- *             the camera and is bounded by screen resolution. This path is a bake for
- *             interiors and small sets, and `?mode=lightmap` on a landscape will now
- *             tell you so in the console instead of quietly producing a dim image.
+ *   NOT  — `InstancedMesh` has one `uv1` shared by every instance and a lightmap stores
+ *          world-space radiance, so a shared chart would light every instance with the
+ *          first one's lighting. Instanced meshes are refused a chart and say so; the
+ *          runtime surfel path lights them.
+ *   NOT  — `userData.lightmap === false` opts a mesh out (foliage, undersides): it
+ *          stays in the tracer as an occluder and bouncer but is lit live.
  */
 export function assignLightmapUvs(
   scene: THREE.Scene,
   options: { padding?: number; atlasSize?: number } = {},
 ): LightmapLayout {
-  const { padding = 0.12, atlasSize = 512 } = options;
+  const { atlasSize = 512 } = options;
+  // Inset of the geometry from the chart edge, in texels. Half a texel is the minimum
+  // that keeps bilinear filtering inside the chart; anything smaller reads the gap.
+  const inset = Math.max(0.5, options.padding ?? 0.5);
 
   scene.updateMatrixWorld(true);
-
-  type Quad = { mesh: THREE.Mesh; vertex: number; area: number; block: number };
 
   const meshes: THREE.Mesh[] = [];
   let refusedArea = 0;
@@ -136,6 +115,7 @@ export function assignLightmapUvs(
     const mesh = object as THREE.Mesh;
     if (!mesh.isMesh || !mesh.visible) return;
     if (!mesh.layers.isEnabled(Layer.GiStatic)) return;
+    if (mesh.userData.lightmap === false) return;
 
     if ((mesh as THREE.InstancedMesh).isInstancedMesh) {
       const instanced = mesh as THREE.InstancedMesh;
@@ -144,8 +124,6 @@ export function assignLightmapUvs(
       const geometry = mesh.geometry;
       if (!geometry.boundingBox) geometry.computeBoundingBox();
       const size = geometry.boundingBox!.getSize(new THREE.Vector3());
-      // A bounding-box surface area is a crude stand-in for the real one; it is here
-      // to give the refusal below a number, not to be exact.
       refusedArea +=
         2 * (size.x * size.y + size.y * size.z + size.z * size.x) * instanced.count;
       return;
@@ -160,39 +138,25 @@ export function assignLightmapUvs(
         `instances (~${refusedArea.toFixed(0)} m²) were refused a lightmap chart. An ` +
         'InstancedMesh has ONE uv1 shared by every instance and a lightmap stores ' +
         'world-space radiance, so a shared chart would light every instance with the ' +
-        "first one's lighting. They are left to the runtime surfel path, which is the " +
-        'only correct answer. This is why ?mode=lightmap is an interiors-only path.',
+        "first one's lighting. They are left to the runtime surfel path.",
     );
   }
 
-  // Pass one: every quad, with its world area.
-  const quads: Quad[] = [];
+  const requests: ChartRequest[] = [];
   let mappedArea = 0;
 
   for (const mesh of meshes) {
-    const uv = mesh.geometry.getAttribute('uv');
-    const position = mesh.geometry.getAttribute('position');
-    if (!uv || !position) {
-      console.warn(`[lightmap] ${mesh.name || mesh.uuid} has no uv; skipped`);
-      continue;
-    }
-    for (let vertex = 0; vertex < uv.count; vertex += 4) {
-      const area = quadArea(
-        position as THREE.BufferAttribute,
-        mesh.matrixWorld,
-        vertex,
-        position.count,
-      );
-      mappedArea += area;
-      quads.push({ mesh, vertex, area, block: 1 });
-    }
+    const mode = chartMode(mesh);
+    const built = mode === 'quads' ? quadCharts(mesh) : projectedCharts(mesh);
+    for (const chart of built.charts) requests.push(chart);
+    mappedArea += built.area;
   }
 
-  if (quads.length === 0) {
-    console.warn('[lightmap] nothing static carries per-face UVs; atlas will be empty');
+  if (requests.length === 0) {
+    console.warn('[lightmap] nothing static could be charted; atlas will be empty');
     return {
       charts: [],
-      gridSide: 1,
+      gridSide: atlasSize,
       cellCount: 0,
       mappedArea: 0,
       refusedArea,
@@ -201,110 +165,63 @@ export function assignLightmapUvs(
     };
   }
 
-  // Pass two: block size per quad, proportional to the square root of area so that
-  // *texels per metre* is what ends up uniform rather than texels per quad. The
-  // reference is the median rather than the mean: one 400 m terrain chunk drags a mean
-  // far enough that every other surface rounds down to a single cell.
-  const areas = quads.map((q) => q.area).sort((a, b) => a - b);
-  const median = Math.max(1e-6, areas[Math.floor(areas.length / 2)]);
-
-  let cellsNeeded = 0;
-  for (const quad of quads) {
-    const scale = Math.sqrt(quad.area / median);
-    // Powers of two only, so blocks tile the grid without leaving unusable slivers.
-    let block = 1;
-    while (block < MAX_BLOCK && block * 2 <= scale) block *= 2;
-    quad.block = block;
-    cellsNeeded += block * block;
-  }
-
-  // Pass three: pack, largest block first, aligned to its own size. Buckets rather
-  // than a general rectangle packer because there are only three block sizes and a
-  // bucketed layout is exact — every cell in a bucket's region is used.
-  let gridSide = Math.ceil(Math.sqrt(cellsNeeded));
-  gridSide = Math.ceil(gridSide / MAX_BLOCK) * MAX_BLOCK;
-
-  type Placement = { x: number; y: number; block: number };
-  const placements = new Map<Quad, Placement>();
-
-  const pack = (side: number): boolean => {
-    placements.clear();
-    let x = 0;
-    let y = 0;
-    for (let block = MAX_BLOCK; block >= 1; block /= 2) {
-      // Start each bucket on a row boundary its own block size divides, or a 2×2 would
-      // straddle two rows of 4×4s and overlap one of them.
-      if (x > 0) {
-        x = 0;
-        y += block * 2 <= MAX_BLOCK ? block * 2 : block;
-      }
-      y = Math.ceil(y / block) * block;
-      for (const quad of quads) {
-        if (quad.block !== block) continue;
-        if (x + block > side) {
-          x = 0;
-          y += block;
-        }
-        if (y + block > side) return false;
-        placements.set(quad, { x, y, block });
-        x += block;
-      }
+  // --- density search ---------------------------------------------------------
+  let metresPerTexel = Math.sqrt(mappedArea / (TARGET_FILL * atlasSize * atlasSize));
+  let packed = false;
+  for (let attempt = 0; attempt < 40 && !packed; attempt++) {
+    for (const chart of requests) {
+      chart.w = Math.max(1, Math.ceil(chart.extentU / metresPerTexel + 2 * inset));
+      chart.h = Math.max(1, Math.ceil(chart.extentV / metresPerTexel + 2 * inset));
     }
-    return true;
-  };
-
-  let guard = 0;
-  while (!pack(gridSide) && guard++ < 8) {
-    gridSide = Math.ceil((gridSide * 1.2) / MAX_BLOCK) * MAX_BLOCK;
+    packed = shelfPack(requests, atlasSize);
+    if (!packed) metresPerTexel *= 1.07;
+  }
+  if (!packed) {
+    throw new Error(
+      `[lightmap] could not pack ${requests.length} charts into a ${atlasSize}² atlas`,
+    );
   }
 
-  // Pass four: write uv1.
-  const charts: LightmapChart[] = [];
-  const perMesh = new Map<THREE.Mesh, { uv2: Float32Array; cells: number }>();
+  // --- write uv1 ----------------------------------------------------------------
+  const perMesh = new Map<THREE.Mesh, { uv1: Float32Array; texels: number }>();
+  const local = new THREE.Vector2();
 
-  for (const quad of quads) {
-    const placement = placements.get(quad);
-    if (!placement) continue;
-
-    const geometry = quad.mesh.geometry;
-    const uv = geometry.getAttribute('uv');
-    let entry = perMesh.get(quad.mesh);
+  for (const chart of requests) {
+    const geometry = chart.mesh.geometry;
+    const count = geometry.getAttribute('position').count;
+    let entry = perMesh.get(chart.mesh);
     if (!entry) {
-      entry = { uv2: new Float32Array(uv.count * 2), cells: 0 };
-      perMesh.set(quad.mesh, entry);
+      entry = { uv1: new Float32Array(count * 2), texels: 0 };
+      perMesh.set(chart.mesh, entry);
     }
-    entry.cells += placement.block * placement.block;
+    entry.texels += chart.w * chart.h;
 
-    const span = placement.block;
-    // Padding is measured in *cells*, not as a fraction of the block, so the gutter is
-    // the same number of texels whatever size the block is. Bilinear reaches the same
-    // distance regardless of how big the chart it is standing on happens to be.
-    const inner = Math.max(1e-3, span - 2 * padding);
+    const spanU = Math.max(chart.w - 2 * inset, 1e-3);
+    const spanV = Math.max(chart.h - 2 * inset, 1e-3);
+    const scaleU = chart.extentU > 1e-6 ? spanU / chart.extentU : 0;
+    const scaleV = chart.extentV > 1e-6 ? spanV / chart.extentV : 0;
 
-    for (let v = quad.vertex; v < Math.min(quad.vertex + 4, uv.count); v++) {
-      const u = uv.getX(v) * inner + padding;
-      const w = uv.getY(v) * inner + padding;
-      entry.uv2[v * 2 + 0] = (placement.x + u) / gridSide;
-      entry.uv2[v * 2 + 1] = (placement.y + w) / gridSide;
+    for (const vertex of chart.vertices) {
+      chart.local(vertex, local);
+      const u = chart.x + inset + local.x * scaleU;
+      const v = chart.y + inset + local.y * scaleV;
+      entry.uv1[vertex * 2 + 0] = u / atlasSize;
+      entry.uv1[vertex * 2 + 1] = v / atlasSize;
     }
   }
 
+  const charts: LightmapChart[] = [];
   let cursor = 0;
   for (const [mesh, entry] of perMesh) {
-    mesh.geometry.setAttribute('uv1', new THREE.BufferAttribute(entry.uv2, 2));
-    charts.push({ mesh, firstCell: cursor, cellCount: entry.cells });
-    cursor += entry.cells;
+    mesh.geometry.setAttribute('uv1', new THREE.BufferAttribute(entry.uv1, 2));
+    charts.push({ mesh, firstCell: cursor, cellCount: entry.texels });
+    cursor += entry.texels;
   }
 
-  // Density, reported rather than assumed. `sqrt(area)/atlasSize` is the aggregate
-  // metres per texel a fully-packed atlas would achieve; it is the same figure
-  // docs/scale-report.md quotes, so the two are comparable.
-  const metresPerTexel = Math.sqrt(mappedArea) / atlasSize;
-
   console.log(
-    `[lightmap] ${perMesh.size} meshes, ${quads.length} charts, atlas grid ` +
-      `${gridSide}x${gridSide}, ${mappedArea.toFixed(1)} m² mapped, ` +
-      `${metresPerTexel.toFixed(3)} m/texel at ${atlasSize}²`,
+    `[lightmap] ${perMesh.size} meshes, ${requests.length} charts, ` +
+      `${mappedArea.toFixed(1)} m² mapped, ${metresPerTexel.toFixed(4)} m/texel at ` +
+      `${atlasSize}², ${((cursor / (atlasSize * atlasSize)) * 100).toFixed(0)}% of atlas used`,
   );
 
   if (metresPerTexel > REFUSE_METRES_PER_TEXEL) {
@@ -312,20 +229,165 @@ export function assignLightmapUvs(
       `[lightmap] ${metresPerTexel.toFixed(3)} m/texel is past the ` +
         `${REFUSE_METRES_PER_TEXEL} m/texel this atlas is worth baking at. A texel now ` +
         'covers more ground than a person stands on, so no contact shadow and no colour ' +
-        'bleed survives it — the bake will produce a dim, flat image and will not say so ' +
-        'again. Atlas area is proportional to world area at fixed density and no packer ' +
-        'changes that: this path is for interiors and small sets. Use the runtime surfel ' +
-        'GI (the default) for anything landscape-sized.',
+        'bleed survives it. Raise ?lm= or take large surfaces out of the bake.',
     );
   }
 
   return {
     charts,
-    gridSide,
+    gridSide: atlasSize,
     cellCount: cursor,
     mappedArea,
     refusedArea,
     atlasSize,
     metresPerTexel,
   };
+}
+
+function chartMode(mesh: THREE.Mesh): 'quads' | 'projected' {
+  const forced = mesh.userData.lightmapCharts as string | undefined;
+  if (forced === 'quads' || forced === 'projected') return forced;
+  const geometry = mesh.geometry;
+  const uv = geometry.getAttribute('uv');
+  // BoxGeometry: 24 vertices in groups of four, each group one face with a 0..1 UV.
+  if (geometry.type === 'BoxGeometry' && uv && uv.count % 4 === 0) return 'quads';
+  return 'projected';
+}
+
+/** One square chart per four consecutive vertices, keyed on the face's own 0..1 UV. */
+function quadCharts(mesh: THREE.Mesh): { charts: ChartRequest[]; area: number } {
+  const geometry = mesh.geometry;
+  const uv = geometry.getAttribute('uv') as THREE.BufferAttribute;
+  const position = geometry.getAttribute('position') as THREE.BufferAttribute;
+  const charts: ChartRequest[] = [];
+  let area = 0;
+
+  for (let base = 0; base + 3 < position.count; base += 4) {
+    _a.fromBufferAttribute(position, base).applyMatrix4(mesh.matrixWorld);
+    _b.fromBufferAttribute(position, base + 1).applyMatrix4(mesh.matrixWorld);
+    _c.fromBufferAttribute(position, base + 2).applyMatrix4(mesh.matrixWorld);
+    const d = new THREE.Vector3()
+      .fromBufferAttribute(position, base + 3)
+      .applyMatrix4(mesh.matrixWorld);
+    const quadArea =
+      0.5 * _e1.subVectors(_b, _a).cross(_e2.subVectors(_c, _a)).length() +
+      0.5 * _e1.subVectors(_c, d).cross(_e2.subVectors(_b, d)).length();
+    area += quadArea;
+    const side = Math.sqrt(Math.max(quadArea, 1e-8));
+    charts.push({
+      mesh,
+      extentU: side,
+      extentV: side,
+      w: 1,
+      h: 1,
+      x: 0,
+      y: 0,
+      vertices: [base, base + 1, base + 2, base + 3],
+      local: (vertex, out) => out.set(uv.getX(vertex) * side, uv.getY(vertex) * side),
+    });
+  }
+  return { charts, area };
+}
+
+/**
+ * Bins triangles by dominant world-normal axis and projects each bin onto the plane
+ * perpendicular to it. Converts the geometry to non-indexed first, because a vertex
+ * shared between two bins would need two different `uv1` values.
+ */
+function projectedCharts(mesh: THREE.Mesh): { charts: ChartRequest[]; area: number } {
+  if (mesh.geometry.index) mesh.geometry = mesh.geometry.toNonIndexed();
+  const geometry = mesh.geometry;
+  const position = geometry.getAttribute('position') as THREE.BufferAttribute;
+  const world = new Float32Array(position.count * 3);
+  for (let i = 0; i < position.count; i++) {
+    _a.fromBufferAttribute(position, i).applyMatrix4(mesh.matrixWorld);
+    world[i * 3] = _a.x;
+    world[i * 3 + 1] = _a.y;
+    world[i * 3 + 2] = _a.z;
+  }
+
+  // axis bins: 0 +X, 1 -X, 2 +Y, 3 -Y, 4 +Z, 5 -Z
+  const bins: number[][] = [[], [], [], [], [], []];
+  let area = 0;
+  for (let tri = 0; tri + 2 < position.count; tri += 3) {
+    _a.fromArray(world, tri * 3);
+    _b.fromArray(world, (tri + 1) * 3);
+    _c.fromArray(world, (tri + 2) * 3);
+    _n.crossVectors(_e1.subVectors(_b, _a), _e2.subVectors(_c, _a));
+    const triArea = 0.5 * _n.length();
+    if (triArea < 1e-10) continue;
+    area += triArea;
+    const ax = Math.abs(_n.x);
+    const ay = Math.abs(_n.y);
+    const az = Math.abs(_n.z);
+    let bin: number;
+    if (ay >= ax && ay >= az) bin = _n.y >= 0 ? 2 : 3;
+    else if (ax >= az) bin = _n.x >= 0 ? 0 : 1;
+    else bin = _n.z >= 0 ? 4 : 5;
+    bins[bin].push(tri, tri + 1, tri + 2);
+  }
+
+  // Plane axes per bin: (u, v) component indices of the world position.
+  const planeAxes: Array<[number, number]> = [
+    [2, 1], // ±X: z, y
+    [2, 1],
+    [0, 2], // ±Y: x, z
+    [0, 2],
+    [0, 1], // ±Z: x, y
+    [0, 1],
+  ];
+
+  const charts: ChartRequest[] = [];
+  for (let bin = 0; bin < 6; bin++) {
+    const vertices = bins[bin];
+    if (vertices.length === 0) continue;
+    const [iu, iv] = planeAxes[bin];
+    let minU = Infinity;
+    let minV = Infinity;
+    let maxU = -Infinity;
+    let maxV = -Infinity;
+    for (const vertex of vertices) {
+      const u = world[vertex * 3 + iu];
+      const v = world[vertex * 3 + iv];
+      if (u < minU) minU = u;
+      if (u > maxU) maxU = u;
+      if (v < minV) minV = v;
+      if (v > maxV) maxV = v;
+    }
+    charts.push({
+      mesh,
+      extentU: maxU - minU,
+      extentV: maxV - minV,
+      w: 1,
+      h: 1,
+      x: 0,
+      y: 0,
+      vertices,
+      local: (vertex, out) =>
+        out.set(world[vertex * 3 + iu] - minU, world[vertex * 3 + iv] - minV),
+    });
+  }
+  return { charts, area };
+}
+
+/** Shelf packer: rows of charts sorted by height, tallest first. Exact enough here. */
+function shelfPack(charts: ChartRequest[], side: number): boolean {
+  const order = charts.slice().sort((p, q) => q.h - p.h || q.w - p.w);
+  let x = 0;
+  let y = 0;
+  let rowHeight = 0;
+  for (const chart of order) {
+    if (chart.w > side || chart.h > side) return false;
+    if (x + chart.w > side) {
+      x = 0;
+      y += rowHeight + CHART_GAP;
+      rowHeight = 0;
+    }
+    if (y + chart.h > side) return false;
+    chart.x = x;
+    chart.y = y;
+    x += chart.w + CHART_GAP;
+    rowHeight = Math.max(rowHeight, chart.h);
+  }
+  return true;
 }

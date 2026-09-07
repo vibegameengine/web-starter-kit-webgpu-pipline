@@ -11,6 +11,7 @@ import { Layer } from '../../world/index.ts';
 
 /** Not a literal: a literal `* 0` is folded away and the tapped node never compiles. */
 const inspectorZero = uniform(0);
+const originalEmission = new WeakMap<THREE.Material, THREE.Node | null>();
 
 /**
  * Routes the baked lightmap into every static material.
@@ -27,6 +28,7 @@ export function applyLightmap(
   scene: THREE.Scene,
   lightmap: THREE.Texture,
   intensityUniform: ReturnType<typeof uniform>,
+  sampling?: { sample: (uv: THREE.Node) => THREE.Node },
 ): number {
   const seen = new Set<THREE.Material>();
   let applied = 0;
@@ -36,6 +38,9 @@ export function applyLightmap(
     if (!mesh.isMesh) return;
     if (!mesh.layers.isEnabled(Layer.GiStatic)) return;
     if (!mesh.geometry.getAttribute('uv1')) return;
+    // Per receiver, not per material: the final composite must not add the full
+    // realtime indirect term to a surface which already received its lightmap.
+    mesh.userData.bakedLightReceiver = true;
 
     const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
     for (const material of materials) {
@@ -55,7 +60,16 @@ export function applyLightmap(
       // Cornell texture variant sets all three colours to white and differs only in
       // the map.
       const map = (standard as { map?: THREE.Texture | null }).map;
-      const albedo = map ? materialColor.mul(texture(map, uv()).rgb) : materialColor;
+      // A procedural material carries its albedo in `colorNode`; `material.color` is
+      // only the flat average the tracer reads. The lightmap term must multiply the
+      // same albedo the raster shades with, or a textured surface bounces flat. Opt-in
+      // (`userData.lightmapAlbedo`), because a constant `colorNode` is inlined into the
+      // program and the cache-sharing failure described above comes straight back.
+      const albedo = standard.colorNode && standard.userData.lightmapAlbedo === true
+        ? vec3(standard.colorNode as THREE.Node).rgb
+        : map
+          ? materialColor.mul(texture(map, uv()).rgb)
+          : materialColor;
 
       // Two nodes read the same texture, on purpose.
       //
@@ -79,8 +93,11 @@ export function applyLightmap(
       // light source — has its emission in `emissiveNode` too, and overwriting it here
       // put the lamp out the moment the scene switched to lightmap mode. The result
       // was a glow on the wall with nothing visible casting it.
-      const existing = standard.emissiveNode ?? null;
-      const baked = vec3(texture(lightmap, attribute('uv1', 'vec2')).rgb)
+      if (!originalEmission.has(material)) originalEmission.set(material, standard.emissiveNode ?? null);
+      const existing = originalEmission.get(material);
+      const lightmapUv = attribute('uv1', 'vec2');
+      const lighting = sampling ? sampling.sample(lightmapUv) : texture(lightmap, lightmapUv).rgb;
+      const baked = vec3(lighting)
         .mul(albedo)
         .mul(intensityUniform)
         .add(preview.rgb.mul(inspectorZero));

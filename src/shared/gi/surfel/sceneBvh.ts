@@ -460,7 +460,7 @@ export function createSceneBVH(
   const gathered = gatherBvhGeometries(scene, {
     materialIdByUUID,
     label: 'static',
-    include: (mesh) => mesh.userData.mobility !== Mobility.Movable,
+    include: (mesh) => mesh.userData.mobility !== Mobility.Movable && mesh.userData.giExclude !== true,
     focus,
     farRadius: giKnobs.bvhFarRadius(),
   });
