@@ -27,6 +27,13 @@ export async function initRenderer(
   const trackTimestamp =
     new URLSearchParams(window.location.search).get('gputime') === '1';
 
+  // WebGPU or nothing. Three's renderer would quietly swap in its WebGL2 backend on a
+  // browser without `navigator.gpu`, and every pass here is written against WebGPU
+  // (storage buffers, compute, WGSL): the fallback does not run this pipeline, it
+  // runs a different one and fails somewhere deep inside it.
+  if (!('gpu' in navigator)) {
+    throw new Error('WebGPU is not available in this browser; this application does not fall back to WebGL.');
+  }
   const renderer = new THREE.WebGPURenderer({
     antialias: false,
     forceWebGL: false,

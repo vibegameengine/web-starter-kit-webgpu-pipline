@@ -79,6 +79,7 @@ export class ShallowWater {
   private readonly heightQuad: THREE.QuadMesh;
   private readonly initQuad: THREE.QuadMesh;
   private readonly zeroQuad: THREE.QuadMesh;
+  private impactAt!: (q: ReturnType<typeof vec2>, velocity: ReturnType<typeof vec2>) => ReturnType<typeof float>;
   private initialised = false;
   private _simTime = 0;
 
@@ -150,6 +151,20 @@ export class ShallowWater {
     zeroMaterial.colorNode = vec4(0.0);
     this.zeroQuad = new THREE.QuadMesh(zeroMaterial);
 
+    // 0..1: how hard the flow at `q` is being driven up a steep bed. u·∇b is the
+    // vertical speed the water would need to follow the slope; past ~0.35 m/s on a
+    // slope steeper than 45° it cannot, and the impact turns into spray.
+    this.impactAt = (q, velocity) => {
+      const bl = bAt(asUv(q.sub(vec2(texel, 0.0))));
+      const br = bAt(asUv(q.add(vec2(texel, 0.0))));
+      const bb = bAt(asUv(q.sub(vec2(0.0, texel))));
+      const bf = bAt(asUv(q.add(vec2(0.0, texel))));
+      const grad = vec2(br.sub(bl), bf.sub(bb)).div(l.mul(2.0));
+      const steep = smoothstep(0.7, 1.4, length(grad));
+      const climb = dot(velocity, grad);
+      return smoothstep(0.35, 1.0, climb).mul(steep);
+    };
+
     // --- flux pass: accelerate the four pipes by the surface slope ---------------
     const fluxMaterial = dataMaterial();
     fluxMaterial.colorNode = Fn(() => {
@@ -193,7 +208,11 @@ export class ShallowWater {
       const state = this.statePrev.sample(asUv(q));
       const speed = length(state.gb);
       const manning = float(9.81 * 0.025 * 0.025).mul(speed).div(max(d, 0.004).pow(4.0 / 3.0));
-      const damping = float(1.0).sub(dt.mul(this.friction.add(manning.min(float(0.9).div(dt))))).max(0.0);
+      // Impact: flow driven into a steep rise of the bed (a boulder's flank, the cut
+      // of a rock) does not climb it as a sheet — it breaks into spray. The kinetic
+      // energy leaves the column here and is handed to the foam source (height pass).
+      const impact = this.impactAt(asUv(q), state.gb as unknown as ReturnType<typeof vec2>);
+      const damping = float(1.0).sub(dt.mul(this.friction.add(manning.min(float(0.9).div(dt))).add(impact.mul(12.0)))).max(0.0);
       return next.mul(scale).mul(damping);
     })();
     this.fluxQuad = new THREE.QuadMesh(fluxMaterial);
@@ -247,7 +266,9 @@ export class ShallowWater {
       const speed = length(vec2(u, v));
       const shallowFast = smoothstep(0.25, 0.9, speed).mul(smoothstep(0.35, 0.02, d)).mul(step(0.004, d));
       const converge = smoothstep(-1.5, -6.0, u.sub(left.y.sub(left.x).div(l.mul(dMean))).div(l).add(v.sub(back.w.sub(back.z).div(l.mul(dMean))).div(l)));
-      const foam = clamp(max(shallowFast, converge.mul(0.8)), 0.0, 1.0);
+      // Spray: the impact energy the flux pass took out of the flow comes back as foam.
+      const splash = this.impactAt(asUv(q), vec2(u, v)).mul(smoothstep(0.004, 0.03, d));
+      const foam = clamp(max(max(shallowFast, converge.mul(0.8)), splash), 0.0, 1.0);
       return vec4(d, clamp(u, -4.0, 4.0), clamp(v, -4.0, 4.0), foam);
     })();
     this.heightQuad = new THREE.QuadMesh(heightMaterial);

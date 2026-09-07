@@ -235,22 +235,29 @@ export function createWater(options: WaterOptions): Water {
   const simBase = sim
     ? Fn(([xz]: [ReturnType<typeof vec2>]) => {
         const q = sim.uvOf(xz) as unknown as ReturnType<typeof vec2>;
-        // A 2×2 box over the cell (four bilinear taps at half-texel offsets): the grid
-        // rings at its own scale next to steep ground, and the sheet must not show it.
+        // Interpolate the free surface η = b + d, never b and d apart: between a deep
+        // cell and a boulder's flank, depth blended on its own lands metre-deep water
+        // on the stone and lifts a ring of teeth around every rock. A dry cell is the
+        // still-water line (capped a little above the ground) so the sheet runs level
+        // into the stone instead of climbing it; what is drawn there is the fragment's
+        // call (see thinFilm). Four taps at half-texel offsets: a 2×2 box.
         const h = float(0.5 / sim.size);
-        const dTap = (o: ReturnType<typeof vec2>) => ((sim.stateNode.sample(q.add(o)) as typeof sim.stateNode).level(float(0.0)) as ReturnType<typeof vec4>).r;
-        const d = dTap(vec2(h, h)).add(dTap(vec2(h.negate(), h))).add(dTap(vec2(h, h.negate()))).add(dTap(vec2(h.negate(), h.negate()))).mul(0.25);
-        const b = (texture(heightTexture, q).level(float(0.0)) as ReturnType<typeof vec4>).r;
-        // Continuous everywhere: the sheet is the free surface b + d where there is
-        // water and the ground itself where there is none, so no triangle ever spans a
-        // wet cell and a dry one as a spike. On ground above the water line the sheet
-        // may ride at most a couple of centimetres over the stone (a film, not a wall);
-        // whether such a film is drawn at all is the fragment's decision (see thinFilm).
-        // The sheet never rises past the run-up ceiling (about one wave height over
-        // still water, Hunt): whatever the solver piles against a boulder's flank is
-        // clipped to a plane there instead of climbing the stone as a crown of teeth.
-        const ceiling = waterLevel.add((sim.swellAmplitude as unknown as ReturnType<typeof float>).mul(1.5).add(0.03));
-        return min(b.add(d), ceiling);
+        // Run-up ceiling: about one wave height over still water on a beach (Hunt),
+        // but against a steep flank the water cannot climb — it breaks into spray
+        // (see ShallowWater.impactAt) — so there the sheet stays within 3 cm of the line.
+        const bTex = (o: ReturnType<typeof vec2>) => (texture(heightTexture, q.add(o)).level(float(0.0)) as ReturnType<typeof vec4>).r;
+        const t2 = float(2.0 / sim.size);
+        const grad = vec2(bTex(vec2(t2, 0.0)).sub(bTex(vec2(t2.negate(), 0.0))), bTex(vec2(0.0, t2)).sub(bTex(vec2(0.0, t2.negate())))).div(float(sim.cell * 4));
+        const gentle = smoothstep(1.2, 0.5, grad.length());
+        const ceiling = waterLevel.add(float(0.03).add((sim.swellAmplitude as unknown as ReturnType<typeof float>).mul(1.5).mul(gentle)));
+        const etaTap = (o: ReturnType<typeof vec2>) => {
+          const uv = q.add(o);
+          const d = ((sim.stateNode.sample(uv) as typeof sim.stateNode).level(float(0.0)) as ReturnType<typeof vec4>).r;
+          const b = (texture(heightTexture, uv).level(float(0.0)) as ReturnType<typeof vec4>).r;
+          return select(d.greaterThan(0.002), b.add(d), min(b, waterLevel.add(0.02)));
+        };
+        const eta = etaTap(vec2(h, h)).add(etaTap(vec2(h.negate(), h))).add(etaTap(vec2(h, h.negate()))).add(etaTap(vec2(h.negate(), h.negate()))).mul(0.25);
+        return min(eta, ceiling);
       })
     : null;
   /** Wind waves at (x, z): height and slope, shoaled by the local depth. */
