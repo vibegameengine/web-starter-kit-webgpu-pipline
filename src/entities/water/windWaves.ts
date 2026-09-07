@@ -66,9 +66,41 @@ export class WindWaves {
   private readonly paramsNode: ReturnType<typeof uniformArray>;
   private readonly phasesNode: ReturnType<typeof uniformArray>;
 
+  private readonly options: Required<WindWaveOptions>;
+
   constructor(options: WindWaveOptions = {}) {
-    const { windSpeed = 4.5, windDirection = Math.atan2(-0.4, 0.9), fetch = 800, components = 48, seed = 11, gain = 1 } = options;
-    this.count = components;
+    this.options = {
+      windSpeed: 4.5,
+      windDirection: Math.atan2(-0.4, 0.9),
+      fetch: 800,
+      components: 48,
+      seed: 11,
+      gain: 1,
+      ...options,
+    };
+    this.count = this.options.components;
+    for (let i = 0; i < this.count; i++) {
+      this.params.push(new THREE.Vector4());
+      this.phases.push(0);
+    }
+    this.sample();
+    this.paramsNode = uniformArray(this.params, 'vec4');
+    this.phasesNode = uniformArray(this.phases, 'float');
+  }
+
+  /** Re-samples the spectrum for a new wind; the uniform arrays are updated in place. */
+  setWind(windSpeed: number, windDirection: number, gain = this.options.gain): void {
+    this.options.windSpeed = windSpeed;
+    this.options.windDirection = windDirection;
+    this.options.gain = gain;
+    this.sample();
+  }
+
+  get windSpeed(): number { return this.options.windSpeed; }
+  get windDirection(): number { return this.options.windDirection; }
+
+  private sample(): void {
+    const { windSpeed, windDirection, fetch, components, seed, gain } = this.options;
     const random = seededRandom(seed);
 
     // Fetch-limited JONSWAP peak and alpha (Hasselmann): dimensionless fetch.
@@ -93,11 +125,9 @@ export class WindWaves {
       const amplitude = Math.sqrt(2 * Math.max(energy, 0)) * gain;
       // Deep-water k for the seed; the shader re-solves k(h) per point.
       const k = (omega * omega) / GRAVITY;
-      this.params.push(new THREE.Vector4(Math.cos(theta) * k, Math.sin(theta) * k, omega, amplitude));
-      this.phases.push(random() * Math.PI * 2);
+      this.params[i].set(Math.cos(theta) * k, Math.sin(theta) * k, omega, amplitude);
+      this.phases[i] = random() * Math.PI * 2;
     }
-    this.paramsNode = uniformArray(this.params, 'vec4');
-    this.phasesNode = uniformArray(this.phases, 'float');
   }
 
   /** Total significant amplitude (for capping the surface). */

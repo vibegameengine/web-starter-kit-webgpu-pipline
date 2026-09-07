@@ -1,4 +1,5 @@
 import * as THREE from 'three/webgpu';
+import type GUI from 'lil-gui';
 import type { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 
 import { createScene } from '../../shared/gi/surfel/scene.ts';
@@ -23,6 +24,8 @@ export interface BeachScene {
   update: (elapsedSeconds: number) => void;
   /** The overlay pass hands the water the composited colour and the scene depth. */
   bindScreen: (color: THREE.Texture, depth: THREE.Texture) => void;
+  /** Water knobs (swell, wind) in the shared GUI. */
+  bindGui: (gui: GUI) => void;
 }
 
 /**
@@ -217,6 +220,17 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
     water,
     field,
     bindScreen: water.bindScreen,
+    bindGui(gui) {
+      const c = water.controls;
+      const folder = gui.addFolder('Water');
+      folder.add(c, 'swellAmplitude', 0, 0.2, 0.005).name('swell amplitude (m)').onChange(() => c.apply());
+      folder.add(c, 'swellPeriod', 0.8, 5, 0.1).name('swell period (s)').onChange(() => c.apply());
+      folder.add(c, 'swellDirection', -180, 180, 1).name('swell direction (°)').onChange(() => c.apply());
+      folder.add(c, 'windSpeed', 0, 12, 0.1).name('wind speed (m/s)').onChange(() => c.apply());
+      folder.add(c, 'windDirection', -180, 180, 1).name('wind direction (°)').onChange(() => c.apply());
+      folder.add(c, 'friction', 0, 0.5, 0.01).name('bottom friction').onChange(() => c.apply());
+      folder.add(water.uniforms.foamStrength, 'value', 0, 2, 0.05).name('foam');
+    },
     update(elapsedSeconds) {
       island.update(elapsedSeconds, sun.color, sunDirection.copy(sun.position).sub(sun.target.position).normalize());
       water.update(elapsedSeconds);

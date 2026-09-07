@@ -45,6 +45,8 @@ export interface SceneHost {
   sun: THREE.DirectionalLight;
   /** Per-frame animation owned by the scene (wind, water). Never lighting. */
   update?: (elapsedSeconds: number) => void;
+  /** The scene's own knobs (waves, wind) in the shared GUI. Never lighting. */
+  bindGui?: (gui: GUI) => void;
   /** Draw the lighting environment behind the scene (Cornell) or not (a diorama). */
   skyIsBackground: boolean;
   /** Whether the orbiting demo sphere is in the scene unless `?mover=0`. */
@@ -608,6 +610,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   };
   onModeSettled(lightingMode);
 
+  host.bindGui?.(gui);
   const bakeFolder = gui.addFolder('GI bake');
   // Both budgets are always present: the mode is a runtime switch now, so hiding the
   // other one only means the value it would use is invisible when it gets used.

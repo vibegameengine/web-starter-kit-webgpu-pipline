@@ -3,6 +3,7 @@ import {
   Fn,
   abs,
   clamp,
+  dot,
   float,
   length,
   max,
@@ -10,6 +11,7 @@ import {
   mix,
   sin,
   smoothstep,
+  sqrt,
   step,
   texture,
   uniform,
@@ -47,6 +49,8 @@ export interface ShallowWaterOptions {
   /** Incoming swell at the open sides (−x and +z faces): amplitude (m) and period (s). */
   swellAmplitude?: number;
   swellPeriod?: number;
+  /** Direction the swell travels toward, radians in the xz plane (0 = +x, π/2 = +z). */
+  swellDirection?: number;
 }
 
 export class ShallowWater {
@@ -57,6 +61,8 @@ export class ShallowWater {
   readonly stateNode: ReturnType<typeof texture>;
   readonly swellAmplitude: ReturnType<typeof uniform>;
   readonly swellPeriod: ReturnType<typeof uniform>;
+  /** Unit vector the swell travels along; set through `setSwellDirection`. */
+  readonly swellDir: ReturnType<typeof uniform>;
   readonly friction = uniform(0.12);
 
   private readonly renderer: THREE.WebGPURenderer;
@@ -77,13 +83,14 @@ export class ShallowWater {
   private _simTime = 0;
 
   constructor(options: ShallowWaterOptions) {
-    const { renderer, bathymetry, half, waterLevel, size = 512, swellAmplitude = 0.06, swellPeriod = 1.4 } = options;
+    const { renderer, bathymetry, half, waterLevel, size = 512, swellAmplitude = 0.06, swellPeriod = 1.4, swellDirection = Math.atan2(-1, 1) } = options;
     this.renderer = renderer;
     this.half = half;
     this.size = size;
     this.cell = (2 * half) / size;
     this.swellAmplitude = uniform(swellAmplitude);
     this.swellPeriod = uniform(swellPeriod);
+    this.swellDir = uniform(new THREE.Vector2(Math.cos(swellDirection), Math.sin(swellDirection)));
 
     const makeTarget = () => {
       const target = new THREE.RenderTarget(size, size, {
@@ -180,8 +187,13 @@ export class ShallowWater {
       // Never drain more than the column holds this step.
       const total = next.x.add(next.y).add(next.z).add(next.w);
       const scale = min(float(1.0), d.mul(l).mul(l).div(total.mul(dt).add(1e-6)));
-      // Bottom friction, linear in the flow.
-      const damping = float(1.0).sub(dt.mul(this.friction)).max(0.0);
+      // Bottom friction: a linear background term plus Manning's quadratic drag,
+      // g·n²·|u|/d^(4/3) with n = 0.025 (sand). The drag grows as the water thins, so a
+      // film sloshing up a boulder's flank is stopped by the stone it runs over.
+      const state = this.statePrev.sample(asUv(q));
+      const speed = length(state.gb);
+      const manning = float(9.81 * 0.025 * 0.025).mul(speed).div(max(d, 0.004).pow(4.0 / 3.0));
+      const damping = float(1.0).sub(dt.mul(this.friction.add(manning.min(float(0.9).div(dt))))).max(0.0);
       return next.mul(scale).mul(damping);
     })();
     this.fluxQuad = new THREE.QuadMesh(fluxMaterial);
@@ -210,12 +222,19 @@ export class ShallowWater {
       // Swell generator on the open faces: the surface there follows the incoming
       // wave, a long crest running along each face and travelling into the slab.
       const b = bAt(asUv(q));
+      // A long crest travelling along `swellDir` at the shallow-water speed of the
+      // water it enters, so the forcing and the medium agree on the wavelength.
       const omega = float(2 * Math.PI).div(this.swellPeriod);
       const xz = q.sub(0.5).mul(2.0).mul(slabHalf);
-      const phase = this.clock.mul(omega).sub(xz.x.add(xz.y.negate()).mul(0.9));
+      const dir = this.swellDir as unknown as ReturnType<typeof vec2>;
+      const cGen = sqrt(g.mul(max(level.sub(b), 0.3)));
+      const kGen = omega.div(cGen);
+      const phase = this.clock.mul(omega).sub(dot(xz, dir).mul(kGen));
       const swell = level.add(this.swellAmplitude.mul(sin(phase)));
-      const generatorL = smoothstep(0.03, 0.0, q.x);
-      const generatorF = smoothstep(0.97, 1.0, q.y);
+      // Only the faces the swell enters through force it: the −x face for a wave
+      // travelling toward +x, the +z face for one travelling toward −z.
+      const generatorL = smoothstep(0.03, 0.0, q.x).mul(clamp(dir.x.mul(1.4), 0.0, 1.0));
+      const generatorF = smoothstep(0.97, 1.0, q.y).mul(clamp(dir.y.negate().mul(1.4), 0.0, 1.0));
       const generator = max(generatorL, generatorF);
       const forced = max(swell.sub(b), 0.0);
       // Relax toward the incoming wave rather than impose it: a hard-set column next
@@ -233,6 +252,11 @@ export class ShallowWater {
     })();
     this.heightQuad = new THREE.QuadMesh(heightMaterial);
     void abs;
+  }
+
+  /** Points the incoming swell: radians in the xz plane, 0 = toward +x, π/2 = toward +z. */
+  setSwellDirection(radians: number): void {
+    (this.swellDir.value as THREE.Vector2).set(Math.cos(radians), Math.sin(radians));
   }
 
   /** Largest stable sub-step for the deepest water the slab can hold. */

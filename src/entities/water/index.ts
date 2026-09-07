@@ -78,6 +78,17 @@ export interface Water {
    * pipeline), so this is called once per frame-graph rebuild, not per frame.
    */
   bindScreen(color: THREE.Texture, depth: THREE.Texture): void;
+  /** Art-direction knobs over the physics: the swell entering the slab and the wind. */
+  controls: {
+    swellAmplitude: number;
+    swellPeriod: number;
+    /** Degrees in the xz plane, 0 = toward +x, 90 = toward +z. */
+    swellDirection: number;
+    windSpeed: number;
+    windDirection: number;
+    friction: number;
+    apply(): void;
+  };
   /** Advances the foam field by the elapsed time and refreshes the sun uniforms. */
   update(elapsedSeconds: number): void;
   /** Called with the live foam/wetness field texture after every step. */
@@ -118,7 +129,7 @@ export function createWater(options: WaterOptions): Water {
   const { renderer, field, environment, sun, cutDepth = 3.0 } = options;
   const half = field.half;
 
-  const heightTexture = field.toTexture(256);
+  const heightTexture = field.toTexture(512);
   heightTexture.name = 'islandHeight';
 
   const uniforms = {
@@ -223,15 +234,23 @@ export function createWater(options: WaterOptions): Water {
   /** Simulated free surface η = b + d (capped); dry cells sit below the sand. */
   const simBase = sim
     ? Fn(([xz]: [ReturnType<typeof vec2>]) => {
-        const q = sim.uvOf(xz);
-        const d = ((sim.stateNode.sample(q) as typeof sim.stateNode).level(float(0.0)) as ReturnType<typeof vec4>).r;
+        const q = sim.uvOf(xz) as unknown as ReturnType<typeof vec2>;
+        // A 2×2 box over the cell (four bilinear taps at half-texel offsets): the grid
+        // rings at its own scale next to steep ground, and the sheet must not show it.
+        const h = float(0.5 / sim.size);
+        const dTap = (o: ReturnType<typeof vec2>) => ((sim.stateNode.sample(q.add(o)) as typeof sim.stateNode).level(float(0.0)) as ReturnType<typeof vec4>).r;
+        const d = dTap(vec2(h, h)).add(dTap(vec2(h.negate(), h))).add(dTap(vec2(h, h.negate()))).add(dTap(vec2(h.negate(), h.negate()))).mul(0.25);
         const b = (texture(heightTexture, q).level(float(0.0)) as ReturnType<typeof vec4>).r;
-        // A thin film on high ground (a boulder's flank) must not lift the sheet into
-        // a wall: the surface never rises past the level plus the largest wave.
-        // Ground above the water line (a boulder's flank, the upper beach) only carries
-        // a surface once the run-up is deep enough to be one; a film there is wet stone.
-        const needed = float(0.003).add(max(b.sub(waterLevel), 0.0).mul(0.6));
-        return select(d.greaterThan(needed), min(b.add(d), waterLevel.add(0.06)), waterLevel.sub(0.15));
+        // Continuous everywhere: the sheet is the free surface b + d where there is
+        // water and the ground itself where there is none, so no triangle ever spans a
+        // wet cell and a dry one as a spike. On ground above the water line the sheet
+        // may ride at most a couple of centimetres over the stone (a film, not a wall);
+        // whether such a film is drawn at all is the fragment's decision (see thinFilm).
+        // The sheet never rises past the run-up ceiling (about one wave height over
+        // still water, Hunt): whatever the solver piles against a boulder's flank is
+        // clipped to a plane there instead of climbing the stone as a crown of teeth.
+        const ceiling = waterLevel.add((sim.swellAmplitude as unknown as ReturnType<typeof float>).mul(1.5).add(0.03));
+        return min(b.add(d), ceiling);
       })
     : null;
   /** Wind waves at (x, z): height and slope, shoaled by the local depth. */
@@ -463,9 +482,9 @@ export function createWater(options: WaterOptions): Water {
       return clamp(max(contact, drifting), 0.0, 1.0).mul(uniforms.foamStrength);
     })();
     const foamLight = vec3(uniforms.sunColor).mul(sunUp.mul(1.3)).add(vec3(0.35, 0.4, 0.45));
-    // Bubbles: small Worley cells break the foam into froth; the outer edge thins out.
-    const bubbles = mx_worley_noise_vec2(vec3(p.x.mul(45.0), p.z.mul(45.0), t.mul(0.9)), 1.0);
-    const froth = smoothstep(0.05, 0.35, bubbles.x).mul(0.55).add(0.45);
+    // Froth: fine fractal grain, not cells — a foam sheet has no polka dots.
+    const grain = mx_fractal_noise_float(vec3(p.x.mul(30.0), p.z.mul(30.0), t.mul(0.9)), 3, 2.1, 0.6);
+    const froth = smoothstep(-0.6, 0.5, grain).mul(0.35).add(0.7);
     const foamColor = vec3(0.92, 0.95, 0.96).mul(foamLight).mul(froth);
 
     // Glitter: the sun caught by micro-facets the mesh cannot carry. A high-frequency
@@ -492,8 +511,21 @@ export function createWater(options: WaterOptions): Water {
     const simState = (sim ? sim.stateNode.sample(sim.uvOf(p.xz) as unknown as ReturnType<typeof vec2>) : vec4(0.0)) as ReturnType<typeof vec4>;
     // Run-up thinner than a few millimetres is wet sand, not a water surface; up to a
     // couple of centimetres the sheet fades into the (wet) sand under it.
-    const thinFilm = top && sim ? simState.r.lessThan(0.004) : float(0.0).greaterThan(1.0);
-    const filmFade = top && sim ? smoothstep(0.004, 0.03, simState.r) : float(1.0);
+    // Run-up thinner than a few millimetres is wet sand, not a water surface. On
+    // ground above the water line (a boulder's flank) the run-up must be deeper still
+    // before it reads as a surface: a film there is wet stone.
+    const groundHere = sandHeight(p.xz);
+    const needed = float(0.004).add(max(groundHere.sub(waterLevel), 0.0));
+    // Run-up on a slope reaches about one wave height above still water (Hunt);
+    // ground higher than that never carries a surface, whatever the solver piles there.
+    const runupCeiling = sim ? (sim.swellAmplitude as unknown as ReturnType<typeof float>).mul(1.5).add(0.03) : float(1.0);
+    const tooHigh = groundHere.sub(waterLevel).greaterThan(runupCeiling);
+    // The sheet's real height over the real floor (scene depth), not the solver's
+    // column over its own bathymetry: the two floors differ by centimetres, and a film
+    // judged on the wrong one pokes through the sand as a row of teeth.
+    const sheetAboveFloor = select(floorOutside, float(1.0), p.y.sub(floorWorld.y));
+    const thinFilm = top && sim ? simState.r.lessThan(needed).or(tooHigh).or(sheetAboveFloor.lessThan(0.004)) : float(0.0).greaterThan(1.0);
+    const filmFade = top && sim ? smoothstep(needed, needed.add(0.026), simState.r).mul(smoothstep(0.004, 0.03, sheetAboveFloor)) : float(1.0);
     const debug: THREE.Node | null =
       debugMode === 'depth' ? vec3(verticalDepth.mul(0.5))
       : debugMode === 'path' ? vec3(pathLength.mul(0.3))
@@ -514,7 +546,7 @@ export function createWater(options: WaterOptions): Water {
   const group = new THREE.Group();
   group.name = 'water';
 
-  const top = new THREE.PlaneGeometry(2 * half, 2 * half, 384, 384);
+  const top = new THREE.PlaneGeometry(2 * half, 2 * half, 512, 512);
   top.rotateX(-Math.PI / 2);
   top.translate(0, field.waterLevel, 0);
   const topMesh = new THREE.Mesh(top);
@@ -583,6 +615,23 @@ export function createWater(options: WaterOptions): Water {
 
   const sunDirection = new THREE.Vector3();
   let previousTime = -1;
+  const controls: Water['controls'] = {
+    swellAmplitude: sim ? (sim.swellAmplitude.value as number) : 0.06,
+    swellPeriod: sim ? (sim.swellPeriod.value as number) : 1.4,
+    swellDirection: -45,
+    windSpeed: wind.windSpeed,
+    windDirection: (wind.windDirection * 180) / Math.PI,
+    friction: sim ? (sim.friction.value as number) : 0.12,
+    apply() {
+      if (sim) {
+        sim.swellAmplitude.value = controls.swellAmplitude;
+        sim.swellPeriod.value = controls.swellPeriod;
+        sim.setSwellDirection((controls.swellDirection * Math.PI) / 180);
+        sim.friction.value = controls.friction;
+      }
+      wind.setWind(controls.windSpeed, (controls.windDirection * Math.PI) / 180);
+    },
+  };
   const water: Water = {
     group,
     async readFoamField() {
@@ -596,6 +645,7 @@ export function createWater(options: WaterOptions): Water {
     },
     uniforms,
     bindScreen,
+    controls,
     update(elapsedSeconds) {
       const dt = previousTime < 0 ? 1 / 60 : elapsedSeconds - previousTime;
       previousTime = elapsedSeconds;
