@@ -108,14 +108,16 @@ export function createIsland(options: IslandOptions): Island {
 
         // Outward displacement: soil sags, rock juts. Zero at the rim row so the
         // wall meets the sand exactly; grows with depth then fades near the bottom.
-        // Under water the wall stays a clean glass-side until below the sand floor.
+        // Under the water line the wall is a plain vertical cut: the water's own cut
+        // face is the diorama's outer boundary and nothing may stand outside it.
         const sub = Math.min(rim, field.waterLevel - 0.15) - y;
         const reach = Math.max(0, Math.min(1, sub / 0.6)) * (1 - 0.6 * v * v);
+        const underWater = y < field.waterLevel - 0.02 ? 0 : 1;
         const rockField = n.ridged3(bx * 0.9 + 3, y * 1.4, bz * 0.9, 4);
         const lumps = n.fbm3(bx * 1.6, y * 2.2 + 11, bz * 1.6, 3);
         const rockMask = Math.max(0, Math.min(1, (rockField - 0.6) * 4.0));
         const bulge = 0.04 * lumps + 0.7 * rockMask * (0.5 + 0.5 * lumps);
-        const out = reach * bulge;
+        const out = reach * bulge * underWater;
 
         const i = r * (wallCols + 1) + c;
         positions[i * 3] = bx + side.outward.x * out;

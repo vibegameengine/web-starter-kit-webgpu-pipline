@@ -7,6 +7,7 @@ import { Layer, Mobility, applyMobility } from '../../shared/world/index.ts';
 import { seededRandom } from '../../shared/lib/noise.ts';
 import { IslandField, createIsland, type CliffTextures } from '../../entities/island/index.ts';
 import { createWater, type Water } from '../../entities/water/index.ts';
+import { bakeBathymetry } from '../../entities/water/bathymetry.ts';
 import { createBackdrop } from '../../entities/backdrop/index.ts';
 import { createRock, createRockMaterial, type RockTextures } from '../../entities/rocks/index.ts';
 import { createPalm, type Palm } from '../../entities/palm/index.ts';
@@ -23,7 +24,7 @@ export interface BeachScene {
   /** Per-frame: wind, water, caustics. Static geometry never moves. */
   update: (elapsedSeconds: number) => void;
   /** The overlay pass hands the water the composited colour and the scene depth. */
-  bindScreen: (color: THREE.Texture, depth: THREE.Texture) => void;
+  bindScreen: (color: THREE.Texture, depth: THREE.Texture, normal: THREE.Texture) => void;
   /** Water knobs (swell, wind) in the shared GUI. */
   bindGui: (gui: GUI) => void;
 }
@@ -54,6 +55,10 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
     shore: [new THREE.Vector3(1.8, 2.4, 6.5), new THREE.Vector3(0.2, -0.3, 1.5)],
     rocks: [new THREE.Vector3(-5.5, 3.0, 0.5), new THREE.Vector3(-2.5, -0.4, -3.8)],
     water: [new THREE.Vector3(-2.0, 3.5, 7.5), new THREE.Vector3(-1.5, -0.6, 1.5)],
+    // Materials: the nearest trunk at arm's length, and the crown fronds with the
+    // undergrowth against the sun.
+    palm: [new THREE.Vector3(-0.2, 1.6, -1.3), new THREE.Vector3(1.0, 1.4, -3.3)],
+    leaves: [new THREE.Vector3(-1.5, 3.2, -0.8), new THREE.Vector3(3.2, 3.6, -3.6)],
   };
   const preset = presets[new URLSearchParams(window.location.search).get('cam') ?? ''];
   if (preset) {
@@ -193,10 +198,13 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
   }
 
   // --- water and backdrop (outside the GI) -------------------------------------
-  const water = createWater({ renderer, field, environment, sun });
+  // The bed the water runs over is the geometry itself, rendered from above once.
+  const bathymetry = bakeBathymetry({ renderer, objects: [island.group, rocks], half: field.half, size: 512 });
+  const water = createWater({ renderer, field, environment, sun, bathymetry });
   // The sand darkens where the simulated swash has been.
   water.onField = (fieldTexture) => island.setWetness(fieldTexture);
-  scene.add(water.group);
+  // `?water=0` leaves the water out: what is left is the diorama the water is drawn over.
+  if (new URLSearchParams(window.location.search).get('water') !== '0') scene.add(water.group);
   const backdrop = createBackdrop({ islandBottom: field.bottom, islandHalf: field.half });
   scene.add(backdrop);
   backdrop.traverse((object) => {
@@ -228,7 +236,7 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
       folder.add(c, 'swellDirection', -180, 180, 1).name('swell direction (°)').onChange(() => c.apply());
       folder.add(c, 'windSpeed', 0, 12, 0.1).name('wind speed (m/s)').onChange(() => c.apply());
       folder.add(c, 'windDirection', -180, 180, 1).name('wind direction (°)').onChange(() => c.apply());
-      folder.add(c, 'friction', 0, 0.5, 0.01).name('bottom friction').onChange(() => c.apply());
+      folder.add(c, 'manning', 0.01, 0.06, 0.001).name('Manning n (bed)').onChange(() => c.apply());
       folder.add(water.uniforms.foamStrength, 'value', 0, 2, 0.05).name('foam');
     },
     update(elapsedSeconds) {

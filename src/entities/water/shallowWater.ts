@@ -3,12 +3,13 @@ import {
   Fn,
   abs,
   clamp,
-  dot,
   float,
   length,
   max,
   min,
   mix,
+  select,
+  sign,
   sin,
   smoothstep,
   sqrt,
@@ -17,74 +18,94 @@ import {
   uniform,
   uv,
   vec2,
+  vec3,
   vec4,
 } from 'three/tsl';
 
 /**
- * Shallow-water simulation of the lagoon on the GPU.
+ * Shallow-water (Saint-Venant) solver on the bathymetry — the swell entering the
+ * lagoon, its shoaling, the bore it turns into, the run-up over the sand and the
+ * back-wash: the *shape* of the water the surface is drawn from.
  *
- * Physics: the Saint-Venant (shallow water) equations, depth-averaged — the right
- * model when the wavelength is long against the depth, which a 2.5 m lagoon with a
- * 3 m swell is. Discretised with the virtual-pipe scheme (Mei, Decaudin, Hu 2007;
- * the same family as Kass & Miller 1990's height-field waves): every cell holds a
- * water column `d` over the bathymetry `b`, and exchanges volume with its four
- * neighbours through pipes whose flow accelerates with the free-surface difference
- * `g·(H − H_n)/l`, `H = b + d`. Volume is conserved exactly, cells run dry and wet
- * again on the beach (run-up), waves refract around the boulders, shoal over the
- * shallows and reflect off the walls, all from the equations rather than from any
- * authored pattern. Wave speed comes out as √(g·d) in the linear limit.
+ * Central-upwind finite-volume scheme of Kurganov & Petrova (2007): well-balanced
+ * (a lake at rest stays at rest over any bed), positivity-preserving (depth never
+ * goes negative, so a wet/dry front needs no special casing), and it captures a
+ * hydraulic jump as the shock it is. State per cell is the conservative
+ * (w = η − level, hu, hv); the bed enters through its values at cell corners, faces
+ * are corner means and the cell bed the mean of its four faces, which is what makes
+ * the balance exact. Generalized-minmod reconstruction (θ = 1.3), hydrostatic
+ * correction at the faces, desingularised velocities, SSP-RK2 in time at a fixed
+ * step, Manning friction applied semi-implicitly. The open sides (−x, +z) are
+ * characteristic boundaries: the incoming Riemann invariant is the swell, the
+ * outgoing one leaves. The other two sides are the diorama's walls.
  *
- * Stability is explicit-CFL: `dt < l / √(g·d_max)`; the caller sub-steps.
- *
- * State texture RGBA = (d, u, v, foam source); flux texture RGBA = outflow to
- * (−x, +x, −z, +z). Two ping-pong pairs, four quad draws per sub-step.
+ * Consumers never read the conservative state: after each frame's sub-steps a view
+ * pass writes (depth, u, v, foam source) as RGBA16F, which is what `stateNode` is.
+ * See docs/water/grill-session.md Q3, Q16–Q20, Q32–Q37.
  */
 export interface ShallowWaterOptions {
   renderer: THREE.WebGPURenderer;
-  /** Bathymetry, R16F over the slab square: the island height texture. */
+  /** Bathymetry over the slab square: height (metres, absolute), u → +x, v → +z. */
   bathymetry: THREE.Texture;
   half: number;
   waterLevel: number;
+  /** Cells across the slab. */
   size?: number;
   /** Incoming swell at the open sides (−x and +z faces): amplitude (m) and period (s). */
   swellAmplitude?: number;
   swellPeriod?: number;
   /** Direction the swell travels toward, radians in the xz plane (0 = +x, π/2 = +z). */
   swellDirection?: number;
+  /** Mean still-water depth along the −x and +z faces, for the swell's velocity. */
+  faceDepth?: { x: number; z: number };
 }
+
+const GRAVITY = 9.81;
+/** Fixed time step (s): Courant ≤ ¼ at 3.1 cm cells for |u| ≤ 1 m/s over 1.7 m of water. */
+const DT = 0.0015;
+const MAX_SUBSTEPS = 12;
+/** Below this the cell is dry: momentum is zeroed and nothing moves. */
+const DRY = 1e-3;
+/** Desingularisation ε = (1 mm)⁴: velocity in a thinner film is smoothly damped. */
+const EPSILON = 1e-12;
+const THETA = 1.3;
 
 export class ShallowWater {
   readonly size: number;
   /** Metres per cell. */
   readonly cell: number;
-  /** State as the renderer reads it; the texture is swapped after every step. */
+  /** (depth, u, v, foam source) as the renderer reads it. */
   readonly stateNode: ReturnType<typeof texture>;
   readonly swellAmplitude: ReturnType<typeof uniform>;
   readonly swellPeriod: ReturnType<typeof uniform>;
   /** Unit vector the swell travels along; set through `setSwellDirection`. */
   readonly swellDir: ReturnType<typeof uniform>;
-  readonly friction = uniform(0.12);
+  /** Manning's n of the bed (sand ≈ 0.025). */
+  readonly manning = uniform(0.025);
 
   private readonly renderer: THREE.WebGPURenderer;
   private readonly half: number;
-  private stateRead: THREE.RenderTarget;
-  private stateWrite: THREE.RenderTarget;
-  private fluxRead: THREE.RenderTarget;
-  private fluxWrite: THREE.RenderTarget;
-  private readonly statePrev: ReturnType<typeof texture>;
-  private readonly fluxPrev: ReturnType<typeof texture>;
-  private readonly dt = uniform(0.004);
+  private stateA: THREE.RenderTarget;
+  private stateB: THREE.RenderTarget;
+  private stateC: THREE.RenderTarget;
+  private readonly view: THREE.RenderTarget;
+  private readonly prevNode: ReturnType<typeof texture>;
+  private readonly baseNode: ReturnType<typeof texture>;
+  private readonly stageMix = uniform(0);
   private readonly clock = uniform(0);
-  private readonly fluxQuad: THREE.QuadMesh;
-  private readonly heightQuad: THREE.QuadMesh;
+  private readonly stageQuad: THREE.QuadMesh;
+  private readonly viewQuad: THREE.QuadMesh;
   private readonly initQuad: THREE.QuadMesh;
-  private readonly zeroQuad: THREE.QuadMesh;
-  private impactAt!: (q: ReturnType<typeof vec2>, velocity: ReturnType<typeof vec2>) => ReturnType<typeof float>;
   private initialised = false;
   private _simTime = 0;
+  private accumulator = 0;
 
   constructor(options: ShallowWaterOptions) {
-    const { renderer, bathymetry, half, waterLevel, size = 512, swellAmplitude = 0.06, swellPeriod = 1.4, swellDirection = Math.atan2(-1, 1) } = options;
+    const {
+      renderer, bathymetry, half, waterLevel, size = 384,
+      swellAmplitude = 0.06, swellPeriod = 3.2, swellDirection = Math.atan2(-1, 1),
+      faceDepth = { x: 1.2, z: 1.2 },
+    } = options;
     this.renderer = renderer;
     this.half = half;
     this.size = size;
@@ -93,186 +114,266 @@ export class ShallowWater {
     this.swellPeriod = uniform(swellPeriod);
     this.swellDir = uniform(new THREE.Vector2(Math.cos(swellDirection), Math.sin(swellDirection)));
 
-    const makeTarget = () => {
+    const makeTarget = (filter: THREE.MagnificationTextureFilter) => {
       const target = new THREE.RenderTarget(size, size, {
         type: THREE.HalfFloatType,
         format: THREE.RGBAFormat,
         depthBuffer: false,
         generateMipmaps: false,
       });
-      target.texture.minFilter = THREE.LinearFilter;
-      target.texture.magFilter = THREE.LinearFilter;
+      target.texture.minFilter = filter as THREE.MinificationTextureFilter;
+      target.texture.magFilter = filter;
       target.texture.wrapS = target.texture.wrapT = THREE.ClampToEdgeWrapping;
       return target;
     };
-    this.stateRead = makeTarget();
-    this.stateWrite = makeTarget();
-    this.fluxRead = makeTarget();
-    this.fluxWrite = makeTarget();
-    this.statePrev = texture(this.stateRead.texture);
-    this.fluxPrev = texture(this.fluxRead.texture);
-    this.stateNode = texture(this.stateRead.texture);
+    // The conservative state is read at cell centres only — nearest, never blended.
+    this.stateA = makeTarget(THREE.NearestFilter);
+    this.stateB = makeTarget(THREE.NearestFilter);
+    this.stateC = makeTarget(THREE.NearestFilter);
+    this.view = makeTarget(THREE.LinearFilter);
+    this.prevNode = texture(this.stateA.texture);
+    this.baseNode = texture(this.stateA.texture);
+    this.stateNode = texture(this.view.texture);
 
     const level = uniform(waterLevel);
     const slabHalf = uniform(half);
-    const l = float(this.cell);
+    const hRefX = uniform(Math.max(0.3, faceDepth.x));
+    const hRefZ = uniform(Math.max(0.3, faceDepth.z));
+    const n = float(size);
+    const dx = float(this.cell);
     const texel = float(1 / size);
-    const g = float(9.81);
-    const dt = this.dt;
+    const g = float(GRAVITY);
+    const dt = float(DT);
     const bathy = texture(bathymetry);
 
-    type Uv = Parameters<typeof bathy.sample>[0];
-    const bAt = (q: Uv) => bathy.sample(q).r;
-    const dAt = (q: Uv) => this.statePrev.sample(q).r;
-    const inside = (q: ReturnType<typeof vec2>) =>
-      step(0.0, q.x).mul(step(q.x, 1.0)).mul(step(0.0, q.y)).mul(step(q.y, 1.0));
-    const asUv = (q: THREE.Node) => q as ReturnType<typeof vec2>;
+    type V2 = ReturnType<typeof vec2>;
+    type V3 = ReturnType<typeof vec3>;
+    type F = ReturnType<typeof float>;
+    const asV2 = (node: THREE.Node) => node as V2;
+    const asV3 = (node: THREE.Node) => node as V3;
+    const asF = (node: THREE.Node) => node as F;
 
-    // Opaque node materials force alpha to 1 unless they do not blend at all, and the
-    // fourth channel here is data (the +z flux, the foam source), not coverage.
+    /** Bed relative to the still-water line, at a slab uv (bilinear in the bathymetry). */
+    const bedAt = (q: V2): F => asF(bathy.sample(q).r.sub(level));
+
     const dataMaterial = () => {
       const material = new THREE.MeshBasicNodeMaterial();
       material.transparent = false;
       material.blending = THREE.NoBlending;
       material.depthTest = false;
       material.depthWrite = false;
+      material.toneMapped = false;
       return material;
     };
 
-    // --- initial state: still water on the bathymetry --------------------------
+    /** Velocity from momentum and depth, finite in a film (Kurganov–Petrova 2.21). */
+    const desingularise = (hu: F, h: F): F => {
+      const h4 = h.mul(h).mul(h).mul(h);
+      return asF(float(Math.SQRT2).mul(h).mul(hu).div(sqrt(h4.add(max(h4, EPSILON)))));
+    };
+    /** Componentwise generalized minmod of three slopes. */
+    const minmod3 = (a: V3, b: V3, c: V3): V3 => {
+      const same = step(0.0, a.mul(b)).mul(step(0.0, a.mul(c)));
+      return asV3(sign(a).mul(min(abs(a), min(abs(b), abs(c)))).mul(same));
+    };
+
+    // --- one SSP-RK2 stage ---------------------------------------------------------
+    const stageMaterial = dataMaterial();
+    stageMaterial.colorNode = Fn(() => {
+      const q = uv();
+      const cellIndex = q.mul(n).floor();
+      const i = cellIndex.x;
+      const j = cellIndex.y;
+
+      const U = (ox: number, oz: number): V3 => asV3(this.prevNode.sample(asV2(q.add(vec2(ox, oz).mul(texel)))).xyz);
+      /** Bed at a corner of the cell offset (ox, oz): corners are at ±½ texel. */
+      const corner = (ox: number, oz: number): F => bedAt(asV2(q.add(vec2(ox, oz).mul(texel))));
+      /** x-face bed of cell (ox, ·) on its east (+½) or west (−½) side. */
+      const bedX = (ox: number, side: number): F => asF(corner(ox + side, -0.5).add(corner(ox + side, 0.5)).mul(0.5));
+      const bedZ = (oz: number, side: number): F => asF(corner(-0.5, oz + side).add(corner(0.5, oz + side)).mul(0.5));
+
+      /** Reconstructed, hydrostatically corrected west/east states of a cell along one axis. */
+      const faces = (Um: V3, U0: V3, Up: V3, bW: F, bE: F) => {
+        const s = minmod3(asV3(U0.sub(Um).mul(THETA)), asV3(Up.sub(Um).mul(0.5)), asV3(Up.sub(U0).mul(THETA)));
+        const E = asV3(asV3(U0.add(s.mul(0.5))).toVar());
+        const W = asV3(asV3(U0.sub(s.mul(0.5))).toVar());
+        // Kurganov–Petrova (2.15)–(2.16): a face below the bed is lifted to it and
+        // the opposite face compensates so the cell mean is kept.
+        const lowE = E.x.lessThan(bE);
+        W.x.assign(select(lowE, U0.x.mul(2.0).sub(bE), W.x));
+        E.x.assign(select(lowE, bE, E.x));
+        const lowW = W.x.lessThan(bW);
+        E.x.assign(select(lowW, U0.x.mul(2.0).sub(bW), E.x));
+        W.x.assign(select(lowW, bW, W.x));
+        return { W, E, bE, bW, mean: U0 };
+      };
+      const facesX = (ox: number) => faces(U(ox - 1, 0), U(ox, 0), U(ox + 1, 0), bedX(ox, -0.5), bedX(ox, 0.5));
+      const facesZ = (oz: number) => faces(U(0, oz - 1), U(0, oz), U(0, oz + 1), bedZ(oz, -0.5), bedZ(oz, 0.5));
+
+      /**
+       * Central-upwind flux through a face with bed `bf`, from the left state `L`
+       * (w, hu, hv) and right state `R`. `axis` 0: x-face (normal velocity u), 1: z-face.
+       */
+      const flux = (L: V3, R: V3, bf: F, axis: 0 | 1): V3 => {
+        const hL = max(L.x.sub(bf), 0.0);
+        const hR = max(R.x.sub(bf), 0.0);
+        const uL = desingularise(L.y, hL);
+        const vL = desingularise(L.z, hL);
+        const uR = desingularise(R.y, hR);
+        const vR = desingularise(R.z, hR);
+        const nL = axis === 0 ? uL : vL;
+        const nR = axis === 0 ? uR : vR;
+        const cL = sqrt(g.mul(hL));
+        const cR = sqrt(g.mul(hR));
+        const ap = max(max(nL.add(cL), nR.add(cR)), 0.0);
+        const am = min(min(nL.sub(cL), nR.sub(cR)), 0.0);
+        const halfG = g.mul(0.5);
+        const FL = axis === 0
+          ? vec3(hL.mul(uL), hL.mul(uL).mul(uL).add(halfG.mul(hL).mul(hL)), hL.mul(uL).mul(vL))
+          : vec3(hL.mul(vL), hL.mul(uL).mul(vL), hL.mul(vL).mul(vL).add(halfG.mul(hL).mul(hL)));
+        const FR = axis === 0
+          ? vec3(hR.mul(uR), hR.mul(uR).mul(uR).add(halfG.mul(hR).mul(hR)), hR.mul(uR).mul(vR))
+          : vec3(hR.mul(vR), hR.mul(uR).mul(vR), hR.mul(vR).mul(vR).add(halfG.mul(hR).mul(hR)));
+        const UL = vec3(L.x, hL.mul(uL), hL.mul(vL));
+        const UR = vec3(R.x, hR.mul(uR), hR.mul(vR));
+        const span = ap.sub(am);
+        const H = ap.mul(FL).sub(am.mul(FR)).div(span).add(ap.mul(am).div(span).mul(UR.sub(UL)));
+        return asV3(select(span.greaterThan(1e-6), H, vec3(0.0)));
+      };
+
+      const cx = facesX(0);
+      const xe = facesX(1);
+      const xw = facesX(-1);
+      const cz = facesZ(0);
+      const ze = facesZ(1);
+      const zw = facesZ(-1);
+      const Hp = flux(cx.E, xe.W, cx.bE, 0);
+      const Hm = flux(xw.E, cx.W, cx.bW, 0);
+      const Gp = flux(cz.E, ze.W, cz.bE, 1);
+      const Gm = flux(zw.E, cz.W, cz.bW, 1);
+
+      const U0 = cx.mean;
+      const bedCell = cx.bE.add(cx.bW).add(cz.bE).add(cz.bW).mul(0.25);
+      const hCell = max(U0.x.sub(bedCell), 0.0);
+      const source = vec3(0.0, g.negate().mul(hCell).mul(cx.bE.sub(cx.bW)).div(dx), g.negate().mul(hCell).mul(cz.bE.sub(cz.bW)).div(dx));
+      const rate = Hp.sub(Hm).add(Gp.sub(Gm)).div(dx).negate().add(source);
+      const P = asV3(U0.add(rate.mul(dt))).toVar();
+
+      // Positivity guard, dry cells, Manning friction (semi-implicit), a speed cap.
+      const hNew = max(P.x.sub(bedCell), 0.0);
+      P.x.assign(bedCell.add(hNew));
+      const uNew = desingularise(P.y, hNew);
+      const vNew = desingularise(P.z, hNew);
+      const speed = length(vec2(uNew, vNew));
+      const drag = float(1.0).div(float(1.0).add(dt.mul(g).mul(this.manning).mul(this.manning).mul(speed).div(max(hNew, DRY).pow(4.0 / 3.0))));
+      const capped = min(float(1.0), sqrt(g.mul(hNew)).mul(2.0).add(1.0).div(max(speed, 1e-6)));
+      const wet = step(DRY, hNew);
+      P.y.assign(hNew.mul(uNew).mul(drag).mul(capped).mul(wet));
+      P.z.assign(hNew.mul(vNew).mul(drag).mul(capped).mul(wet));
+
+      // SSP-RK2: stage 1 is the Euler step; stage 2 averages it with the base state.
+      const base = asV3(this.baseNode.sample(q).xyz);
+      const advanced = mix(P, base.add(P).mul(0.5), this.stageMix);
+
+      // --- boundaries: two rings of cells set, not evolved ------------------------
+      const openX = i.lessThan(2.0);
+      const openZ = j.greaterThan(n.sub(2.5));
+      const wallX = i.greaterThan(n.sub(2.5));
+      const wallZ = j.lessThan(2.0);
+
+      const omega = float(2 * Math.PI).div(this.swellPeriod);
+      const dir = asV2(this.swellDir);
+      const xz = q.sub(0.5).mul(2.0).mul(slabHalf);
+      /** Characteristic ghost state for an open face with inward normal `normal` and reference depth hRef. */
+      const ghost = (interiorUv: V2, normal: V2, hRef: F, entering: F): V3 => {
+        const kFace = omega.div(sqrt(g.mul(hRef)));
+        const etaExt = this.swellAmplitude.mul(sin(this.clock.mul(omega).sub(kFace.mul(xz.x.mul(dir.x).add(xz.y.mul(dir.y)))))).mul(entering);
+        const velExt = dir.mul(etaExt.mul(sqrt(g.div(hRef))));
+        const hExt = max(etaExt.sub(bedCell), 0.0);
+        const unExt = velExt.x.mul(normal.x).add(velExt.y.mul(normal.y));
+        const Ui = asV3(this.prevNode.sample(interiorUv).xyz);
+        const bedInt = bedAt(interiorUv);
+        const hInt = max(Ui.x.sub(bedInt), 0.0);
+        const uInt = desingularise(Ui.y, hInt);
+        const vInt = desingularise(Ui.z, hInt);
+        const unInt = uInt.mul(normal.x).add(vInt.mul(normal.y));
+        const rPlus = unExt.add(sqrt(g.mul(hExt)).mul(2.0));
+        const rMinus = unInt.sub(sqrt(g.mul(hInt)).mul(2.0));
+        const unG = rPlus.add(rMinus).mul(0.5);
+        const cG = max(rPlus.sub(rMinus).mul(0.25), 0.0);
+        const hG = cG.mul(cG).div(g);
+        // Tangential component: from outside while inflow, from inside while outflow.
+        const tangent = vec2(normal.y.negate(), normal.x);
+        const utExt = velExt.x.mul(tangent.x).add(velExt.y.mul(tangent.y));
+        const utInt = uInt.mul(tangent.x).add(vInt.mul(tangent.y));
+        const utG = select(unG.greaterThan(0.0), utExt, utInt);
+        const velG = normal.mul(unG).add(tangent.mul(utG));
+        return asV3(vec3(bedCell.add(hG), hG.mul(velG.x), hG.mul(velG.y)));
+      };
+      const ghostX = ghost(asV2(vec2(float(2.5).mul(texel), q.y)), asV2(vec2(1.0, 0.0)), asF(hRefX), asF(max(sign(dir.x), 0.0)));
+      const ghostZ = ghost(asV2(vec2(q.x, n.sub(2.5).mul(texel))), asV2(vec2(0.0, -1.0)), asF(hRefZ), asF(max(sign(dir.y.negate()), 0.0)));
+      // Walls mirror the interior: the cell across the face, normal momentum reversed.
+      const mirrorX = asV3(this.prevNode.sample(asV2(vec2(n.mul(2.0).sub(5.0).sub(i).add(0.5).mul(texel), q.y))).xyz);
+      const mirrorZ = asV3(this.prevNode.sample(asV2(vec2(q.x, float(3.0).sub(j).add(0.5).mul(texel)))).xyz);
+      const wallXState = vec3(mirrorX.x, mirrorX.y.negate(), mirrorX.z);
+      const wallZState = vec3(mirrorZ.x, mirrorZ.y, mirrorZ.z.negate());
+
+      const result = select(openX, ghostX, select(wallX, wallXState, select(openZ, ghostZ, select(wallZ, wallZState, advanced))));
+      return vec4(result, 0.0);
+    })();
+    this.stageQuad = new THREE.QuadMesh(stageMaterial);
+
+    // --- initial state: a lake at rest --------------------------------------------
     const initMaterial = dataMaterial();
     initMaterial.colorNode = Fn(() => {
       const q = uv();
-      const d = max(level.sub(bAt(asUv(q))), 0.0);
-      return vec4(d, 0.0, 0.0, 0.0);
+      const corner = (ox: number, oz: number): F => bedAt(asV2(q.add(vec2(ox, oz).mul(texel))));
+      const bedCell = corner(-0.5, -0.5).add(corner(0.5, -0.5)).add(corner(-0.5, 0.5)).add(corner(0.5, 0.5)).mul(0.25);
+      return vec4(max(bedCell, 0.0), 0.0, 0.0, 0.0);
     })();
     this.initQuad = new THREE.QuadMesh(initMaterial);
-    const zeroMaterial = dataMaterial();
-    zeroMaterial.colorNode = vec4(0.0);
-    this.zeroQuad = new THREE.QuadMesh(zeroMaterial);
 
-    // 0..1: how hard the flow at `q` is being driven up a steep bed. u·∇b is the
-    // vertical speed the water would need to follow the slope; past ~0.35 m/s on a
-    // slope steeper than 45° it cannot, and the impact turns into spray.
-    this.impactAt = (q, velocity) => {
-      const bl = bAt(asUv(q.sub(vec2(texel, 0.0))));
-      const br = bAt(asUv(q.add(vec2(texel, 0.0))));
-      const bb = bAt(asUv(q.sub(vec2(0.0, texel))));
-      const bf = bAt(asUv(q.add(vec2(0.0, texel))));
-      const grad = vec2(br.sub(bl), bf.sub(bb)).div(l.mul(2.0));
-      const steep = smoothstep(0.7, 1.4, length(grad));
-      const climb = dot(velocity, grad);
-      return smoothstep(0.35, 1.0, climb).mul(steep);
-    };
-
-    // --- flux pass: accelerate the four pipes by the surface slope ---------------
-    const fluxMaterial = dataMaterial();
-    fluxMaterial.colorNode = Fn(() => {
+    // --- view: (depth, u, v, foam source) for everything that draws the water ------
+    const viewMaterial = dataMaterial();
+    viewMaterial.colorNode = Fn(() => {
       const q = uv();
-      const d = dAt(asUv(q));
-      const H = bAt(asUv(q)).add(d);
-      const f = this.fluxPrev.sample(asUv(q)).toVar();
-      const offsets: Array<[number, number]> = [
-        [-1, 0],
-        [1, 0],
-        [0, -1],
-        [0, 1],
-      ];
-      const next = vec4(0.0).toVar();
-      const components = ['x', 'y', 'z', 'w'] as const;
-      offsets.forEach(([ox, oz], i) => {
-        const qn = asUv(q.add(vec2(ox, oz).mul(texel)));
-        const dn = dAt(qn);
-        const Hn = bAt(qn).add(dn);
-        // Pipe cross-section = mean depth × cell width, length l: Δf = dt·A·g·ΔH/l =
-        // dt·d̄·g·ΔH. This is what makes the wave speed √(g·d), the shallow-water one.
-        const dEdge = max(d.add(dn).mul(0.5), 0.0);
-        const accelerated = max(f[components[i]].add(dt.mul(dEdge).mul(g).mul(H.sub(Hn))), 0.0);
-        // No pipe through the slab boundary.
-        next[components[i]].assign(accelerated.mul(inside(qn)));
-      });
-      // A little of the neighbours' flow in each pipe: the collocated scheme's
-      // odd-even mode (a sawtooth at cell scale) has nothing else to damp it.
-      const fl = this.fluxPrev.sample(asUv(q.sub(vec2(texel, 0.0))));
-      const fr = this.fluxPrev.sample(asUv(q.add(vec2(texel, 0.0))));
-      const fb = this.fluxPrev.sample(asUv(q.sub(vec2(0.0, texel))));
-      const ff = this.fluxPrev.sample(asUv(q.add(vec2(0.0, texel))));
-      const smoothed = fl.add(fr).add(fb).add(ff).mul(0.25);
-      next.assign(mix(next, max(smoothed, 0.0), 0.08));
-      // Never drain more than the column holds this step.
-      const total = next.x.add(next.y).add(next.z).add(next.w);
-      const scale = min(float(1.0), d.mul(l).mul(l).div(total.mul(dt).add(1e-6)));
-      // Bottom friction: a linear background term plus Manning's quadratic drag,
-      // g·n²·|u|/d^(4/3) with n = 0.025 (sand). The drag grows as the water thins, so a
-      // film sloshing up a boulder's flank is stopped by the stone it runs over.
-      const state = this.statePrev.sample(asUv(q));
-      const speed = length(state.gb);
-      const manning = float(9.81 * 0.025 * 0.025).mul(speed).div(max(d, 0.004).pow(4.0 / 3.0));
-      // Impact: flow driven into a steep rise of the bed (a boulder's flank, the cut
-      // of a rock) does not climb it as a sheet — it breaks into spray. The kinetic
-      // energy leaves the column here and is handed to the foam source (height pass).
-      const impact = this.impactAt(asUv(q), state.gb as unknown as ReturnType<typeof vec2>);
-      const damping = float(1.0).sub(dt.mul(this.friction.add(manning.min(float(0.9).div(dt))).add(impact.mul(12.0)))).max(0.0);
-      return next.mul(scale).mul(damping);
+      const U = (ox: number, oz: number): V3 => asV3(this.prevNode.sample(asV2(q.add(vec2(ox, oz).mul(texel)))).xyz);
+      const corner = (ox: number, oz: number): F => bedAt(asV2(q.add(vec2(ox, oz).mul(texel))));
+      const bedOf = (ox: number, oz: number): F =>
+        asF(corner(ox - 0.5, oz - 0.5).add(corner(ox + 0.5, oz - 0.5)).add(corner(ox - 0.5, oz + 0.5)).add(corner(ox + 0.5, oz + 0.5)).mul(0.25));
+      const U0 = U(0, 0);
+      const bedCell = bedOf(0, 0);
+      const h = max(U0.x.sub(bedCell), 0.0);
+      const u = desingularise(U0.y, h);
+      const v = desingularise(U0.z, h);
+      const wet = step(DRY, h);
+      // Depth as the sheet needs it: over the bathymetry texel, so η = b + d there.
+      const bedTexel = bedAt(asV2(q));
+      const depth = max(U0.x.sub(bedTexel), 0.0).mul(wet);
+
+      // Foam source. A hydraulic jump between two cells dissipates
+      // D = g·√(g·h̄)·Δh³/(4·h₁·h₂) per unit width (the classic bore loss); it fires
+      // only where the characteristics converge. Scaled by the dissipation that
+      // fills coverage in 0.3 s. Plus the run-up front: a thin tongue in motion.
+      const jump = (Ua: V3, ba: F, Ub: V3, bb: F, axis: 0 | 1): F => {
+        const ha = max(Ua.x.sub(ba), DRY);
+        const hb = max(Ub.x.sub(bb), DRY);
+        const na = axis === 0 ? desingularise(Ua.y, ha) : desingularise(Ua.z, ha);
+        const nb = axis === 0 ? desingularise(Ub.y, hb) : desingularise(Ub.z, hb);
+        const converge = step(0.1, na.add(sqrt(g.mul(ha))).sub(nb.add(sqrt(g.mul(hb)))));
+        const dh = abs(hb.sub(ha));
+        const hMean = ha.add(hb).mul(0.5);
+        const D = g.mul(sqrt(g.mul(hMean))).mul(dh).mul(dh).mul(dh).div(ha.mul(hb).mul(4.0));
+        return asF(D.mul(converge).div(0.045));
+      };
+      const jx = max(jump(U(-1, 0), bedOf(-1, 0), U0, bedCell, 0), jump(U0, bedCell, U(1, 0), bedOf(1, 0), 0));
+      const jz = max(jump(U(0, -1), bedOf(0, -1), U0, bedCell, 1), jump(U0, bedCell, U(0, 1), bedOf(0, 1), 1));
+      const bore = max(jx, jz).mul(smoothstep(0.6, 0.02, h));
+      const front = length(vec2(u, v)).div(0.5).mul(smoothstep(0.02, 0.008, h)).mul(wet);
+      const foam = clamp(max(bore, front), 0.0, 1.0);
+      return vec4(depth, clamp(u, -6.0, 6.0).mul(wet), clamp(v, -6.0, 6.0).mul(wet), foam);
     })();
-    this.fluxQuad = new THREE.QuadMesh(fluxMaterial);
-
-    // --- height pass: move the volume, derive velocity, drive the swell -----------
-    const heightMaterial = dataMaterial();
-    heightMaterial.colorNode = Fn(() => {
-      const q = uv();
-      const own = this.fluxPrev.sample(asUv(q));
-      const left = this.fluxPrev.sample(asUv(q.sub(vec2(texel, 0.0))));
-      const right = this.fluxPrev.sample(asUv(q.add(vec2(texel, 0.0))));
-      const back = this.fluxPrev.sample(asUv(q.sub(vec2(0.0, texel))));
-      const front = this.fluxPrev.sample(asUv(q.add(vec2(0.0, texel))));
-      const inflow = left.y.add(right.x).add(back.w).add(front.z);
-      const outflow = own.x.add(own.y).add(own.z).add(own.w);
-      const d0 = dAt(asUv(q));
-      const d = max(d0.add(dt.mul(inflow.sub(outflow)).div(l.mul(l))), 0.0).toVar();
-
-      // Depth-averaged velocity from the net flow through the cell.
-      const dMean = max(d0.add(d).mul(0.5), 0.002);
-      const flowX = left.y.sub(own.x).add(own.y).sub(right.x).mul(0.5);
-      const flowZ = back.w.sub(own.z).add(own.w).sub(front.z).mul(0.5);
-      const u = flowX.div(l.mul(dMean));
-      const v = flowZ.div(l.mul(dMean));
-
-      // Swell generator on the open faces: the surface there follows the incoming
-      // wave, a long crest running along each face and travelling into the slab.
-      const b = bAt(asUv(q));
-      // A long crest travelling along `swellDir` at the shallow-water speed of the
-      // water it enters, so the forcing and the medium agree on the wavelength.
-      const omega = float(2 * Math.PI).div(this.swellPeriod);
-      const xz = q.sub(0.5).mul(2.0).mul(slabHalf);
-      const dir = this.swellDir as unknown as ReturnType<typeof vec2>;
-      const cGen = sqrt(g.mul(max(level.sub(b), 0.3)));
-      const kGen = omega.div(cGen);
-      const phase = this.clock.mul(omega).sub(dot(xz, dir).mul(kGen));
-      const swell = level.add(this.swellAmplitude.mul(sin(phase)));
-      // Only the faces the swell enters through force it: the −x face for a wave
-      // travelling toward +x, the +z face for one travelling toward −z.
-      const generatorL = smoothstep(0.03, 0.0, q.x).mul(clamp(dir.x.mul(1.4), 0.0, 1.0));
-      const generatorF = smoothstep(0.97, 1.0, q.y).mul(clamp(dir.y.negate().mul(1.4), 0.0, 1.0));
-      const generator = max(generatorL, generatorF);
-      const forced = max(swell.sub(b), 0.0);
-      // Relax toward the incoming wave rather than impose it: a hard-set column next
-      // to a free one is a step every sub-step, and the grid rings at its own scale.
-      const relax = generator.mul(dt.mul(12.0)).min(1.0);
-      d.assign(mix(d, forced, relax));
-
-      // Foam is born where the flow is fast over shallow water (breaking, run-up)
-      // and where the flow converges hard.
-      const speed = length(vec2(u, v));
-      const shallowFast = smoothstep(0.25, 0.9, speed).mul(smoothstep(0.35, 0.02, d)).mul(step(0.004, d));
-      const converge = smoothstep(-1.5, -6.0, u.sub(left.y.sub(left.x).div(l.mul(dMean))).div(l).add(v.sub(back.w.sub(back.z).div(l.mul(dMean))).div(l)));
-      // Spray: the impact energy the flux pass took out of the flow comes back as foam.
-      const splash = this.impactAt(asUv(q), vec2(u, v)).mul(smoothstep(0.004, 0.03, d));
-      const foam = clamp(max(max(shallowFast, converge.mul(0.8)), splash), 0.0, 1.0);
-      return vec4(d, clamp(u, -4.0, 4.0), clamp(v, -4.0, 4.0), foam);
-    })();
-    this.heightQuad = new THREE.QuadMesh(heightMaterial);
-    void abs;
+    this.viewQuad = new THREE.QuadMesh(viewMaterial);
   }
 
   /** Points the incoming swell: radians in the xz plane, 0 = toward +x, π/2 = toward +z. */
@@ -280,55 +381,74 @@ export class ShallowWater {
     (this.swellDir.value as THREE.Vector2).set(Math.cos(radians), Math.sin(radians));
   }
 
-  /** Largest stable sub-step for the deepest water the slab can hold. */
-  stableStep(maxDepth: number): number {
-    return (0.4 * this.cell) / Math.sqrt(9.81 * Math.max(0.05, maxDepth));
+  /** The fixed sub-step, seconds. */
+  get timeStep(): number {
+    return DT;
   }
 
-  /** Advances the water by `dt` seconds, in as many sub-steps as CFL requires. */
-  step(dt: number, maxDepth: number): void {
+  private substep(): void {
+    const renderer = this.renderer;
+    this._simTime += DT;
+    this.clock.value = this._simTime;
+    // Stage 1: A → B (Euler).
+    this.stageMix.value = 0;
+    this.prevNode.value = this.stateA.texture;
+    this.baseNode.value = this.stateA.texture;
+    renderer.setRenderTarget(this.stateB);
+    this.stageQuad.render(renderer);
+    // Stage 2: from B, averaged with A → C.
+    this.stageMix.value = 1;
+    this.prevNode.value = this.stateB.texture;
+    renderer.setRenderTarget(this.stateC);
+    this.stageQuad.render(renderer);
+    const a = this.stateA;
+    this.stateA = this.stateC;
+    this.stateC = a;
+  }
+
+  private ensureInitialised(): void {
+    if (this.initialised) return;
+    this.renderer.setRenderTarget(this.stateA);
+    this.initQuad.render(this.renderer);
+    this.initialised = true;
+  }
+
+  private writeView(): void {
+    this.prevNode.value = this.stateA.texture;
+    this.renderer.setRenderTarget(this.view);
+    this.viewQuad.render(this.renderer);
+    this.stateNode.value = this.view.texture;
+  }
+
+  /**
+   * Advances the water by `dt` seconds of wall time at the fixed step; at most
+   * MAX_SUBSTEPS per call, the remainder dropped (the water never runs slow).
+   */
+  step(dt: number): void {
     const renderer = this.renderer;
     const previousTarget = renderer.getRenderTarget();
-    if (!this.initialised) {
-      renderer.setRenderTarget(this.stateRead);
-      this.initQuad.render(renderer);
-      renderer.setRenderTarget(this.fluxRead);
-      this.zeroQuad.render(renderer);
-      this.initialised = true;
+    this.ensureInitialised();
+    this.accumulator += dt;
+    let steps = Math.floor(this.accumulator / DT);
+    if (steps > MAX_SUBSTEPS) {
+      steps = MAX_SUBSTEPS;
+      this.accumulator = 0;
+    } else {
+      this.accumulator -= steps * DT;
     }
-    const stable = this.stableStep(maxDepth);
-    const steps = Math.min(8, Math.max(1, Math.ceil(dt / stable)));
-    const sub = Math.min(dt / steps, stable);
-    this.dt.value = sub;
-    for (let i = 0; i < steps; i++) {
-      this._simTime += sub;
-      this.clock.value = this._simTime;
-      this.statePrev.value = this.stateRead.texture;
-      this.fluxPrev.value = this.fluxRead.texture;
-      renderer.setRenderTarget(this.fluxWrite);
-      this.fluxQuad.render(renderer);
-      const fluxSwap = this.fluxRead;
-      this.fluxRead = this.fluxWrite;
-      this.fluxWrite = fluxSwap;
-      this.fluxPrev.value = this.fluxRead.texture;
-      renderer.setRenderTarget(this.stateWrite);
-      this.heightQuad.render(renderer);
-      const stateSwap = this.stateRead;
-      this.stateRead = this.stateWrite;
-      this.stateWrite = stateSwap;
-    }
+    for (let k = 0; k < steps; k++) this.substep();
+    this.writeView();
     renderer.setRenderTarget(previousTarget);
-    this.stateNode.value = this.stateRead.texture;
   }
 
   get simTime(): number {
     return this._simTime;
   }
 
-  /** The state read back from the GPU as floats (the target is half-float; decode it). */
+  /** The view read back from the GPU as floats (the target is half-float; decode it). */
   async readState(): Promise<{ size: number; depth: Float32Array; u: Float32Array; v: Float32Array; foam: Float32Array }> {
     const size = this.size;
-    const raw = await this.renderer.readRenderTargetPixelsAsync(this.stateRead, 0, 0, size, size);
+    const raw = await this.renderer.readRenderTargetPixelsAsync(this.view, 0, 0, size, size);
     const n = size * size;
     const depth = new Float32Array(n);
     const u = new Float32Array(n);
@@ -367,9 +487,13 @@ export class ShallowWater {
    * Runs the water forward before the first frame so a capture does not show a pond
    * that has not yet heard about the swell. Sub-steps only; no frame is drawn.
    */
-  preroll(seconds: number, maxDepth: number): void {
-    const stable = this.stableStep(maxDepth);
-    const steps = Math.ceil(seconds / stable);
-    for (let i = 0; i < steps; i += 8) this.step(Math.min(8, steps - i) * stable, maxDepth);
+  preroll(seconds: number): void {
+    const renderer = this.renderer;
+    const previousTarget = renderer.getRenderTarget();
+    this.ensureInitialised();
+    const steps = Math.min(4000, Math.ceil(seconds / DT));
+    for (let k = 0; k < steps; k++) this.substep();
+    this.writeView();
+    renderer.setRenderTarget(previousTarget);
   }
 }

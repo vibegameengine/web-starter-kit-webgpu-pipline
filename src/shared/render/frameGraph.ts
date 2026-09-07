@@ -123,7 +123,7 @@ export class FrameGraph {
    * reads: the composited scene colour (a render-to-texture of the beauty node) and the
    * scene pass depth. Both change identity on rebuild and resize, hence a callback.
    */
-  onScreenTextures: ((color: THREE.Texture, depth: THREE.Texture) => void) | null = null;
+  onScreenTextures: ((color: THREE.Texture, depth: THREE.Texture, normal: THREE.Texture) => void) | null = null;
 
   constructor(
     private readonly renderer: THREE.WebGPURenderer,
@@ -278,7 +278,7 @@ export class FrameGraph {
       const sceneColor = rtt(beauty as ReturnType<typeof vec4>);
       const over = this.overlayPass.getTextureNode('output');
       beauty = mix(sceneColor, over, over.a) as unknown as TslNode;
-      this.onScreenTextures?.(sceneColor.value as THREE.Texture, this.overlayPass && this.scenePass.getTexture('depth'));
+      this.onScreenTextures?.(sceneColor.value as THREE.Texture, this.scenePass.getTexture('depth'), this.scenePass.getTexture('normal'));
     }
 
     const composed = this.applySplit(beauty, giRaw, indirect);

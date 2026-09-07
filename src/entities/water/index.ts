@@ -2,14 +2,17 @@ import * as THREE from 'three/webgpu';
 import {
   Discard,
   Fn,
+  If,
   abs,
   cameraFar,
   cameraNear,
   cameraPosition,
   cameraProjectionMatrixInverse,
+  cameraViewMatrix,
+  cameraProjectionMatrix,
+  refract,
   cameraWorldMatrix,
   clamp,
-  cos,
   distance,
   dot,
   equirectUV,
@@ -57,6 +60,8 @@ export interface WaterOptions {
   sun: THREE.DirectionalLight;
   /** How far below the water line the cut faces reach; the sand wall hides the rest. */
   cutDepth?: number;
+  /** The bed as a height texture over the slab (see bathymetry.ts); the field's stamps otherwise. */
+  bathymetry?: THREE.Texture;
 }
 
 export interface Water {
@@ -77,7 +82,7 @@ export interface Water {
    * materials are rebuilt around the new textures (texture identity is baked into the
    * pipeline), so this is called once per frame-graph rebuild, not per frame.
    */
-  bindScreen(color: THREE.Texture, depth: THREE.Texture): void;
+  bindScreen(color: THREE.Texture, depth: THREE.Texture, normal: THREE.Texture): void;
   /** Art-direction knobs over the physics: the swell entering the slab and the wind. */
   controls: {
     swellAmplitude: number;
@@ -86,7 +91,8 @@ export interface Water {
     swellDirection: number;
     windSpeed: number;
     windDirection: number;
-    friction: number;
+    /** Manning's n of the bed (sand 0.025, rock 0.035). */
+    manning: number;
     apply(): void;
   };
   /** Advances the foam field by the elapsed time and refreshes the sun uniforms. */
@@ -112,11 +118,15 @@ export interface Water {
  * Only the pipeline's overlay pass draws it (`Layer.Overlay`); the GI never sees it.
  */
 export function createWater(options: WaterOptions): Water {
-  const { renderer, field, environment, sun, cutDepth = 3.0 } = options;
+  const { renderer, field, environment, sun, cutDepth = 3.0, bathymetry } = options;
   const half = field.half;
 
-  const heightTexture = field.toTexture(512);
-  heightTexture.name = 'islandHeight';
+  const heightTexture = bathymetry ?? field.toTexture(512);
+  if (!bathymetry) heightTexture.name = 'islandHeight';
+  // The sand alone, without boulder stamps: says whether a rim position is beach or
+  // lagoon, which a stamp lying on the rim must not decide.
+  const sandTexture = field.toTexture(128, true);
+  sandTexture.name = 'islandSand';
 
   const uniforms = {
     absorb: uniform(WATER_ABSORB.clone()),
@@ -134,7 +144,14 @@ export function createWater(options: WaterOptions): Water {
   const params = new URLSearchParams(window.location.search);
   const debugMode = params.get('waterDebug');
   // The physical surface: shallow-water equations on the bathymetry.
-  const sim = new ShallowWater({ renderer, bathymetry: heightTexture, half, waterLevel: field.waterLevel, size: 512 });
+  // Mean still-water depth along each open face, for the swell's velocity there.
+  const faceDepth = { x: 0, z: 0 };
+  for (let k = 0; k < 64; k++) {
+    const s = -half + ((k + 0.5) / 64) * 2 * half;
+    faceDepth.x += Math.max(0, field.waterLevel - field.obstacleHeight(-half + 0.05, s)) / 64;
+    faceDepth.z += Math.max(0, field.waterLevel - field.obstacleHeight(s, half - 0.05)) / 64;
+  }
+  const sim = new ShallowWater({ renderer, bathymetry: heightTexture, half, waterLevel: field.waterLevel, size: 384, faceDepth });
   // Wind waves from the spectrum ride on the simulated surface (see windWaves.ts).
   const wind = new WindWaves({ windSpeed: 4.5, fetch: 800, components: 48, gain: 1.0 });
   const windCap = Math.min(0.12, wind.amplitudeSum);
@@ -147,7 +164,7 @@ export function createWater(options: WaterOptions): Water {
     maxDepth = Math.max(maxDepth, field.waterLevel - field.height(x, z));
   }
   maxDepth += 0.15;
-  sim.preroll(4.0, maxDepth);
+  sim.preroll(6.0);
 
   /** Sand height (with boulders stamped in) under (x, z); +z is row-down in the texture. */
   const sandHeight = Fn(([xz]: [ReturnType<typeof vec2>]) => {
@@ -247,7 +264,6 @@ export function createWater(options: WaterOptions): Water {
   foamSim.depthWrite = false;
   foamSim.colorNode = Fn(() => {
     const q = uv();
-    const xz = q.sub(0.5).mul(2.0).mul(slabHalf);
     // Advection: with the simulated flow, or the primary swell's drift without it.
     const flow: THREE.Node = sim.stateNode.sample(q).gb.mul(foamDt);
     const from = q.sub((flow as ReturnType<typeof vec2>).div(slabHalf.mul(2.0)));
@@ -260,13 +276,10 @@ export function createWater(options: WaterOptions): Water {
       .mul(0.2);
     const decayed = spread.mul(exp(foamDt.negate().div(foamDecaySeconds)));
 
-    const depth = waterLevel.sub(sandHeight(xz));
-    const lace = mx_fractal_noise_float(vec3(xz.x.mul(3.0), xz.y.mul(3.0), time.mul(0.3)), 3, 2.2, 0.55).mul(0.5).add(0.5);
+    // Only the solver's sources: breaking, the run-up front, impact spray. The
+    // analytic "shore lace" band that ignored the water is gone (grill Q12/Q20).
     const crest = sim.stateNode.sample(q).a;
-    const shallow = smoothstep(0.42, 0.0, depth).mul(smoothstep(-0.04, 0.04, depth));
-    const shore = shallow.mul(smoothstep(0.25, 0.75, lace)).mul(0.9);
-    const born = max(crest.mul(0.85), shore);
-    const foam = max(decayed, born);
+    const foam = max(decayed, crest.mul(0.85));
     // Wetness: where water stands now, or stood in the last half minute. The sand
     // shader reads it; sand the swash has reached stays dark and glossy as it dries.
     const standing = smoothstep(0.0005, 0.006, sim.stateNode.sample(q).r);
@@ -290,7 +303,7 @@ export function createWater(options: WaterOptions): Water {
     water.onField?.(foamRead.texture);
   };
 
-  function buildMaterial(screen: { color: THREE.Texture; depth: THREE.Texture }, top: boolean): THREE.MeshStandardNodeMaterial {
+  function buildMaterial(screen: { color: THREE.Texture; depth: THREE.Texture; normal: THREE.Texture }, top: boolean): THREE.MeshStandardNodeMaterial {
     const material = new THREE.MeshStandardNodeMaterial();
     material.name = top ? 'lagoonWaterSurface' : 'lagoonWaterCut';
     material.transparent = false;
@@ -330,29 +343,100 @@ export function createWater(options: WaterOptions): Water {
     // the emissive Fn below — a bare `Discard` outside a stack is never emitted.
     const behindScene = viewZ.lessThan(sceneZ0.sub(0.003));
 
-    // Refraction: bend the lookup by the surface normal, less with distance; never pull
-    // something that stands in front of the surface into the water.
-    const offset = nView.xy.mul(vec3(uniforms.refractionStrength).x).div(max(float(1.0), viewZ.negate()));
-    const uvR = screenUV.add(vec2(offset.x, offset.y.negate()));
-    const depthR = depthAt(uvR);
-    const zR = perspectiveDepthToViewZ(depthR, cameraNear, cameraFar);
-    const refractionValid = zR.lessThan(viewZ);
-    const uvF = select(refractionValid, uvR, screenUV);
-    const depthF = select(refractionValid, depthR, sceneDepth0);
-
-    const floorView = getViewPosition(uvF, depthF, cameraProjectionMatrixInverse);
-    const floorWorld = cameraWorldMatrix.mul(vec4(floorView, 1.0)).xyz;
-    // A ray that leaves the slab before it meets anything (the back and right edges
-    // have no cut face; the water block simply ends) is deep water to the boundary:
-    // the path stops at the boundary and nothing shows through.
-    const floorOutside = max(abs(floorWorld.x), abs(floorWorld.z)).greaterThan(slabHalf.add(0.6));
+    // --- Snell refraction (grill Q26/Q39) -------------------------------------------
+    // The view ray bends at the surface (n = 1.333). The refracted ray is intersected
+    // with the plane of the floor seen straight below this pixel (position from the
+    // depth, orientation from the G-buffer normal), the hit is projected back to the
+    // screen and the floor there is read; a second pass with that floor's plane
+    // refines it. Nothing standing in front of the surface is ever pulled under it.
     const viewDirEarly = normalize(p.sub(cameraPosition));
+    const refracted = refract(viewDirEarly, nWorld, float(1.0 / 1.333));
+    type V2 = ReturnType<typeof vec2>;
+    type V3 = ReturnType<typeof vec3>;
+    type F1 = ReturnType<typeof float>;
+    const floorAt = (uvNode: THREE.Node, depthNode: THREE.Node): V3 =>
+      cameraWorldMatrix.mul(vec4(getViewPosition(uvNode as V2, depthNode as F1, cameraProjectionMatrixInverse), 1.0)).xyz as unknown as V3;
+    const normalAt = (uvNode: THREE.Node): V3 => {
+      const nv = texture(screen.normal, uvNode as V2).xyz;
+      return normalize(cameraWorldMatrix.mul(vec4(nv, 0.0)).xyz) as unknown as V3;
+    };
+    const project = (world: THREE.Node): V2 => {
+      const clip = cameraProjectionMatrix.mul(cameraViewMatrix.mul(vec4(world as V3, 1.0)));
+      const ndc = clip.xy.div(max(clip.w, 1e-4));
+      return vec2(ndc.x.mul(0.5).add(0.5), float(0.5).sub(ndc.y.mul(0.5)));
+    };
+    const planeHit = (floor: V3, planeN: V3): F1 => {
+      const denom = dot(refracted, planeN);
+      const t = dot(floor.sub(p), planeN).div(denom);
+      const straight = distance(floor, p);
+      return select(denom.lessThan(-1e-3).and(t.greaterThan(0.0)), min(t, straight.mul(4.0)), straight) as unknown as F1;
+    };
+    const inside01 = (u: V2) => u.x.greaterThan(0.0).and(u.x.lessThan(1.0)).and(u.y.greaterThan(0.0)).and(u.y.lessThan(1.0));
+    const floor0 = floorAt(screenUV, sceneDepth0);
+    const t0 = planeHit(floor0, normalAt(screenUV));
+    const uv1raw = project(p.add(refracted.mul(t0)) as unknown as V3);
+    const uv1c = clamp(uv1raw, vec2(0.0), vec2(1.0)) as unknown as V2;
+    const depth1 = depthAt(uv1c);
+    // A hit counts only if what the screen shows there is (nearly) the point the ray
+    // reached: a sample that landed on a boulder's face above the water, or on the
+    // far side of it, is a different surface and would tear the floor apart.
+    const hit1 = p.add(refracted.mul(t0));
+    const consistent1 = distance(floorAt(uv1c, depth1), hit1).lessThan(0.15);
+    const valid1 = inside01(uv1raw).and(perspectiveDepthToViewZ(depth1, cameraNear, cameraFar).lessThan(viewZ)).and(consistent1);
+    const uv1 = select(valid1, uv1c, screenUV) as unknown as V2;
+    const depthAt1 = select(valid1, depth1, sceneDepth0) as unknown as F1;
+    const floor1 = floorAt(uv1, depthAt1);
+    const t1 = planeHit(floor1, normalAt(uv1));
+    const uv2raw = project(p.add(refracted.mul(t1)) as unknown as V3);
+    const uv2c = clamp(uv2raw, vec2(0.0), vec2(1.0)) as unknown as V2;
+    const depth2 = depthAt(uv2c);
+    const hit2 = p.add(refracted.mul(t1));
+    const consistent2 = distance(floorAt(uv2c, depth2), hit2).lessThan(0.15);
+    const valid2 = inside01(uv2raw).and(perspectiveDepthToViewZ(depth2, cameraNear, cameraFar).lessThan(viewZ)).and(consistent2);
+    // Where no plane hit is consistent (a boulder's flank, its far side) the refracted
+    // ray is marched through the depth buffer in eight steps: the first step whose
+    // point lies behind what the screen shows there is the hit.
+    // `If` only exists inside a Fn stack, hence the wrapper; it returns (uv, depth, t)
+    // with t = 0 when nothing was hit.
+    const march = Fn(() => {
+      const hitUv = screenUV.toVar();
+      const hitDepth = sceneDepth0.toVar();
+      const hitT = float(0.0).toVar();
+      const span = distance(floor0, p).mul(2.0).min(4.0).max(0.05);
+      for (let i = 1; i <= 8; i++) {
+        const t = span.mul(i / 8);
+        const q = p.add(refracted.mul(t)) as unknown as V3;
+        const uvq = project(q);
+        const uvqc = clamp(uvq, vec2(0.0), vec2(1.0)) as unknown as V2;
+        const dq = depthAt(uvqc);
+        const zq = perspectiveDepthToViewZ(dq, cameraNear, cameraFar);
+        const qz = cameraViewMatrix.mul(vec4(q, 1.0)).z;
+        const behind = zq.greaterThan(qz);
+        If(hitT.equal(0.0).and(behind).and(inside01(uvq)), () => {
+          hitUv.assign(uvqc);
+          hitDepth.assign(dq);
+          hitT.assign(t);
+        });
+      }
+      return vec4(hitUv, hitDepth, hitT);
+    })();
+    const marchUv = march.xy as unknown as V2;
+    const marchDepth = march.z as unknown as F1;
+    const marchT = march.w as unknown as F1;
+    const marchFound = marchT.greaterThan(0.0);
+    const uvF = select(valid2, uv2c, select(valid1, uv1c, select(marchFound, marchUv, screenUV))) as unknown as V2;
+    const depthF = select(valid2, depth2, select(valid1, depth1, select(marchFound, marchDepth, sceneDepth0))) as unknown as F1;
+    const floorWorld = floorAt(uvF, depthF);
+    // Length of the refracted path to the floor, held to the distance the sampled
+    // floor actually is from the surface.
+    const refractedPath = clamp(select(valid2, t1, select(valid1, t0, select(marchFound, marchT, distance(p, floorWorld)))), 0.0, distance(p, floorWorld).mul(1.5));
+    const floorOutside = max(abs(floorWorld.x), abs(floorWorld.z)).greaterThan(slabHalf.add(0.6));
     const boundaryT = Fn(() => {
-      const tx = select(viewDirEarly.x.greaterThan(0.0), slabHalf.sub(p.x), slabHalf.negate().sub(p.x)).div(select(abs(viewDirEarly.x).greaterThan(1e-4), viewDirEarly.x, float(1e-4)));
-      const tz = select(viewDirEarly.z.greaterThan(0.0), slabHalf.sub(p.z), slabHalf.negate().sub(p.z)).div(select(abs(viewDirEarly.z).greaterThan(1e-4), viewDirEarly.z, float(1e-4)));
+      const tx = select(refracted.x.greaterThan(0.0), slabHalf.sub(p.x), slabHalf.negate().sub(p.x)).div(select(abs(refracted.x).greaterThan(1e-4), refracted.x, float(1e-4)));
+      const tz = select(refracted.z.greaterThan(0.0), slabHalf.sub(p.z), slabHalf.negate().sub(p.z)).div(select(abs(refracted.z).greaterThan(1e-4), refracted.z, float(1e-4)));
       return clamp(min(abs(tx), abs(tz)), 0.0, 10.0);
     })();
-    const pathLength = select(floorOutside, boundaryT.add(1.5), clamp(distance(p, floorWorld), 0.0, 10.0));
+    const pathLength = select(floorOutside, boundaryT, clamp(refractedPath, 0.0, 10.0));
     const verticalDepth = select(floorOutside, float(2.0), max(waterLevel.sub(floorWorld.y), 0.0));
     const sceneColor = select(floorOutside, vec3(0.0), texture(screen.color, uvF).rgb);
 
@@ -378,18 +462,15 @@ export function createWater(options: WaterOptions): Water {
     // --- foam -----------------------------------------------------------------------
     const foamMask = Fn(() => {
       if (!top) return float(0.0);
+      // The persistent field only (grill Q12/Q21): its sources are the solver's.
+      // Noise is sub-cell detail of that mask — lace inside the patch, never a patch
+      // of its own — and nothing here depends on where the camera is.
       const lace = mx_fractal_noise_float(vec3(p.x.mul(5.0), p.z.mul(5.0), t.mul(0.45)), 4, 2.3, 0.55);
       const fine = mx_noise_float(vec3(p.x.mul(22.0), p.z.mul(22.0), t.mul(0.8)));
-      // Shallow against anything: sand, a boulder, the cut of a rock. Real depth, per pixel.
-      const band = smoothstep(0.55, 0.0, verticalDepth);
-      const edge = smoothstep(0.08, 0.0, verticalDepth);
-      const surge = cos(verticalDepth.mul(28.0).sub(t.mul(2.0)).add(lace.mul(4.0))).mul(0.5).add(0.5);
-      // Thin contact line against anything, from the real per-pixel depth.
-      const contact = smoothstep(0.0, 0.7, edge.mul(0.9).add(fine.mul(0.55)).add(lace.mul(0.3)).add(band.mul(0.3)).sub(0.7)).mul(band).mul(0.7);
-      // The drifting field, broken into lace by the noise so it never reads as a wash.
       const field = foamField.sample(p.xz.div(slabHalf.mul(2.0)).add(0.5)).r;
-      const drifting = smoothstep(0.0, 0.8, field.mul(1.1).add(lace.mul(0.5)).add(fine.mul(0.25)).add(surge.mul(0.15).mul(band)).sub(0.6));
-      return clamp(max(contact, drifting), 0.0, 1.0).mul(uniforms.foamStrength);
+      const coverage = float(1.0).sub(exp(field.negate().mul(2.5)));
+      const drifting = smoothstep(0.0, 0.8, coverage.mul(1.2).add(lace.mul(0.45)).add(fine.mul(0.25)).sub(0.55));
+      return clamp(drifting, 0.0, 1.0).mul(uniforms.foamStrength);
     })();
     const foamLight = vec3(uniforms.sunColor).mul(sunUp.mul(1.3)).add(vec3(0.35, 0.4, 0.45));
     // Froth: fine fractal grain, not cells — a foam sheet has no polka dots.
@@ -397,27 +478,7 @@ export function createWater(options: WaterOptions): Water {
     const froth = smoothstep(-0.6, 0.5, grain).mul(0.35).add(0.7);
     const foamColor = vec3(0.92, 0.95, 0.96).mul(foamLight).mul(froth);
 
-    // Glitter: the sun caught by micro-facets the mesh cannot carry. A high-frequency
-    // noise tilts the normal; the half-vector test is sharpened well past the GGX lobe.
-    const glitter = Fn(() => {
-      if (!top) return vec3(0.0);
-      const jitter = vec3(
-        mx_noise_float(vec3(p.x.mul(60.0), p.z.mul(60.0), t.mul(1.7))),
-        float(0.0),
-        mx_noise_float(vec3(p.x.mul(60.0).add(7.0), p.z.mul(60.0), t.mul(1.3))),
-      ).mul(0.12);
-      const nGlint = normalize(nWorld.add(jitter));
-      const halfVector = normalize(sunDir.sub(viewDir));
-      const spec = pow(clamp(dot(nGlint, halfVector), 0.0, 1.0), 900.0);
-      const sparkle = smoothstep(0.55, 0.9, mx_noise_float(vec3(p.x.mul(40.0), p.z.mul(40.0), t.mul(2.5))).mul(0.5).add(0.5));
-      return vec3(uniforms.sunColor).mul(spec).mul(sparkle).mul(sunUp).mul(6.0);
-    })();
-
-    // Thin crest lit from behind: more of the sun makes it through the peak.
-    const peak = top ? clamp(p.y.sub(waterLevel).div(0.06), 0.0, 1.0) : float(0.0);
-    const peakGlow = vec3(uniforms.scatter).mul(sunLight).mul(peak).mul(1.5);
-
-    const shaded: THREE.Node = mix(under.add(reflection).add(peakGlow), foamColor, foamMask).add(glitter);
+    const shaded: THREE.Node = mix(under.add(reflection), foamColor, foamMask);
     const simState = sim.stateNode.sample(sim.uvOf(p.xz) as unknown as ReturnType<typeof vec2>) as ReturnType<typeof vec4>;
     // Run-up thinner than a few millimetres is wet sand, not a water surface; up to a
     // couple of centimetres the sheet fades into the (wet) sand under it.
@@ -426,15 +487,21 @@ export function createWater(options: WaterOptions): Water {
     // before it reads as a surface: a film there is wet stone.
     const groundHere = sandHeight(p.xz);
     const needed = float(0.004).add(max(groundHere.sub(waterLevel), 0.0));
-    // Run-up on a slope reaches about one wave height above still water (Hunt);
-    // ground higher than that never carries a surface, whatever the solver piles there.
-    const runupCeiling = (sim.swellAmplitude as unknown as ReturnType<typeof float>).mul(1.5).add(0.03);
-    const tooHigh = groundHere.sub(waterLevel).greaterThan(runupCeiling);
     // The sheet's real height over the real floor (scene depth), not the solver's
     // column over its own bathymetry: the two floors differ by centimetres, and a film
     // judged on the wrong one pokes through the sand as a row of teeth.
-    const sheetAboveFloor = select(floorOutside, float(1.0), p.y.sub(floorWorld.y));
-    const thinFilm = top ? simState.r.lessThan(needed).or(tooHigh).or(sheetAboveFloor.lessThan(0.004)) : float(0.0).greaterThan(1.0);
+    // Judged on the floor straight behind the pixel, never the refracted one: a
+    // refracted sample that lands on a boulder above the line is not this pixel's floor.
+    const floor0Outside = max(abs(floor0.x), abs(floor0.z)).greaterThan(slabHalf.add(0.6));
+    const sheetAboveFloor = select(floor0Outside, float(1.0), p.y.sub(floor0.y));
+    // A cut face is water only where the rim floor is under the water line; on the
+    // beach side the block is sand and the cliff shows instead.
+    const bareSand = texture(sandTexture, p.xz.div(slabHalf).mul(0.5).add(0.5)).r;
+    const cutDry = bareSand.greaterThan(waterLevel.sub(0.01));
+    // `?waterFilm=0` draws every sheet pixel: a hole is then either geometry or the
+    // scene depth, never this gate.
+    const gateOn = params.get('waterFilm') !== '0';
+    const thinFilm = !gateOn ? float(0.0).greaterThan(1.0) : top ? simState.r.lessThan(needed).or(sheetAboveFloor.lessThan(0.004)) : cutDry;
     const filmFade = top ? smoothstep(needed, needed.add(0.026), simState.r).mul(smoothstep(0.004, 0.03, sheetAboveFloor)) : float(1.0);
     const debug: THREE.Node | null =
       debugMode === 'depth' ? vec3(verticalDepth.mul(0.5))
@@ -480,8 +547,25 @@ export function createWater(options: WaterOptions): Water {
   leftMesh.name = 'waterCutLeft';
   group.add(leftMesh);
 
-  if (!wantCuts) group.remove(frontMesh, leftMesh);
-  for (const mesh of [topMesh, frontMesh, leftMesh]) {
+  // The back and right faces too: from a low camera the far rim is a cut like any
+  // other, and where the sand at the rim stands above the water the fragment
+  // discards them (see `cutDry`), so the beach side shows the cliff, not water.
+  const back = new THREE.PlaneGeometry(2 * half, cutDepth, 96, 24);
+  back.rotateY(Math.PI);
+  back.translate(0, field.waterLevel - cutDepth / 2, -half - skin);
+  const backMesh = new THREE.Mesh(back);
+  backMesh.name = 'waterCutBack';
+  group.add(backMesh);
+
+  const right = new THREE.PlaneGeometry(2 * half, cutDepth, 96, 24);
+  right.rotateY(Math.PI / 2);
+  right.translate(half + skin, field.waterLevel - cutDepth / 2, 0);
+  const rightMesh = new THREE.Mesh(right);
+  rightMesh.name = 'waterCutRight';
+  group.add(rightMesh);
+
+  if (!wantCuts) group.remove(frontMesh, leftMesh, backMesh, rightMesh);
+  for (const mesh of [topMesh, frontMesh, leftMesh, backMesh, rightMesh]) {
     mesh.castShadow = false;
     mesh.receiveShadow = true;
     mesh.userData.giExclude = true;
@@ -493,17 +577,19 @@ export function createWater(options: WaterOptions): Water {
   const placeholderColor = new THREE.DataTexture(new Uint8Array([0, 0, 0, 255]), 1, 1);
   placeholderColor.needsUpdate = true;
   let materials: THREE.MeshStandardNodeMaterial[] = [];
-  const bindScreen = (color: THREE.Texture, depth: THREE.Texture) => {
+  const bindScreen = (color: THREE.Texture, depth: THREE.Texture, normal: THREE.Texture) => {
     const previous = materials;
-    const surface = buildMaterial({ color, depth }, true);
-    const cut = buildMaterial({ color, depth }, false);
+    const surface = buildMaterial({ color, depth, normal }, true);
+    const cut = buildMaterial({ color, depth, normal }, false);
     topMesh.material = surface;
     frontMesh.material = cut;
     leftMesh.material = cut;
+    backMesh.material = cut;
+    rightMesh.material = cut;
     materials = [surface, cut];
     for (const m of previous) m.dispose();
   };
-  bindScreen(placeholderColor, placeholderDepth);
+  bindScreen(placeholderColor, placeholderDepth, placeholderColor);
 
   // Numbers, not impressions: `__water.simStats()` reads the state back, and
   // `?waterInspect=1` (or `=z:<metres>`) draws the map and a section on screen.
@@ -519,7 +605,7 @@ export function createWater(options: WaterOptions): Water {
   };
   const inspectParam = params.get('waterInspect');
   const inspector = inspectParam
-    ? new WaterInspector(renderer, sim, field, { sectionZ: inspectParam.startsWith('z:') ? Number(inspectParam.slice(2)) : undefined, readFoam: () => water.readFoamField() })
+    ? new WaterInspector(renderer, sim, field, { sectionZ: inspectParam.startsWith('z:') ? Number(inspectParam.slice(2)) : undefined, readFoam: () => water.readFoamField(), bathymetry: heightTexture })
     : null;
 
   const sunDirection = new THREE.Vector3();
@@ -530,12 +616,12 @@ export function createWater(options: WaterOptions): Water {
     swellDirection: -45,
     windSpeed: wind.windSpeed,
     windDirection: (wind.windDirection * 180) / Math.PI,
-    friction: sim.friction.value as number,
+    manning: sim.manning.value as number,
     apply() {
       sim.swellAmplitude.value = controls.swellAmplitude;
       sim.swellPeriod.value = controls.swellPeriod;
       sim.setSwellDirection((controls.swellDirection * Math.PI) / 180);
-      sim.friction.value = controls.friction;
+      sim.manning.value = controls.manning;
       wind.setWind(controls.windSpeed, (controls.windDirection * Math.PI) / 180);
     },
   };
@@ -556,7 +642,7 @@ export function createWater(options: WaterOptions): Water {
     update(elapsedSeconds) {
       const dt = previousTime < 0 ? 1 / 60 : elapsedSeconds - previousTime;
       previousTime = elapsedSeconds;
-      sim.step(Math.min(0.05, Math.max(0.001, dt)), maxDepth);
+      sim.step(Math.min(0.05, Math.max(0.001, dt)));
       wind.clock.value = sim.simTime;
       surface.update();
       inspector?.update(performance.now());

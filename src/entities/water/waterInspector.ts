@@ -22,15 +22,21 @@ export class WaterInspector {
   private busy = false;
   private sectionZ: number;
   private readonly readFoam: (() => Promise<{ size: number; foam: Float32Array; wetness: Float32Array }>) | null;
+  private readonly renderer: THREE.WebGPURenderer;
+  private readonly bathymetry: THREE.Texture | null;
   private foamField: { size: number; foam: Float32Array; wetness: Float32Array } | null = null;
+  /** The bed as the solver sees it (read back once), else the field's analytic stamps. */
+  private bed: { size: number; height: Float32Array } | null = null;
+  private bedRequested = false;
 
   constructor(
     renderer: THREE.WebGPURenderer,
     private readonly sim: ShallowWater,
     private readonly field: IslandField,
-    options: { sectionZ?: number; readFoam?: () => Promise<{ size: number; foam: Float32Array; wetness: Float32Array }> } = {},
+    options: { sectionZ?: number; readFoam?: () => Promise<{ size: number; foam: Float32Array; wetness: Float32Array }>; bathymetry?: THREE.Texture } = {},
   ) {
-    void renderer;
+    this.renderer = renderer;
+    this.bathymetry = options.bathymetry ?? null;
     this.readFoam = options.readFoam ?? null;
     this.sectionZ = options.sectionZ ?? -1.0;
     this.canvas = document.createElement('canvas');
@@ -50,6 +56,16 @@ export class WaterInspector {
     // reads the wrong texture.
     const read = async () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
+      const target = this.bathymetry?.userData.renderTarget as THREE.RenderTarget | undefined;
+      if (target && !this.bedRequested) {
+        this.bedRequested = true;
+        const size = target.width;
+        const raw = await this.renderer.readRenderTargetPixelsAsync(target, 0, 0, size, size);
+        const height = new Float32Array(size * size);
+        const decode = raw instanceof Uint16Array ? (x: number) => THREE.DataUtils.fromHalfFloat(x) : (x: number) => x;
+        for (let k = 0; k < size * size; k++) height[k] = decode(raw[k * 4]);
+        this.bed = { size, height };
+      }
       const state = await this.sim.readState();
       const foamField = this.readFoam ? await this.readFoam() : null;
       return { state, foamField };
@@ -62,6 +78,16 @@ export class WaterInspector {
       console.warn('[water-inspector]', error);
       this.busy = false;
     });
+  }
+
+  /** Bed height at world (x, z): the solver's texture when read back, else the field. */
+  private bedHeight(x: number, z: number): number {
+    if (!this.bed) return this.field.obstacleHeight(x, z);
+    const { size, height } = this.bed;
+    const half = this.field.half;
+    const u = Math.max(0, Math.min(size - 1, Math.floor(((x + half) / (2 * half)) * size)));
+    const v = Math.max(0, Math.min(size - 1, Math.floor(((z + half) / (2 * half)) * size)));
+    return height[v * size + u];
   }
 
   private draw(state: { size: number; depth: Float32Array; u: Float32Array; v: Float32Array; foam: Float32Array }): void {
@@ -83,7 +109,7 @@ export class WaterInspector {
         const d = depth[k];
         const x = -half + ((sx + 0.5) / size) * 2 * half;
         const z = -half + ((sz + 0.5) / size) * 2 * half;
-        const b = this.field.obstacleHeight(x, z);
+        const b = this.bedHeight(x, z);
         const o = (j * mapSize + i) * 4;
         if (d > 0.003) {
           const eta = b + d - level;
@@ -130,7 +156,7 @@ export class WaterInspector {
         ctx.strokeStyle = '#b08a52'; ctx.lineWidth = 2; ctx.beginPath();
         for (let i = 0; i < size; i++) {
           const x = -half + ((i + 0.5) / size) * 2 * half;
-          const b = this.field.obstacleHeight(x, this.sectionZ);
+          const b = this.bedHeight(x, this.sectionZ);
           const px = x0 + (i / (size - 1)) * w;
           if (i === 0) ctx.moveTo(px, yOf(b)); else ctx.lineTo(px, yOf(b));
         }
@@ -142,7 +168,7 @@ export class WaterInspector {
         const k = sz * size + i;
         const d = depth[k];
         const x = -half + ((i + 0.5) / size) * 2 * half;
-        const b = this.field.obstacleHeight(x, this.sectionZ);
+        const b = this.bedHeight(x, this.sectionZ);
         const px = x0 + (i / (size - 1)) * w;
         if (d > 0.003) { const py = yOf(b + d); if (!pen) { ctx.moveTo(px, py); pen = true; } else ctx.lineTo(px, py); }
         else pen = false;

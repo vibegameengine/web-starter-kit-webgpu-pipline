@@ -56,7 +56,7 @@ export interface SceneHost {
    * the frame graph adds the overlay pass and calls this with the composited colour
    * and the scene depth every time those textures are (re)created.
    */
-  bindScreen?: (color: THREE.Texture, depth: THREE.Texture) => void;
+  bindScreen?: (color: THREE.Texture, depth: THREE.Texture, normal: THREE.Texture) => void;
 }
 
 export interface PipelineUi {

@@ -80,14 +80,17 @@ export class IslandField {
     return y;
   }
 
-  /** Height, packed for the GPU: R16F over the slab square, row-major, +z down. */
-  toTexture(size = 256): THREE.DataTexture {
+  /**
+   * Height, packed for the GPU: R16F over the slab square, row-major, +z down.
+   * With the boulder stamps (the bathymetry the water runs over) unless `bare`.
+   */
+  toTexture(size = 256, bare = false): THREE.DataTexture {
     const data = new Uint16Array(size * size);
     for (let j = 0; j < size; j++) {
       const z = -this.half + ((j + 0.5) / size) * 2 * this.half;
       for (let i = 0; i < size; i++) {
         const x = -this.half + ((i + 0.5) / size) * 2 * this.half;
-        data[j * size + i] = THREE.DataUtils.toHalfFloat(this.obstacleHeight(x, z));
+        data[j * size + i] = THREE.DataUtils.toHalfFloat(bare ? this.height(x, z) : this.obstacleHeight(x, z));
       }
     }
     const texture = new THREE.DataTexture(data, size, size, THREE.RedFormat, THREE.HalfFloatType);
