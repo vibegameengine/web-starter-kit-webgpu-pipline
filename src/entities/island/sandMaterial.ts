@@ -108,7 +108,9 @@ export function createSandMaterial(u: SandMaterialUniforms): THREE.MeshStandardN
     const fade = smoothstep(0.0, 0.06, depth).mul(exp(depth.mul(-1.4)));
     return filaments.mul(fade).mul(submerged);
   });
-  material.emissiveNode = albedo.mul(vec3(u.sunColor)).mul(caustic()).mul(0.85);
+  // Caustics are drawn by the water pass onto the reconstructed floor (they land on
+  // boulders too and only under water); the sand keeps the sun-through-water albedo.
+  void caustic;
 
   return material;
 }

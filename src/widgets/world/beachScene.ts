@@ -21,6 +21,8 @@ export interface BeachScene {
   field: IslandField;
   /** Per-frame: wind, water, caustics. Static geometry never moves. */
   update: (elapsedSeconds: number) => void;
+  /** The overlay pass hands the water the composited colour and the scene depth. */
+  bindScreen: (color: THREE.Texture, depth: THREE.Texture) => void;
 }
 
 /**
@@ -181,12 +183,16 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
   scene.add(water.group);
   const backdrop = createBackdrop({ islandBottom: field.bottom, islandHalf: field.half });
   scene.add(backdrop);
-  for (const root of [water.group, backdrop]) {
-    root.traverse((object) => {
-      object.layers.set(Layer.Debug);
-      object.userData.giExclude = true;
-    });
-  }
+  backdrop.traverse((object) => {
+    object.layers.set(Layer.Debug);
+    object.userData.giExclude = true;
+  });
+  // The water is drawn by the frame graph's overlay pass, after the composite, with
+  // the scene colour and depth as inputs; no G-buffer camera sees this layer.
+  water.group.traverse((object) => {
+    object.layers.set(Layer.Overlay);
+    object.userData.giExclude = true;
+  });
 
 
   const sunDirection = new THREE.Vector3();
@@ -197,6 +203,7 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
     sun,
     water,
     field,
+    bindScreen: water.bindScreen,
     update(elapsedSeconds) {
       island.update(elapsedSeconds, sun.color, sunDirection.copy(sun.position).sub(sun.target.position).normalize());
       water.update();

@@ -9,4 +9,4 @@ import * as THREE from 'three/webgpu';
  *
  * Absorption per metre, linear RGB. Red goes first; that is the whole colour of the sea.
  */
-export const WATER_ABSORB = new THREE.Vector3(2.0, 0.36, 0.15);
+export const WATER_ABSORB = new THREE.Vector3(0.5, 0.085, 0.075);

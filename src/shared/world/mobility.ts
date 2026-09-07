@@ -38,6 +38,12 @@ export const Layer = {
   GiStatic: 3,
   /** Debug gizmos — visible to the viewport camera, invisible to every other pass. */
   Debug: 4,
+  /**
+   * Drawn by the frame graph's overlay pass, after the composite, with the scene's
+   * colour and depth as inputs: water and other single-layer translucents. No camera
+   * that feeds the G-buffer or the GI ever enables it.
+   */
+  Overlay: 5,
 } as const;
 export type Layer = (typeof Layer)[keyof typeof Layer];
 

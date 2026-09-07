@@ -3,8 +3,10 @@ import {
   diffuseColor,
   mrt,
   normalView,
+  mix,
   output,
   pass,
+  rtt,
   screenUV,
   texture,
   vec2,
@@ -13,6 +15,7 @@ import {
   velocity,
 } from 'three/tsl';
 import { fxaa } from 'three/addons/tsl/display/FXAANode.js';
+import { Layer } from '../world/index.ts';
 
 /**
  * TSL's fluent API returns a different concrete node class per operator, so the
@@ -53,6 +56,12 @@ export interface FrameGraphOptions {
   indirectIntensity?: number;
   splitView?: SplitView;
   debugTaps?: boolean;
+  /**
+   * Adds the overlay pass: objects on `Layer.Overlay` (water) are drawn after the GI
+   * composite by a copy of the camera that sees only that layer, with the composited
+   * colour and the scene depth available to their materials. See `onScreenTextures`.
+   */
+  overlay?: boolean;
 }
 
 /**
@@ -79,6 +88,8 @@ export class FrameGraph {
 
   giMode: GiMode;
   readonly indirectIntensity = uniform(1);
+  /** Suppress realtime GI only on receivers already lit by the baked atlas. */
+  readonly hybridReceivers = uniform(0);
   /**
    * Where the divider sits, `?splitAt=` overriding the half-and-half default.
    *
@@ -103,6 +114,17 @@ export class FrameGraph {
   private albedoTexture: THREE.Texture | null = null;
   private needsComposite = true;
 
+  /** Single-layer translucents (water) drawn over the composite. Null without `overlay`. */
+  readonly overlayPass: ReturnType<typeof pass> | null = null;
+  private readonly overlayCamera: THREE.PerspectiveCamera | null = null;
+  private readonly camera: THREE.PerspectiveCamera;
+  /**
+   * Called whenever the composite is rebuilt, with the textures an overlay material
+   * reads: the composited scene colour (a render-to-texture of the beauty node) and the
+   * scene pass depth. Both change identity on rebuild and resize, hence a callback.
+   */
+  onScreenTextures: ((color: THREE.Texture, depth: THREE.Texture) => void) | null = null;
+
   constructor(
     private readonly renderer: THREE.WebGPURenderer,
     scene: THREE.Scene,
@@ -114,7 +136,15 @@ export class FrameGraph {
       indirectIntensity = 1,
       splitView = SplitView.Off,
       debugTaps = true,
+      overlay = false,
     } = options;
+    this.camera = camera;
+    if (overlay) {
+      const overlayCamera = camera.clone();
+      overlayCamera.layers.set(Layer.Overlay);
+      this.overlayCamera = overlayCamera;
+      this.overlayPass = pass(scene, overlayCamera);
+    }
     this.giMode = giMode;
     this.indirectIntensity.value = indirectIntensity;
     this.splitView = splitView;
@@ -123,10 +153,11 @@ export class FrameGraph {
     this.post = new THREE.PostProcessing(renderer);
 
     const scenePass = pass(scene, camera);
+    const bakedReceiver = uniform(0).onObjectUpdate(({ object }) => object?.userData.bakedLightReceiver ? 1 : 0);
     scenePass.setMRT(
       mrt({
         output: output,
-        albedo: diffuseColor,
+        albedo: vec4(diffuseColor.rgb, bakedReceiver),
         normal: normalView,
         velocity: velocity,
         // NO metalness/roughness attachment here, though this is where it belongs.
@@ -224,7 +255,8 @@ export class FrameGraph {
       giRaw = texture(this.giTexture, screenUV).toInspector('GI / Surfel');
       indirect = (giRaw as ReturnType<typeof texture>)
         .mul(albedo)
-        .mul(this.indirectIntensity);
+        .mul(this.indirectIntensity)
+        .mul(this.scenePass.getTextureNode('albedo').a.mul(this.hybridReceivers).oneMinus());
 
       switch (this.giMode) {
         case GiMode.Direct:
@@ -237,6 +269,16 @@ export class FrameGraph {
           beauty = (this.color as ReturnType<typeof vec4>).add(indirect);
           break;
       }
+    }
+
+    if (this.overlayPass) {
+      // The composite becomes a texture the overlay can refract through; the overlay
+      // pass writes premultiplied colour with coverage in alpha, so a frame with no
+      // overlay object is the composite unchanged.
+      const sceneColor = rtt(beauty as ReturnType<typeof vec4>);
+      const over = this.overlayPass.getTextureNode('output');
+      beauty = mix(sceneColor, over, over.a) as unknown as TslNode;
+      this.onScreenTextures?.(sceneColor.value as THREE.Texture, this.overlayPass && this.scenePass.getTexture('depth'));
     }
 
     const composed = this.applySplit(beauty, giRaw, indirect);
@@ -325,6 +367,12 @@ export class FrameGraph {
 
   render(): void {
     if (this.needsComposite) this.rebuildComposite();
+    if (this.overlayCamera) {
+      // Same eye, same lens, one layer: `copy` takes the layers with it, so reset them.
+      this.overlayCamera.copy(this.camera, false);
+      this.overlayCamera.layers.set(Layer.Overlay);
+      this.overlayCamera.updateMatrixWorld();
+    }
     this.post.render();
   }
 }

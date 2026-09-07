@@ -49,6 +49,12 @@ export interface SceneHost {
   skyIsBackground: boolean;
   /** Whether the orbiting demo sphere is in the scene unless `?mover=0`. */
   moverByDefault: boolean;
+  /**
+   * Present when the scene has single-layer translucents on `Layer.Overlay` (water):
+   * the frame graph adds the overlay pass and calls this with the composited colour
+   * and the scene depth every time those textures are (re)created.
+   */
+  bindScreen?: (color: THREE.Texture, depth: THREE.Texture) => void;
 }
 
 export interface PipelineUi {
@@ -263,7 +269,12 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
     giMode: (params.get('giMode') as GiMode) ?? GiMode.Combined,
     indirectIntensity: num('gi') ?? 1,
     splitView: (params.get('split') as SplitView) ?? SplitView.Off,
+    overlay: host.bindScreen !== undefined,
   });
+  if (host.bindScreen) {
+    frameGraph.onScreenTextures = host.bindScreen;
+    frameGraph.forceRebuild();
+  }
 
   /**
    * `surfel` resolves the cache on screen every frame; `lightmap` samples a texture
