@@ -623,6 +623,8 @@ export function createPalm(options: PalmOptions): Palm {
     side: THREE.DoubleSide,
   });
   leavesMaterial.colorNode = vertexColor();
+  // Thin fronds: the GI tracer lets light through them (see giVisibility).
+  leavesMaterial.userData.giTransmission = 0.45;
   leavesMaterial.emissiveNode = leafTranslucency(0.28);
   leavesMaterial.color.setRGB(stat.sum[0] / stat.count, stat.sum[1] / stat.count, stat.sum[2] / stat.count, THREE.LinearSRGBColorSpace);
   // Wind: a slow lateral sway growing toward the frond tips, phased by world x so

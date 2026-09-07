@@ -4,7 +4,7 @@
 
 import { wgsl, wgslFn } from 'three/tsl';
 import { rayStruct, constants, bvhIntersectFirstHit } from '../bvh/webgpu/index.js';
-import { dynBoundsHit, dynBvhIntersectFirstHit } from './dynamicBvh';
+import { dynBoundsHit, dynBvhIntersectFirstHit, sceneHitStruct, traceScene } from './dynamicBvh';
 import { consts } from './wgslConsts';
 import { MAX_GI_LIGHTS } from './sceneLights';
 
@@ -102,6 +102,52 @@ export const giOccluded = wgslFn(
   }
 `,
   [bvhIntersectFirstHit, dynBvhIntersectFirstHit, dynBoundsHit, rayStruct, constants],
+);
+
+/**
+ * "How much of the light gets here", per channel, with foliage in the way.
+ *
+ * `giOccluded` answers yes/no, which is right for a wall and wrong for a palm frond:
+ * a crown of two-sided leaflets is a wall to a closest-hit query, and the sand under
+ * it integrated to black — no sky, no sun, nothing. A leaf is thin. Light gets
+ * through it, dimmed and coloured by the leaf.
+ *
+ * Each hit reads the material's opacity from the diffuse array's alpha (see
+ * `getMaterialTransmission`). Opaque: done, dark. Translucent: the transmittance is
+ * multiplied in, tinted toward the leaf's own colour, and the ray continues past the
+ * hit. Four leaves deep is night; the loop stops there.
+ */
+export const giVisibility = wgslFn(
+  /* wgsl */ `
+  fn giVisibility(
+    rayIn: Ray,
+    maxDist: f32,
+    dynEnabled: f32,
+    dynBounds: vec4f,
+    diffuseTex: texture_2d_array<f32>,
+    diffuseSampler: sampler,
+    eps: f32,
+  ) -> vec3f {
+    var ray = rayIn;
+    var remaining = maxDist;
+    var transmitted = vec3f( 1.0 );
+    for ( var k: u32 = 0u; k < 4u; k = k + 1u ) {
+      let hit = traceScene( ray, dynEnabled, dynBounds );
+      if ( !hit.didHit || hit.dist >= remaining ) { return transmitted; }
+      let layerCount = i32( textureNumLayers( diffuseTex ) );
+      let layer = clamp( i32( round( hit.attrib.z ) ), 0, layerCount - 1 );
+      let s = textureSampleLevel( diffuseTex, diffuseSampler, hit.attrib.xy, layer, 0.0 );
+      if ( s.a > 0.995 ) { return vec3f( 0.0 ); }
+      transmitted *= ( 1.0 - s.a ) * ( 0.35 + 0.65 * s.rgb );
+      if ( max( transmitted.x, max( transmitted.y, transmitted.z ) ) < 0.02 ) { return vec3f( 0.0 ); }
+      let advance = hit.dist + eps;
+      ray.origin = ray.origin + ray.direction * advance;
+      remaining = remaining - advance;
+    }
+    return transmitted;
+  }
+`,
+  [traceScene, sceneHitStruct, rayStruct, constants],
 );
 
 /**
@@ -210,6 +256,8 @@ export const giShadeHit = wgslFn(
     lightSamples: u32,
     rnd: f32,
     medium: vec4f,
+    diffuseTex: texture_2d_array<f32>,
+    diffuseSampler: sampler,
   ) -> vec3f {
     let count = min( lightCount, MAX_GI_LIGHTS );
     if ( count == 0u ) { return vec3f(0.0); }
@@ -243,9 +291,10 @@ export const giShadeHit = wgslFn(
       // panel with a point light inside it) otherwise shadows itself with the panel.
       let reach = select( s.dist - eps, INFINITY, s.dist >= INFINITY );
       if ( reach <= 0.0 ) { continue; }
-      if ( giOccluded( ray, reach, dynEnabled, dynBounds ) ) { continue; }
+      let visibility = giVisibility( ray, reach, dynEnabled, dynBounds, diffuseTex, diffuseSampler, eps );
+      if ( max( visibility.x, max( visibility.y, visibility.z ) ) <= 0.0 ) { continue; }
 
-      var radiance = s.radiance;
+      var radiance = s.radiance * visibility;
       // Below the water line the light has crossed the medium on a slanted path; the
       // shadow ray above already answered "is it blocked", this answers "what colour".
       if ( p.y < medium.x ) {
@@ -258,7 +307,7 @@ export const giShadeHit = wgslFn(
     return sum * weight;
   }
 `,
-  [giLightConsts, giSampleLight, giOccluded, rayStruct, consts, constants],
+  [giLightConsts, giSampleLight, giVisibility, rayStruct, consts, constants],
 );
 
 /**

@@ -390,6 +390,8 @@ export function createShrub(options: ShrubOptions): Shrub {
     vertexColors: true,
   });
   leafMaterial.colorNode = vertexColor();
+  // Waxy broad leaves: thicker than a frond, still not a wall to the GI tracer.
+  leafMaterial.userData.giTransmission = 0.35;
   leafMaterial.emissiveNode = leafTranslucency(0.2);
   {
     // Wind: sway grows with height above ground; two frequencies so it never reads as a metronome.

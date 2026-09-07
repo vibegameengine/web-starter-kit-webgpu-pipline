@@ -1,6 +1,5 @@
 import * as THREE from 'three/webgpu';
 import type { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { CSMShadowNode } from 'three/examples/jsm/csm/CSMShadowNode.js';
 
 import { createScene } from '../../shared/gi/surfel/scene.ts';
 import { Layer, Mobility, applyMobility } from '../../shared/world/index.ts';
@@ -12,8 +11,6 @@ import { createRock, createRockMaterial, type RockTextures } from '../../entitie
 import { createPalm, type Palm } from '../../entities/palm/index.ts';
 import { createShrub, type Shrub } from '../../entities/shrub/index.ts';
 import { updateFoliageSun } from '../../entities/foliage/translucency.ts';
-import { WATER_ABSORB } from '../../entities/water/medium.ts';
-import { setGiMedium } from '../../shared/gi/surfel/sceneLights.ts';
 
 export interface BeachScene {
   scene: THREE.Scene;
@@ -52,23 +49,18 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
 
   // Sun: the direction is derived from the environment map by the app; here only the
   // shadow footprint, sized to the slab and its palms.
-  // Tropical sun: warm and strong, high from the front right (the camera side), which
-  // is what lights both visible cut faces and keeps the palm shadows off the beach.
-  sun.color.setRGB(1.0, 0.88, 0.70);
+  // Exactly the Cornell sun shadow (content.ts), with the ortho footprint widened
+  // from ±15 to cover the 12 m slab and its palms. Nothing else differs.
   sun.castShadow = true;
-  sun.shadow.mapSize.set(2048, 2048);
-  sun.shadow.camera.near = 1;
-  sun.shadow.camera.far = 120;
-  sun.shadow.bias = -0.0004;
-  sun.shadow.normalBias = 0.02;
-  sun.shadow.radius = 2;
-  // Cascaded shadows: the map resolution follows the camera. Three cascades split
-  // the view frustum out to 60 m, so the slab under the camera gets the finest
-  // texels and the far palm crowns still cast; the cascade frusta are rebuilt from
-  // the camera each frame, so orbiting keeps the near cascade near.
-  const csm = new CSMShadowNode(sun, { cascades: 3, maxFar: 60, mode: 'practical', lightMargin: 25 });
-  csm.fade = true;
-  sun.shadow.shadowNode = csm;
+  sun.shadow.mapSize.width = 4096;
+  sun.shadow.mapSize.height = 4096;
+  sun.shadow.camera.near = 0.1;
+  sun.shadow.camera.far = 100;
+  sun.shadow.camera.top = 12;
+  sun.shadow.camera.bottom = -12;
+  sun.shadow.camera.left = -12;
+  sun.shadow.camera.right = 12;
+  sun.shadow.bias = -0.0003;
 
   // --- textures ------------------------------------------------------------------
   const base = import.meta.env.BASE_URL;
@@ -93,8 +85,6 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
 
   // --- island --------------------------------------------------------------------
   const field = new IslandField(7, 6, -3.2);
-  // The tracer attenuates sunlight through the lagoon: bounce off the floor is teal.
-  setGiMedium(field.waterLevel, WATER_ABSORB);
   const island = createIsland({ field, textures: cliffTextures });
   scene.add(island.group);
   applyMobility(island.group, Mobility.Static);
@@ -208,16 +198,7 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
       object.userData.giExclude = true;
     });
   }
-  // The studio floor is the exception: it is part of the lit world for the tracer —
-  // the warm fill that reaches the shaded faces of rocks and cut walls comes from it —
-  // but it is never drawn. Layer GiStatic only: the BVH gathers it, no camera sees it,
-  // no live surfel spawns on it, and the lightmap opt-out keeps it out of the atlas.
-  const studioFloor = backdrop.getObjectByName('studioFloor');
-  if (studioFloor) {
-    studioFloor.userData.giExclude = false;
-    applyMobility(studioFloor, Mobility.Static, { castShadow: false });
-    studioFloor.layers.set(Layer.GiStatic);
-  }
+
 
   const sunDirection = new THREE.Vector3();
   return {

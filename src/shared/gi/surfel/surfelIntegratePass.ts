@@ -3,6 +3,7 @@
 import * as THREE from 'three/webgpu';
 import { storage, uniform, wgslFn, wgsl, sampler, texture } from 'three/tsl';
 import type { SurfelPool } from './surfelPool';
+import type { VirtualLightmap } from '../../render/virtualTexture/virtualLightmap';
 import type { SceneBVHBundle } from './sceneBvh';
 import { SurfelMoments, SurfelStruct } from './surfelPool';
 import {
@@ -70,6 +71,7 @@ import { giKnobs } from './knobs';
 const MAX_SURFELS_PER_CELL_LOOKUP = 32;
 
 export type SurfelIntegratePass = {
+  setBakedLightmap: (value: VirtualLightmap | null) => void;
   /**
    * `scene` rather than a light: the tracer reads every analytic light in the graph out
    * of the storage buffer `sceneLights.ts` refreshes here. It used to take one
@@ -615,6 +617,7 @@ export function createSurfelIntegratePass(
   const U_WRITE_OFFSET = uniform(0);
   const U_GRID_ORIGIN = uniform(new THREE.Vector3());
   const U_BASE_SAMPLE_COUNT = uniform(4);
+  let bakedLightmap: VirtualLightmap | null = null;
   const U_ALBEDO_BOOST = uniform(1.0);
   const U_GI_FROM_DIRECT = uniform(1.0);
   const U_GI_FROM_INDIRECT = uniform(1.0);
@@ -903,6 +906,7 @@ export function createSurfelIntegratePass(
       );
 
       // --- WGSL Integrator ---
+      const bakedSampler = bakedLightmap?.computeSampler();
       const integrator = wgslFn(
         /* wgsl */ `
       fn compute(
@@ -931,6 +935,9 @@ export function createSurfelIntegratePass(
           dynBounds: vec4f,
           diffuseLodScale: f32,
           medium: vec4f,
+          ${bakedSampler ? `bakedUv: texture_2d<f32>, bakedFallback: texture_2d<f32>, bakedFallbackSampler: sampler,
+          bakedPages: texture_2d_array<f32>, bakedPageSampler: sampler, bakedTable: texture_2d<u32>,
+          bakedClock: f32, bakedEnabled: f32,` : ''}
         ) -> void {
           let index = instanceIndex;
           // let total = atomicLoad(&poolMax[0]);
@@ -989,6 +996,7 @@ export function createSurfelIntegratePass(
           
           var diffuseGI = vec3f(0.0);
           var validSamples = 0.0;
+          ${bakedSampler ? 'var pageFeedback = vec3f(0.0); var feedbackScore = -1.0;' : ''}
 
           // Adaptive based on MSME inconsistency
           let baseCount = max(1u, baseSampleCount);
@@ -1107,7 +1115,28 @@ export function createSurfelIntegratePass(
               // nearer of the static and dynamic hits and resolves the interpolated
               // uv/matId out of whichever structure won, so everything below this line
               // is upstream's shading path with no knowledge of the split.
-              let hit = traceScene(ray, dynTrace, dynBounds);
+              var hit = traceScene(ray, dynTrace, dynBounds);
+              // Foliage is see-through for a bounce ray with probability (1 - opacity):
+              // the ray that would have stopped on a frond continues to whatever is
+              // behind it, so the sky reaches the ground under a crown and the crown
+              // itself bounces at its own opacity. Two leaves deep is enough.
+              {
+                var passRay = ray;
+                var passOffset = 0.0;
+                let passU = blueNoise4(index, frame * BLUE_NOISE_STRIDE + i, 2u, blueNoiseTex).y;
+                for (var leafHop: u32 = 0u; leafHop < 2u; leafHop = leafHop + 1u) {
+                  if (!hit.didHit) { break; }
+                  let passLayer = clamp(i32(round(hit.attrib.z)), 0, i32(textureNumLayers(diffuseTex)) - 1);
+                  let passOpacity = textureSampleLevel(diffuseTex, diffuseTexSampler, hit.attrib.xy, passLayer, 0.0).a;
+                  if (passOpacity > 0.995 || passU < passOpacity) { break; }
+                  let advance = hit.dist - passOffset + eps;
+                  passRay.origin = passRay.origin + passRay.direction * advance;
+                  passOffset = passOffset + advance;
+                  var next = traceScene(passRay, dynTrace, dynBounds);
+                  next.dist = next.dist + passOffset;
+                  hit = next;
+                }
+              }
               var bounceLi = vec3f(0.0);
               
               // ----------------------------------------------------------
@@ -1150,7 +1179,8 @@ export function createSurfelIntegratePass(
                 bounceLi += giShadeHit(
                   lightsTex, hitPoint, hitNormal, hitAlbedo, eps,
                   dynTrace, dynBounds,
-                  lightCount, lightSamples, lightU, medium
+                  lightCount, lightSamples, lightU, medium,
+                  diffuseTex, diffuseTexSampler
                 ) * giFromDirect;
 
                 // Emission is added raw. It is not multiplied by the hit's albedo (a
@@ -1162,7 +1192,31 @@ export function createSurfelIntegratePass(
                   emissiveBase, emissiveScale
                 );
 
-                let gi = lookupSurfelGI(hitPoint, hitNormal, camPos, gridOrigin, readOffset, occParams);
+                var gi = vec3f(0.0);
+                ${bakedSampler ? `
+                var bakedHit = false;
+                if (!hit.isDynamic) {
+                  let width = textureDimensions(bakedUv).x;
+                  let a = textureLoad(bakedUv, vec2i(i32(hit.indices.x % width), i32(hit.indices.x / width)), 0).xy;
+                  let b = textureLoad(bakedUv, vec2i(i32(hit.indices.y % width), i32(hit.indices.y / width)), 0).xy;
+                  let c = textureLoad(bakedUv, vec2i(i32(hit.indices.z % width), i32(hit.indices.z / width)), 0).xy;
+                  bakedHit = all(a >= vec2f(0.0)) && all(b >= vec2f(0.0)) && all(c >= vec2f(0.0));
+                  if (bakedHit) {
+                    let uv = a * hit.barycoord.x + b * hit.barycoord.y + c * hit.barycoord.z;
+                    gi = sampleVirtualBaked(uv, 1.0, bakedFallback, bakedFallbackSampler,
+                      bakedPages, bakedPageSampler, bakedTable, bakedClock, bakedEnabled);
+                    // Select one existing static hit per live probe. This feedback
+                    // changes residency only; no additional ray or lighting sample.
+                    let score = fract(u4.w + f32(i) * 0.618033989);
+                    if (score > feedbackScore) {
+                      feedbackScore = score;
+                      pageFeedback = vec3f(clamp(uv, vec2f(0.0), vec2f(1.0 - 1e-7)),
+                        clamp(cosTerm / (PI * mixPdf), 0.001, 8.0));
+                    }
+                  }
+                }
+                if (!bakedHit) { gi = lookupSurfelGI(hitPoint, hitNormal, camPos, gridOrigin, readOffset, occParams); }
+                ` : `gi = lookupSurfelGI(hitPoint, hitNormal, camPos, gridOrigin, readOffset, occParams);`}
                 bounceLi += gi * hitAlbedo * giFromIndirect;
               } else {
                 // Basic Sky
@@ -1250,7 +1304,9 @@ export function createSurfelIntegratePass(
           moments.value[outIdx].irradiance   = vec4f(msmeState.mean, totalCount);
           moments.value[outIdx].msmeData0    = vec4f(msmeState.shortMean, msmeState.vbbr);
           moments.value[outIdx].msmeData1    = vec4f(msmeState.variance, msmeState.inconsistency);
-          moments.value[outIdx].hit          = vec4f(hitPos0, debugFlag);
+          // The unused debug-hit record carries UV/importance/frame in baked mode.
+          // Authoring retains its original world-hit diagnostic format.
+          moments.value[outIdx].hit          = ${bakedSampler ? 'vec4f(pageFeedback, f32(frame))' : 'vec4f(hitPos0, debugFlag)'};
           moments.value[outIdx].guiding      = vec4f(meanWorld, slgMass);
         }
       `,
@@ -1293,6 +1349,7 @@ export function createSurfelIntegratePass(
 
           // cache lookup + color
           lookupSurfelGI,
+          ...(bakedSampler ? [bakedSampler.fn] : []),
           gridHelpers,
           colorHelpers,
           msmeHelpers,
@@ -1321,6 +1378,7 @@ export function createSurfelIntegratePass(
       );
 
       const computeCall = integrator({
+        ...(bakedSampler ? { ...bakedSampler.bindings, bakedUv: texture(bvh.lightmapUvTexture) } : {}),
         diffuseTex: texture(bvh.diffuseArrayTex),
         diffuseTexSampler: sampler(bvh.diffuseArrayTex),
 
@@ -1361,6 +1419,9 @@ export function createSurfelIntegratePass(
 
   return {
     run,
+    setBakedLightmap: (value: VirtualLightmap | null) => {
+      if (value !== bakedLightmap) { computeNode?.dispose(); computeNode = null; bakedLightmap = value; }
+    },
     setBaseSampleCount: (count: number) => {
       U_BASE_SAMPLE_COUNT.value = Math.max(1, Math.floor(count));
     },

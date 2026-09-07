@@ -120,15 +120,13 @@ async function boot(): Promise<void> {
   // thing in this frame that emits.
   const sunIntensity = num('sun');
   if (sunIntensity !== null) lightCfg.intensity = sunIntensity;
-  else if (beach) lightCfg.intensity = 2.6;
-  // The diorama is art-directed: `?sunAz=&sunEl=` override the env-derived angles.
-  // The sky still lights and reflects from where it is; only the key light moves.
-  const sunAz = num('sunAz') ?? (beach ? 185 : null);
-  const sunEl = num('sunEl') ?? (beach ? 48 : null);
+  // `?sunAz=&sunEl=` override the env-derived angles for experiments only; every
+  // scene defaults to the same env-derived sun the Cornell box uses.
+  const sunAz = num('sunAz');
+  const sunEl = num('sunEl');
   if (sunAz !== null && sunEl !== null) setLightAngles(sunAz, sunEl);
   const exposure = num('exposure');
   if (exposure !== null) renderer.toneMappingExposure = exposure;
-  else if (beach) renderer.toneMappingExposure = 1.0;
   applyOcclusionSettings({ shadowStrength: 0.5 });
 
   if (!beach) {
@@ -203,9 +201,7 @@ async function boot(): Promise<void> {
   // Applied here, not with the rest of the GUI defaults further down: the bake runs
   // before those exist, and a knob that only takes effect after the cache has converged
   // is a knob that does nothing.
-  // The diorama's skylight: measured against the reference, a boulder's lit/shaded
-  // ratio is 2.0, which the sky HDR at 0.7 plus the studio-floor bounce reproduces.
-  const envIntensityParam = num('env') ?? (beach ? 0.7 : 1);
+  const envIntensityParam = num('env') ?? 1;
   gi.setEnvControls(envIntensityParam, 4);
 
   const lightmapIntensity = uniform(0);
@@ -254,6 +250,8 @@ async function boot(): Promise<void> {
   type LightingMode = 'surfel' | 'lightmap' | 'hybrid';
   let lightingMode: LightingMode = requestedLightingMode === 'lightmap' || requestedLightingMode === 'surfel' ? requestedLightingMode : 'hybrid';
   const bakedHitTransport = params.get('bakedHits') !== '0';
+  gi.bakedFeedbackEnabled = params.get('giPageFeedback') !== '0';
+  let cameraPageDemandEnabled = true;
 
   async function prepareLightmap(iterations: number, forceBake = false): Promise<void> {
     const persistent = lightingMode === 'hybrid' && params.get('bakeCache') !== '0';
@@ -398,13 +396,14 @@ async function boot(): Promise<void> {
 
   function publishPages(pages: LightmapPageSource): void {
     const previousVirtual = virtualLightmap;
-    virtualLightmap = new VirtualLightmap(renderer, pages, num('vtSlots') ?? 8);
+    virtualLightmap = previousVirtual?.replaceSource(pages)
+      ? previousVirtual : new VirtualLightmap(renderer, pages, num('vtSlots') ?? 8);
     lightmapDemand = createLightmapDemand(scene, pages);
     applyLightmap(scene, virtualLightmap.fallback, lightmapIntensity, virtualLightmap);
     lightmapTexture = virtualLightmap.fallback;
     nextPageDemandAt = 0;
     frameGraph.setLightmapTexture(lightmapTexture);
-    previousVirtual?.dispose();
+    if (previousVirtual !== virtualLightmap) previousVirtual?.dispose();
   }
 
   async function prepareSurfel(durationMs: number): Promise<void> {
@@ -738,6 +737,8 @@ async function boot(): Promise<void> {
       return readValidationTexture(renderer, lightmapTexture);
     },
     pages: () => virtualLightmap?.stats() ?? null,
+    cameraPageDemand(value: boolean) { cameraPageDemandEnabled = value; nextPageDemandAt = 0; },
+    giPageFeedback(value: boolean) { gi.bakedFeedbackEnabled = value; nextPageDemandAt = 0; },
     pageDetail(value: boolean) { if (virtualLightmap) virtualLightmap.enabled.value = value ? 1 : 0; },
     pageStreaming(value: boolean) { pausePageStreaming = !value; },
     clearPages() { virtualLightmap?.clear(); },
@@ -775,7 +776,8 @@ async function boot(): Promise<void> {
     beach?.update(now * 0.001);
     if (!switching && lightingMode === 'hybrid' && virtualLightmap && lightmapDemand) {
       if (now >= nextPageDemandAt) {
-        virtualLightmap.setDemand(lightmapDemand(camera, renderer.domElement.width, renderer.domElement.height));
+        virtualLightmap.setDemand(cameraPageDemandEnabled
+          ? lightmapDemand(camera, renderer.domElement.width, renderer.domElement.height) : [], gi.getBakedPageDemand(now));
         nextPageDemandAt = now + 150;
       }
       if (!pausePageStreaming) virtualLightmap.update(now);

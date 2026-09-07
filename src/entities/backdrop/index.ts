@@ -64,28 +64,6 @@ export function createBackdrop(options: BackdropOptions): THREE.Group {
   domeMaterial.colorNode = grade.add(vec3(grain)).mul(float(1.0).sub(shadow));
   domeMaterial.mrtNode = mrt({ albedo: vec4(0.0), normal: vec4(0.0), velocity: vec4(0.0) });
 
-  // Studio floor: a bounce surface for the tracer only (the scene hides it from every
-  // camera). It is what sends warm neutral light back up into the shaded faces of the
-  // slab and the boulders — the fill a cyclorama gives a photographed model.
-  const floorMaterial = new THREE.MeshStandardNodeMaterial();
-  floorMaterial.name = 'studioFloor';
-  floorMaterial.color.setRGB(0.62, 0.575, 0.53);
-  floorMaterial.roughness = 1;
-  floorMaterial.metalness = 0;
-  const floorRadial = positionWorld.xz.sub(centre).div(options.islandHalf * 1.6).length();
-  const floorPool = float(1.0).sub(smoothstep(0.2, 1.0, floorRadial));
-  floorMaterial.colorNode = color(0.62, 0.575, 0.53)
-    .mul(float(1.0).sub(floorPool.mul(floorPool).mul(0.55)))
-    .add(vec3(mx_noise_float(positionWorld.mul(0.6)).mul(0.01)));
-  const floor = new THREE.Mesh(new THREE.CircleGeometry(70, 96), floorMaterial);
-  floor.rotateX(-Math.PI / 2);
-  floor.position.y = options.islandBottom - 1.4;
-  floor.name = 'studioFloor';
-  floor.userData.lightmap = false;
-  floor.receiveShadow = true;
-  floor.castShadow = false;
-  group.add(floor);
-
   const dome = new THREE.Mesh(new THREE.SphereGeometry(160, 48, 32), domeMaterial);
   dome.name = 'backdropDome';
   dome.userData.giExclude = true;

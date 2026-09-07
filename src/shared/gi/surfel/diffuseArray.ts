@@ -142,9 +142,21 @@ function ceilPow2(v: number): number {
  * is sixteen materials over one 2K map that differ by nothing else, and every one of
  * them was costing 4 MiB of its own.
  */
+/**
+ * How much light passes through a hit on this material, 0..1. Foliage sets it: a
+ * frond is thin, and the tracer treating it as a wall is what put the sand under a
+ * palm crown into total darkness — no sky reached the surfels there at all.
+ */
+export function getMaterialTransmission(mat: THREE.Material): number {
+  const value = (mat.userData as { giTransmission?: unknown }).giTransmission;
+  return typeof value === 'number' ? Math.min(0.95, Math.max(0, value)) : 0;
+}
+
 function appearanceKey(mat: THREE.Material): string {
   const map = getMaterialMap(mat);
   const colour = getMaterialColorLinear(mat);
+  const transmission = getMaterialTransmission(mat);
+  const transmissionKey = transmission > 0 ? `|t${transmission.toFixed(2)}` : '';
   // sqrt is a gamma 2.0 stand-in: close enough to sRGB for a bucket boundary, and
   // unlike a real transfer function it cannot disagree with the renderer's colour
   // management about which working space this Color is in.
@@ -162,14 +174,14 @@ function appearanceKey(mat: THREE.Material): string {
       : '';
 
   if (!isTextureReady(map)) {
-    return `flat|${q(colour.r)}|${q(colour.g)}|${q(colour.b)}${emissiveKey}`;
+    return `flat|${q(colour.r)}|${q(colour.g)}|${q(colour.b)}${emissiveKey}${transmissionKey}`;
   }
 
   const m = map.matrix?.elements;
   const matrixKey = m
     ? m.map((v: number) => Math.round(v * 4096)).join(',')
     : `${map.repeat.x},${map.repeat.y},${map.offset.x},${map.offset.y},${map.rotation}`;
-  return `${map.uuid}|${matrixKey}|${q(colour.r)}|${q(colour.g)}|${q(colour.b)}${emissiveKey}`;
+  return `${map.uuid}|${matrixKey}|${q(colour.r)}|${q(colour.g)}|${q(colour.b)}${emissiveKey}${transmissionKey}`;
 }
 
 export function buildDiffuseArrayTexture(
@@ -289,9 +301,12 @@ export function buildDiffuseArrayTexture(
   bakeMaterial.map = null;
 
   const baseColorUniform = uniform(new THREE.Color(1, 1, 1));
+  // Alpha carries opacity (1 - transmission): the tracer reads it to let light
+  // through foliage. Emissive layers are always opaque.
+  const opacityUniform = uniform(1);
   const flippedUv = vec2(uv().x, oneMinus(uv().y));
   const mapNode = texture(whiteMap, flippedUv).setUpdateMatrix(true);
-  bakeMaterial.colorNode = vec4(mapNode.rgb.mul(baseColorUniform), 1.0);
+  bakeMaterial.colorNode = vec4(mapNode.rgb.mul(baseColorUniform), opacityUniform);
 
   const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), bakeMaterial);
   quad.frustumCulled = false;
@@ -323,6 +338,7 @@ export function buildDiffuseArrayTexture(
       : null;
 
     baseColorUniform.value.copy(baseColor);
+    opacityUniform.value = mat && !isEmissiveLayer ? 1 - getMaterialTransmission(mat) : 1;
     const mapTex = isTextureReady(map) ? map : whiteMap;
     mapTex.updateMatrix?.();
     mapNode.value = mapTex;
