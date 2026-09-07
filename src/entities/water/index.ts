@@ -46,7 +46,7 @@ import {
   vec4,
 } from 'three/tsl';
 import type { IslandField } from '../island/heightField.ts';
-import { WATER_ABSORB } from './medium.ts';
+import { WATER_HG_G, WATER_IOR, WATER_SCATTER, WATER_SCATTER_ALBEDO, waterAttenuation } from './medium.ts';
 import { SurfaceField } from './surfaceField.ts';
 import { ShallowWater } from './shallowWater.ts';
 import { WaterInspector } from './waterInspector.ts';
@@ -67,10 +67,12 @@ export interface WaterOptions {
 export interface Water {
   group: THREE.Group;
   uniforms: {
+    /** Effective attenuation per metre, RGB (medium.ts). */
     absorb: ReturnType<typeof uniform>;
-    scatter: ReturnType<typeof uniform>;
-    scatterStrength: ReturnType<typeof uniform>;
-    envStrength: ReturnType<typeof uniform>;
+    /** Particulate scattering coefficient, per metre: the one art knob of the medium. */
+    sigmaS: ReturnType<typeof uniform>;
+    /** Diffuse albedo of the lagoon floor, for the light trapped under the surface. */
+    floorAlbedo: ReturnType<typeof uniform>;
     foamStrength: ReturnType<typeof uniform>;
     causticStrength: ReturnType<typeof uniform>;
     refractionStrength: ReturnType<typeof uniform>;
@@ -129,10 +131,9 @@ export function createWater(options: WaterOptions): Water {
   sandTexture.name = 'islandSand';
 
   const uniforms = {
-    absorb: uniform(WATER_ABSORB.clone()),
-    scatter: uniform(new THREE.Color(0.012, 0.10, 0.10)),
-    scatterStrength: uniform(1.0),
-    envStrength: uniform(0.55),
+    absorb: uniform(waterAttenuation()),
+    sigmaS: uniform(WATER_SCATTER),
+    floorAlbedo: uniform(new THREE.Color(0.80, 0.74, 0.60)),
     foamStrength: uniform(1.0),
     causticStrength: uniform(1.0),
     refractionStrength: uniform(0.12),
@@ -382,7 +383,8 @@ export function createWater(options: WaterOptions): Water {
     // reached: a sample that landed on a boulder's face above the water, or on the
     // far side of it, is a different surface and would tear the floor apart.
     const hit1 = p.add(refracted.mul(t0));
-    const consistent1 = distance(floorAt(uv1c, depth1), hit1).lessThan(0.15);
+    const seen1 = floorAt(uv1c, depth1);
+    const consistent1 = distance(seen1, hit1).lessThan(0.15).and(seen1.y.lessThan(waterLevel.add(0.02)));
     const valid1 = inside01(uv1raw).and(perspectiveDepthToViewZ(depth1, cameraNear, cameraFar).lessThan(viewZ)).and(consistent1);
     const uv1 = select(valid1, uv1c, screenUV) as unknown as V2;
     const depthAt1 = select(valid1, depth1, sceneDepth0) as unknown as F1;
@@ -392,7 +394,8 @@ export function createWater(options: WaterOptions): Water {
     const uv2c = clamp(uv2raw, vec2(0.0), vec2(1.0)) as unknown as V2;
     const depth2 = depthAt(uv2c);
     const hit2 = p.add(refracted.mul(t1));
-    const consistent2 = distance(floorAt(uv2c, depth2), hit2).lessThan(0.15);
+    const seen2 = floorAt(uv2c, depth2);
+    const consistent2 = distance(seen2, hit2).lessThan(0.15).and(seen2.y.lessThan(waterLevel.add(0.02)));
     const valid2 = inside01(uv2raw).and(perspectiveDepthToViewZ(depth2, cameraNear, cameraFar).lessThan(viewZ)).and(consistent2);
     // Where no plane hit is consistent (a boulder's flank, its far side) the refracted
     // ray is marched through the depth buffer in eight steps: the first step whose
@@ -413,7 +416,10 @@ export function createWater(options: WaterOptions): Water {
         const zq = perspectiveDepthToViewZ(dq, cameraNear, cameraFar);
         const qz = cameraViewMatrix.mul(vec4(q, 1.0)).z;
         const behind = zq.greaterThan(qz);
-        If(hitT.equal(0.0).and(behind).and(inside01(uvq)), () => {
+        // What the screen shows there must itself be under water: a boulder's face
+        // above the line is not what a ray inside the water reaches.
+        const underLine = floorAt(uvqc, dq).y.lessThan(waterLevel.add(0.02));
+        If(hitT.equal(0.0).and(behind).and(inside01(uvq)).and(underLine), () => {
           hitUv.assign(uvqc);
           hitDepth.assign(dq);
           hitT.assign(t);
@@ -442,23 +448,49 @@ export function createWater(options: WaterOptions): Water {
     const sceneColor = select(floorOutside, vec3(0.0), texture(screen.color, uvF).rgb);
 
     // --- light through the water --------------------------------------------------
+    // The sun as irradiance (colour × intensity), the way the light loop lights the
+    // sand; its share that enters the water is (1 − F) at its own incidence.
     const sunDir = vec3(uniforms.sunDir);
     const sunUp = clamp(sunDir.y, 0.0, 1.0);
-    const sunLight = vec3(uniforms.sunColor).mul(sunUp.mul(1.6).add(0.5));
+    const sunIrradiance = vec3(uniforms.sunColor);
+    const sunFresnel = float(0.02).add(float(0.98).mul(pow(float(1.0).sub(sunUp), 5.0)));
+    const sunInWater = refract(sunDir.negate(), vec3(0.0, 1.0, 0.0), float(1.0 / WATER_IOR));
     const causticMask = caustic(floorWorld.xz, verticalDepth).mul(sunUp);
-    const transmittance = exp(vec3(uniforms.absorb).mul(pathLength).negate());
-    const scatterAmount = float(1.0).sub(exp(pathLength.mul(-0.3)));
-    const scatter = vec3(uniforms.scatter).mul(sunLight).mul(scatterAmount).mul(uniforms.scatterStrength);
-    const under = sceneColor.mul(float(1.0).add(causticMask.mul(uniforms.causticStrength))).mul(transmittance).add(scatter);
+    const sigma = vec3(uniforms.absorb);
+    const transmittance = exp(sigma.mul(pathLength).negate());
 
-    // --- sky by Fresnel -----------------------------------------------------------
+    // Single scattering along the refracted view path (grill Q25/Q40): particulate
+    // σs with a Henyey–Greenstein lobe, lit by the sun that came in through the
+    // surface, attenuated on the way down (to the point) and back up (to the eye).
+    // Closed form of the integral of σs p E (1−Fs) exp(−σ(s + s·cv/cs)) over the path.
+    const cosView = max(refracted.y.negate(), 0.05);
+    const cosSun = max(sunInWater.y.negate(), 0.05);
+    const cosScatter = dot(sunInWater, refracted.negate());
+    const g = float(WATER_HG_G);
+    const phase = float(1.0).sub(g.mul(g)).div(float(4.0 * Math.PI).mul(pow(float(1.0).add(g.mul(g)).sub(g.mul(2.0).mul(cosScatter)), 1.5)));
+    const ratio = float(1.0).add(cosView.div(cosSun));
+    const scatterIntegral = float(1.0).sub(exp(sigma.mul(pathLength).mul(ratio).negate())).div(sigma.mul(ratio));
+    const inScatter = scatterIntegral.mul(vec3(uniforms.sigmaS).x).mul(WATER_SCATTER_ALBEDO).mul(phase).mul(sunIrradiance).mul(float(1.0).sub(sunFresnel)).mul(sunUp);
+    // Light the floor sends up outside the escape cone (a fraction 1 − 1/n² of a
+    // Lambertian flux) is totally reflected back down, lands on the floor again and
+    // is re-emitted: the geometric series over those bounces, each one paying the
+    // floor's albedo and a two-way pass through the column. This trapped light is
+    // what makes a white-sand lagoon glow, and it is more cyan with every pass.
+    const trapped = float(1.0 - 1.0 / (WATER_IOR * WATER_IOR));
+    const twoWay = exp(sigma.mul(verticalDepth.mul(2.0)).negate());
+    const recycled = float(1.0).div(float(1.0).sub(vec3(uniforms.floorAlbedo).mul(trapped).mul(twoWay)));
+    const under = sceneColor.mul(float(1.0).add(causticMask.mul(uniforms.causticStrength))).mul(transmittance).mul(recycled).add(inScatter);
+
+    // --- the interface: Fresnel sky above, radiance from below × (1 − F)/n² ---------
     const viewDir = normalize(p.sub(cameraPosition));
     const reflected = reflect(viewDir, nWorld);
     const reflectedUp = vec3(reflected.x, abs(reflected.y), reflected.z);
     const sky = texture(environment, equirectUV(reflectedUp)).rgb;
     const cosTheta = clamp(dot(nWorld, viewDir.negate()), 0.0, 1.0);
     const fresnel = float(0.02).add(float(0.98).mul(pow(float(1.0).sub(cosTheta), 5.0)));
-    const reflection = sky.mul(fresnel).mul(uniforms.envStrength);
+    const reflection = sky.mul(fresnel);
+    // Radiance crossing water → air: L/n² is the invariant, and (1 − F) gets through.
+    const outOfWater = float(1.0).sub(fresnel).div(WATER_IOR * WATER_IOR);
 
     // --- foam -----------------------------------------------------------------------
     const foamMask = Fn(() => {
@@ -473,13 +505,16 @@ export function createWater(options: WaterOptions): Water {
       const drifting = smoothstep(0.0, 0.8, coverage.mul(1.2).add(lace.mul(0.45)).add(fine.mul(0.25)).sub(0.55));
       return clamp(drifting, 0.0, 1.0).mul(uniforms.foamStrength);
     })();
-    const foamLight = vec3(uniforms.sunColor).mul(sunUp.mul(1.3)).add(vec3(0.35, 0.4, 0.45));
+    // Foam is a white Lambertian layer at the surface: sun irradiance × cos plus the
+    // sky's, over π. (Shadowing it is grill Q22, pending.)
+    const skyUp = texture(environment, equirectUV(vec3(0.0, 1.0, 0.0))).rgb;
+    const foamLight = sunIrradiance.mul(sunUp).add(skyUp.mul(Math.PI * 0.6)).div(Math.PI);
     // Froth: fine fractal grain, not cells — a foam sheet has no polka dots.
     const grain = mx_fractal_noise_float(vec3(p.x.mul(30.0), p.z.mul(30.0), t.mul(0.9)), 3, 2.1, 0.6);
     const froth = smoothstep(-0.6, 0.5, grain).mul(0.35).add(0.7);
     const foamColor = vec3(0.92, 0.95, 0.96).mul(foamLight).mul(froth);
 
-    const shaded: THREE.Node = mix(under.add(reflection), foamColor, foamMask);
+    const shaded: THREE.Node = mix(under.mul(outOfWater).add(reflection), foamColor, foamMask);
     const simState = sim.stateNode.sample(sim.uvOf(p.xz) as unknown as ReturnType<typeof vec2>) as ReturnType<typeof vec4>;
     // Run-up thinner than a few millimetres is wet sand, not a water surface; up to a
     // couple of centimetres the sheet fades into the (wet) sand under it.
@@ -653,7 +688,7 @@ export function createWater(options: WaterOptions): Water {
       stepFoam(dt);
       sunDirection.copy(sun.position).sub(sun.target.position).normalize();
       (uniforms.sunDir.value as THREE.Vector3).copy(sunDirection);
-      (uniforms.sunColor.value as THREE.Color).copy(sun.color).multiplyScalar(Math.min(1.5, sun.intensity * 0.5));
+      (uniforms.sunColor.value as THREE.Color).copy(sun.color).multiplyScalar(sun.intensity);
     },
   };
   return water;

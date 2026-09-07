@@ -363,10 +363,14 @@ export class ShallowWater {
         const na = axis === 0 ? desingularise(Ua.y, ha) : desingularise(Ua.z, ha);
         const nb = axis === 0 ? desingularise(Ub.y, hb) : desingularise(Ub.z, hb);
         const converge = step(0.1, na.add(sqrt(g.mul(ha))).sub(nb.add(sqrt(g.mul(hb)))));
-        const dh = abs(hb.sub(ha));
+        // A jump is a step in the *surface* between two wet cells; a step in the bed
+        // (a boulder's face) with still water on both sides is not one.
+        const bothWet = step(DRY * 2.0, ha).mul(step(DRY * 2.0, hb));
+        const bedStep = smoothstep(0.12, 0.04, abs(ba.sub(bb)));
+        const dh = abs(hb.add(bb).sub(ha.add(ba)));
         const hMean = ha.add(hb).mul(0.5);
         const D = g.mul(sqrt(g.mul(hMean))).mul(dh).mul(dh).mul(dh).div(ha.mul(hb).mul(4.0));
-        return asF(D.mul(converge).div(0.045));
+        return asF(D.mul(converge).mul(bothWet).mul(bedStep).div(0.045));
       };
       const jx = max(jump(U(-1, 0), bedOf(-1, 0), U0, bedCell, 0), jump(U0, bedCell, U(1, 0), bedOf(1, 0), 0));
       const jz = max(jump(U(0, -1), bedOf(0, -1), U0, bedCell, 1), jump(U0, bedCell, U(0, 1), bedOf(0, 1), 1));

@@ -3,7 +3,7 @@ import { texture, uniform } from 'three/tsl';
 import { IslandField } from './heightField.ts';
 import { createSandMaterial, type SandMaterialUniforms } from './sandMaterial.ts';
 import { createCliffMaterial, type CliffTextures } from './cliffMaterial.ts';
-import { WATER_ABSORB } from '../water/medium.ts';
+import { waterAttenuation } from '../water/medium.ts';
 
 export { IslandField } from './heightField.ts';
 export { SAND_AVERAGE_COLOR } from './sandMaterial.ts';
@@ -50,7 +50,7 @@ export function createIsland(options: IslandOptions): Island {
     sunColor: uniform(new THREE.Color(1, 0.95, 0.85)),
     waterLevel: uniform(field.waterLevel),
     sunDir: uniform(new THREE.Vector3(0, 1, 0)),
-    absorb: uniform(WATER_ABSORB.clone()),
+    absorb: uniform(waterAttenuation()),
     // Placeholder until the water hands over its live field (see `setWetness`).
     wetness: texture(placeholderWetness()),
     slabHalf: uniform(half),
