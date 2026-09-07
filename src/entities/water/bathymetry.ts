@@ -34,12 +34,13 @@ export function bakeBathymetry(options: {
   target.texture.magFilter = THREE.LinearFilter;
   target.texture.wrapS = target.texture.wrapT = THREE.ClampToEdgeWrapping;
 
-  // Straight down with +z as the camera's up, so v = 0 ↔ z = −half as in the height
-  // texture; that basis mirrors x (a right-handed camera looking down cannot give
-  // u ↔ +x and v ↔ +z at once), so the projection swaps left and right to undo it.
-  const camera = new THREE.OrthographicCamera(half, -half, half, -half, 0.1, 60);
+  // Straight down with −z as the camera's up: a render target's v = 0 is the top of
+  // the image here, so the top row is z = −half, as in the height texture, and the
+  // camera's right is +x, so u runs +x. (Measured: with +z up the bed came out
+  // mirrored in z — the boulders' footprints sat in the empty front corner.)
+  const camera = new THREE.OrthographicCamera(-half, half, half, -half, 0.1, 60);
   camera.position.set(0, 30, 0);
-  camera.up.set(0, 0, 1);
+  camera.up.set(0, 0, -1);
   camera.lookAt(0, 0, 0);
   camera.updateMatrixWorld();
 

@@ -262,7 +262,8 @@ export function createWater(options: WaterOptions): Water {
   foamSim.blending = THREE.NoBlending;
   foamSim.depthTest = false;
   foamSim.depthWrite = false;
-  foamSim.colorNode = Fn(() => {
+  foamSim.toneMapped = false;
+  foamSim.fragmentNode = Fn(() => {
     const q = uv();
     // Advection: with the simulated flow, or the primary swell's drift without it.
     const flow: THREE.Node = sim.stateNode.sample(q).gb.mul(foamDt);
@@ -595,6 +596,9 @@ export function createWater(options: WaterOptions): Water {
   // `?waterInspect=1` (or `=z:<metres>`) draws the map and a section on screen.
   (window as unknown as Record<string, unknown>).__water = {
     simStats: async () => sim.readStats(),
+    simProbe: async () => sim.readProbe(),
+    /** The GUI knobs, for scripts: set fields, then `apply()`. */
+    controls: () => water.controls,
     foamDebug: () => ({ isRenderTarget: (foamRead as unknown as { isRenderTarget?: boolean }).isRenderTarget, textures: foamRead.textures?.length, width: foamRead.width }),
     foamStats: async () => {
       const { size, foam, wetness } = await water.readFoamField();

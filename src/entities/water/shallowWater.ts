@@ -163,6 +163,8 @@ export class ShallowWater {
       material.depthTest = false;
       material.depthWrite = false;
       material.toneMapped = false;
+      // Data, not colour: written through `fragmentNode`, past the material's output
+      // chain (which clamps a signed value at zero on its way to the target).
       return material;
     };
 
@@ -179,7 +181,7 @@ export class ShallowWater {
 
     // --- one SSP-RK2 stage ---------------------------------------------------------
     const stageMaterial = dataMaterial();
-    stageMaterial.colorNode = Fn(() => {
+    stageMaterial.fragmentNode = Fn(() => {
       const q = uv();
       const cellIndex = q.mul(n).floor();
       const i = cellIndex.x;
@@ -325,7 +327,7 @@ export class ShallowWater {
 
     // --- initial state: a lake at rest --------------------------------------------
     const initMaterial = dataMaterial();
-    initMaterial.colorNode = Fn(() => {
+    initMaterial.fragmentNode = Fn(() => {
       const q = uv();
       const corner = (ox: number, oz: number): F => bedAt(asV2(q.add(vec2(ox, oz).mul(texel))));
       const bedCell = corner(-0.5, -0.5).add(corner(0.5, -0.5)).add(corner(-0.5, 0.5)).add(corner(0.5, 0.5)).mul(0.25);
@@ -335,7 +337,7 @@ export class ShallowWater {
 
     // --- view: (depth, u, v, foam source) for everything that draws the water ------
     const viewMaterial = dataMaterial();
-    viewMaterial.colorNode = Fn(() => {
+    viewMaterial.fragmentNode = Fn(() => {
       const q = uv();
       const U = (ox: number, oz: number): V3 => asV3(this.prevNode.sample(asV2(q.add(vec2(ox, oz).mul(texel)))).xyz);
       const corner = (ox: number, oz: number): F => bedAt(asV2(q.add(vec2(ox, oz).mul(texel))));
@@ -462,6 +464,33 @@ export class ShallowWater {
       foam[i] = decode(raw[i * 4 + 3]);
     }
     return { size, depth, u, v, foam };
+  }
+
+  /** The conservative state itself (w = η − level, hu, hv) at a few probe cells, for debugging the solver. */
+  async readProbe(): Promise<{ wMin: number; wMax: number; huMax: number; huMin: number; faceW: number[]; rowW: number[] }> {
+    const size = this.size;
+    const raw = await this.renderer.readRenderTargetPixelsAsync(this.stateA, 0, 0, size, size);
+    const decode = raw instanceof Uint16Array ? (x: number) => THREE.DataUtils.fromHalfFloat(x) : (x: number) => x;
+    let wMin = Infinity, wMax = -Infinity, huMax = 0, huMin = 0;
+    const j = Math.floor(size * 0.35);
+    const faceW: number[] = [];
+    const rowW: number[] = [];
+    for (let i = 0; i < size; i++) {
+      const k = (j * size + i) * 4;
+      const w = decode(raw[k]);
+      if (i < 8) faceW.push(Number(w.toFixed(4)));
+      if (i % 24 === 0) rowW.push(Number(w.toFixed(4)));
+    }
+    for (let k = 0; k < size * size; k++) {
+      const w = decode(raw[k * 4]);
+      const huSigned = decode(raw[k * 4 + 1]);
+      huMin = Math.min(huMin, huSigned);
+      const hu = Math.abs(huSigned);
+      // Only cells that can hold water: w below +0.5 m (land above that is just its own bed).
+      if (w < 0.5) { wMin = Math.min(wMin, w); wMax = Math.max(wMax, w); }
+      huMax = Math.max(huMax, hu);
+    }
+    return { wMin, wMax, huMax, huMin, faceW, rowW };
   }
 
   /** Min / max / mean of depth, |velocity| and foam over the grid. */

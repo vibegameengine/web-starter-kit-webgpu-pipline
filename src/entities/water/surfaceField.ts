@@ -62,7 +62,9 @@ export class SurfaceField {
     material.depthTest = false;
     material.depthWrite = false;
     const h = float(this.texel);
-    material.colorNode = Fn(() => {
+    material.toneMapped = false;
+    // Signed data (slopes), so the raw fragment output, not the colour chain.
+    material.fragmentNode = Fn(() => {
       const q = uv();
       // Texture v runs down the image; world +z runs down the slab in the same sense
       // as the simulation and the foam field (see ShallowWater.uvOf).
