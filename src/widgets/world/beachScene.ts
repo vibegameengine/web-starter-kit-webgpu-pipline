@@ -191,6 +191,8 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
 
   // --- water and backdrop (outside the GI) -------------------------------------
   const water = createWater({ renderer, field, environment, sun });
+  // The sand darkens where the simulated swash has been.
+  water.onField = (fieldTexture) => island.setWetness(fieldTexture);
   scene.add(water.group);
   const backdrop = createBackdrop({ islandBottom: field.bottom, islandHalf: field.half });
   scene.add(backdrop);

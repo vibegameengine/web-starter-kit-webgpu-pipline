@@ -4,6 +4,7 @@ import {
   color,
   exp,
   float,
+  max,
   mix,
   mx_fractal_noise_float,
   mx_noise_float,
@@ -13,6 +14,7 @@ import {
   positionWorld,
   smoothstep,
   step,
+  texture,
   transformNormalToView,
   uniform,
   vec3,
@@ -27,6 +29,12 @@ export interface SandMaterialUniforms {
   sunDir: ReturnType<typeof uniform>;
   /** Absorption per metre of the water above the floor (see water/medium.ts). */
   absorb: ReturnType<typeof uniform>;
+  /**
+   * Wetness written by the water simulation over the slab (R = foam, G = wetness,
+   * 0..1), sampled by world xz. Set to the live field once the water exists.
+   */
+  wetness: ReturnType<typeof texture>;
+  slabHalf: ReturnType<typeof uniform>;
 }
 
 /** Average of the dry albedo below; what the ray tracer reads for bounce colour. */
@@ -60,7 +68,11 @@ export function createSandMaterial(u: SandMaterialUniforms): THREE.MeshStandardN
 
   // Wet band: fully wet below the water line, dry a third of a metre up the beach.
   const aboveWater = p.y.sub(u.waterLevel);
-  const wet = smoothstep(0.34, 0.03, aboveWater);
+  // Wet where the swash has been (the simulation's wetness field), and always at and
+  // below the water line; the static band is only a floor under the live one.
+  const fieldUv = p.xz.div(vec3(u.slabHalf).x.mul(2.0)).add(0.5);
+  const swash = u.wetness.sample(fieldUv as unknown as ReturnType<typeof vec3>).g;
+  const wet = max(smoothstep(0.08, 0.0, aboveWater), smoothstep(0.15, 0.6, swash));
   const submerged = smoothstep(0.02, -0.06, aboveWater);
 
   const dry = color(0.86, 0.71, 0.48);

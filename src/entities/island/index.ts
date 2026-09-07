@@ -1,5 +1,5 @@
 import * as THREE from 'three/webgpu';
-import { uniform } from 'three/tsl';
+import { texture, uniform } from 'three/tsl';
 import { IslandField } from './heightField.ts';
 import { createSandMaterial, type SandMaterialUniforms } from './sandMaterial.ts';
 import { createCliffMaterial, type CliffTextures } from './cliffMaterial.ts';
@@ -17,6 +17,12 @@ export interface IslandOptions {
   wallSegments?: number;
 }
 
+function placeholderWetness(): THREE.DataTexture {
+  const tex = new THREE.DataTexture(new Uint8Array([0, 0, 0, 255]), 1, 1);
+  tex.needsUpdate = true;
+  return tex;
+}
+
 export interface Island {
   group: THREE.Group;
   sand: THREE.Mesh;
@@ -24,6 +30,8 @@ export interface Island {
   bottom: THREE.Mesh;
   uniforms: SandMaterialUniforms;
   update(timeSec: number, sunColor: THREE.Color, sunDir: THREE.Vector3): void;
+  /** Points the sand at the water's live foam/wetness field (swapped per frame by the water). */
+  setWetness(field: THREE.Texture): void;
 }
 
 /**
@@ -43,6 +51,9 @@ export function createIsland(options: IslandOptions): Island {
     waterLevel: uniform(field.waterLevel),
     sunDir: uniform(new THREE.Vector3(0, 1, 0)),
     absorb: uniform(WATER_ABSORB.clone()),
+    // Placeholder until the water hands over its live field (see `setWetness`).
+    wetness: texture(placeholderWetness()),
+    slabHalf: uniform(half),
   };
 
   const group = new THREE.Group();
@@ -172,6 +183,9 @@ export function createIsland(options: IslandOptions): Island {
     walls,
     bottom,
     uniforms,
+    setWetness(field) {
+      uniforms.wetness.value = field;
+    },
     update(timeSec, sunColor, sunDir) {
       uniforms.time.value = timeSec;
       (uniforms.sunColor.value as THREE.Color).copy(sunColor);

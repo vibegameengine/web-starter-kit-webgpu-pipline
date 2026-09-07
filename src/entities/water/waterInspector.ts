@@ -21,14 +21,17 @@ export class WaterInspector {
   private nextReadAt = 0;
   private busy = false;
   private sectionZ: number;
+  private readonly readFoam: (() => Promise<{ size: number; foam: Float32Array; wetness: Float32Array }>) | null;
+  private foamField: { size: number; foam: Float32Array; wetness: Float32Array } | null = null;
 
   constructor(
     renderer: THREE.WebGPURenderer,
     private readonly sim: ShallowWater,
     private readonly field: IslandField,
-    options: { sectionZ?: number } = {},
+    options: { sectionZ?: number; readFoam?: () => Promise<{ size: number; foam: Float32Array; wetness: Float32Array }> } = {},
   ) {
     void renderer;
+    this.readFoam = options.readFoam ?? null;
     this.sectionZ = options.sectionZ ?? -1.0;
     this.canvas = document.createElement('canvas');
     this.canvas.width = 900;
@@ -43,7 +46,8 @@ export class WaterInspector {
     if (this.busy || now < this.nextReadAt) return;
     this.busy = true;
     this.nextReadAt = now + 1000;
-    void this.sim.readState().then((state) => {
+    void Promise.all([this.sim.readState(), this.readFoam ? this.readFoam() : Promise.resolve(null)]).then(([state, foamField]) => {
+      this.foamField = foamField;
       this.draw(state);
       this.busy = false;
     }).catch((error) => {
@@ -83,7 +87,14 @@ export class WaterInspector {
           etaMin = Math.min(etaMin, eta); etaMax = Math.max(etaMax, eta);
           wet++;
         } else {
-          image.data[o] = 40; image.data[o + 1] = 34; image.data[o + 2] = 26;
+          // Dry sand, darkened by the wetness field (the swash that has been here).
+          let wetness = 0;
+          if (this.foamField) {
+            const fs = this.foamField.size;
+            wetness = this.foamField.wetness[Math.floor((j / mapSize) * fs) * fs + Math.floor((i / mapSize) * fs)];
+          }
+          const k2 = 1 - 0.7 * Math.min(1, wetness);
+          image.data[o] = 170 * k2; image.data[o + 1] = 140 * k2; image.data[o + 2] = 100 * k2;
         }
         image.data[o + 3] = 255;
       }
