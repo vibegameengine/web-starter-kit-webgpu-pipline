@@ -49,18 +49,7 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
 
   // Sun: the direction is derived from the environment map by the app; here only the
   // shadow footprint, sized to the slab and its palms.
-  // Exactly the Cornell sun shadow (content.ts), with the ortho footprint widened
-  // from ±15 to cover the 12 m slab and its palms. Nothing else differs.
-  sun.castShadow = true;
-  sun.shadow.mapSize.width = 4096;
-  sun.shadow.mapSize.height = 4096;
-  sun.shadow.camera.near = 0.1;
-  sun.shadow.camera.far = 100;
-  sun.shadow.camera.top = 12;
-  sun.shadow.camera.bottom = -12;
-  sun.shadow.camera.left = -12;
-  sun.shadow.camera.right = 12;
-  sun.shadow.bias = -0.0003;
+  // Sun and shadow are the pipeline's (features/lighting-pipeline); nothing here.
 
   // --- textures ------------------------------------------------------------------
   const base = import.meta.env.BASE_URL;
