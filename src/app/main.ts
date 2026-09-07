@@ -27,7 +27,7 @@ import {
 } from '../shared/gi/surfel/lighting.ts';
 import { applyOcclusionSettings } from '../shared/gi/surfel/surfelRadialDepth.ts';
 import { MAX_TEMPORAL_M } from '../shared/gi/surfel/constants.ts';
-import { giLightSummary } from '../shared/gi/surfel/sceneLights.ts';
+import { U_GI_MEDIUM, giLightSummary } from '../shared/gi/surfel/sceneLights.ts';
 import {
   addDynamicSphere,
   createBeachScene,
@@ -83,7 +83,11 @@ async function boot(): Promise<void> {
   const { renderer } = await initRenderer();
 
   const gui = new GUI({ title: 'Elderwood' });
-  if (!showChrome) gui.hide();
+  if (!showChrome) {
+    gui.hide();
+    // The Inspector's fps widget is chrome too; a judged frame must not carry it.
+    (renderer.inspector as unknown as { domElement?: HTMLElement }).domElement?.style.setProperty('display', 'none');
+  }
 
   setLoading('Loading GI assets');
   const gi = await SurfelGI.create(renderer);
@@ -205,7 +209,10 @@ async function boot(): Promise<void> {
   let bakedSunVersion = -1;
   let baked = false;
   const bakeCache = { source: 'none', storage: 'none', key: '', saved: false, error: '' };
-  let readBakeControls = () => ({ envIntensity: envIntensityParam, envLod: 4, fromDirect: 1, fromIndirect: 1, albedoBoost: 1 });
+  // The water medium the tracer attenuates sunlight through is bakeable state too,
+  // and so are the art-directed sun angles.
+  const bakeMedium = () => (U_GI_MEDIUM.value as THREE.Vector4).toArray();
+  let readBakeControls = () => ({ envIntensity: envIntensityParam, envLod: 4, fromDirect: 1, fromIndirect: 1, albedoBoost: 1, medium: bakeMedium(), sun: [lightCfg.azimuthDeg, lightCfg.elevationDeg, lightCfg.intensity] });
 
   // Declared here rather than with the rest of the GUI because the mode switch reads
   // them: switching to lightmap means "bake with the current settings".
@@ -457,7 +464,7 @@ async function boot(): Promise<void> {
     fromIndirect: 1,
     albedoBoost: 1,
   };
-  readBakeControls = () => ({ envIntensity: giParams.envIntensity, envLod: giParams.envLod, fromDirect: giParams.fromDirect, fromIndirect: giParams.fromIndirect, albedoBoost: giParams.albedoBoost });
+  readBakeControls = () => ({ envIntensity: giParams.envIntensity, envLod: giParams.envLod, fromDirect: giParams.fromDirect, fromIndirect: giParams.fromIndirect, albedoBoost: giParams.albedoBoost, medium: bakeMedium(), sun: [lightCfg.azimuthDeg, lightCfg.elevationDeg, lightCfg.intensity] });
   gi.setBaseSampleCount(giParams.baseSamples);
 
   const giFolder = gui.addFolder('GI (surfel)');

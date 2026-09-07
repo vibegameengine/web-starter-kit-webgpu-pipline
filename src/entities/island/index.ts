@@ -3,6 +3,7 @@ import { uniform } from 'three/tsl';
 import { IslandField } from './heightField.ts';
 import { createSandMaterial, type SandMaterialUniforms } from './sandMaterial.ts';
 import { createCliffMaterial, type CliffTextures } from './cliffMaterial.ts';
+import { WATER_ABSORB } from '../water/medium.ts';
 
 export { IslandField } from './heightField.ts';
 export { SAND_AVERAGE_COLOR } from './sandMaterial.ts';
@@ -22,7 +23,7 @@ export interface Island {
   walls: THREE.Mesh[];
   bottom: THREE.Mesh;
   uniforms: SandMaterialUniforms;
-  update(timeSec: number, sunColor: THREE.Color): void;
+  update(timeSec: number, sunColor: THREE.Color, sunDir: THREE.Vector3): void;
 }
 
 /**
@@ -40,6 +41,8 @@ export function createIsland(options: IslandOptions): Island {
     time: uniform(0),
     sunColor: uniform(new THREE.Color(1, 0.95, 0.85)),
     waterLevel: uniform(field.waterLevel),
+    sunDir: uniform(new THREE.Vector3(0, 1, 0)),
+    absorb: uniform(WATER_ABSORB.clone()),
   };
 
   const group = new THREE.Group();
@@ -169,9 +172,10 @@ export function createIsland(options: IslandOptions): Island {
     walls,
     bottom,
     uniforms,
-    update(timeSec, sunColor) {
+    update(timeSec, sunColor, sunDir) {
       uniforms.time.value = timeSec;
       (uniforms.sunColor.value as THREE.Color).copy(sunColor);
+      (uniforms.sunDir.value as THREE.Vector3).copy(sunDir);
     },
   };
 }

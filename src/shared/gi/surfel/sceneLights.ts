@@ -94,6 +94,19 @@ export const U_GI_EMISSIVE_SCALE = uniform(1);
  */
 export const U_GI_EMISSIVE_BASE = uniform(-1);
 
+/**
+ * A horizontal slab of absorbing medium (water): `x` is its surface height, `yzw` the
+ * absorption per metre. Sunlight reaching a hit below the surface is attenuated along
+ * its slanted path through the water, so light bouncing off a lagoon floor arrives on
+ * the neighbours already coloured by the water. `x = -1e9` disables it. Set once per
+ * scene; it is part of the bake key.
+ */
+export const U_GI_MEDIUM = uniform(new THREE.Vector4(-1e9, 0, 0, 0));
+
+export function setGiMedium(level: number, absorb: THREE.Vector3): void {
+  (U_GI_MEDIUM.value as THREE.Vector4).set(level, absorb.x, absorb.y, absorb.z);
+}
+
 const _pos = new THREE.Vector3();
 const _target = new THREE.Vector3();
 const _dir = new THREE.Vector3();

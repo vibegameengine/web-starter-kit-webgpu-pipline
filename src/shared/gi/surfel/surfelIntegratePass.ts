@@ -60,6 +60,7 @@ import {
   U_GI_EMISSIVE_BASE,
   U_GI_EMISSIVE_SCALE,
   U_GI_LIGHT_COUNT,
+  U_GI_MEDIUM,
   U_GI_LIGHT_SAMPLES,
   giLightsTexture,
   syncSceneLights,
@@ -929,6 +930,7 @@ export function createSurfelIntegratePass(
           dynTrace: f32,
           dynBounds: vec4f,
           diffuseLodScale: f32,
+          medium: vec4f,
         ) -> void {
           let index = instanceIndex;
           // let total = atomicLoad(&poolMax[0]);
@@ -993,7 +995,9 @@ export function createSurfelIntegratePass(
           let boostCount = select(0u, 12u, msmeState.inconsistency > 0.3);
           var sampleCount = baseCount + boostCount;
 
-          let warmup = (sinceBirth <= 4u);
+          // A rigid receiver can retain its surface anchor while a teleport
+          // invalidates its lighting history. Warm that history just like a newborn.
+          let warmup = (sinceBirth <= 4u) || (prevCount < 32.0);
           // let warmup = (sinceBirth <= 2u) || (prevCount < 32.0);  // <-- tune threshold
           if (warmup) { sampleCount = 32u; }
 
@@ -1146,7 +1150,7 @@ export function createSurfelIntegratePass(
                 bounceLi += giShadeHit(
                   lightsTex, hitPoint, hitNormal, hitAlbedo, eps,
                   dynTrace, dynBounds,
-                  lightCount, lightSamples, lightU
+                  lightCount, lightSamples, lightU, medium
                 ) * giFromDirect;
 
                 // Emission is added raw. It is not multiplied by the hit's albedo (a
@@ -1331,6 +1335,7 @@ export function createSurfelIntegratePass(
         lightSamples: U_GI_LIGHT_SAMPLES,
         emissiveBase: U_GI_EMISSIVE_BASE,
         emissiveScale: U_GI_EMISSIVE_SCALE,
+        medium: U_GI_MEDIUM,
         camPos: U_CAM_POS,
         gridOrigin: U_GRID_ORIGIN,
         blueNoiseTex: blueNoiseTexN,

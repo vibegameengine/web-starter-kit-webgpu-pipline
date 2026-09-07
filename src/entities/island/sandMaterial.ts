@@ -23,6 +23,10 @@ export interface SandMaterialUniforms {
   sunColor: ReturnType<typeof uniform>;
   /** Water level in world metres. */
   waterLevel: ReturnType<typeof uniform>;
+  /** Unit vector toward the sun; sets the slant of the light path through the water. */
+  sunDir: ReturnType<typeof uniform>;
+  /** Absorption per metre of the water above the floor (see water/medium.ts). */
+  absorb: ReturnType<typeof uniform>;
 }
 
 /** Average of the dry albedo below; what the ray tracer reads for bounce colour. */
@@ -66,7 +70,11 @@ export function createSandMaterial(u: SandMaterialUniforms): THREE.MeshStandardN
   const speck = step(0.78, mx_noise_float(p.mul(160.0).add(vec3(0.0, 13.0, 0.0))));
   const albedoBase = mix(dry, wetTint, wet).mul(float(1.0).add(dark));
   const albedo = mix(albedoBase, albedoBase.mul(0.55), speck.mul(0.6));
-  material.colorNode = albedo;
+  // Below the water line the sun arrives through the water: the floor is lit by what
+  // the medium let through, same absorption the tracer and the water surface use.
+  const sunPath = u.waterLevel.sub(p.y).max(0.0).div(vec3(u.sunDir).y.max(0.08));
+  const litThroughWater = exp(vec3(u.absorb).mul(sunPath).negate());
+  material.colorNode = albedo.mul(litThroughWater);
 
   material.roughnessNode = mix(float(0.92), float(0.30), wet);
 

@@ -209,6 +209,7 @@ export const giShadeHit = wgslFn(
     lightCount: u32,
     lightSamples: u32,
     rnd: f32,
+    medium: vec4f,
   ) -> vec3f {
     let count = min( lightCount, MAX_GI_LIGHTS );
     if ( count == 0u ) { return vec3f(0.0); }
@@ -244,7 +245,14 @@ export const giShadeHit = wgslFn(
       if ( reach <= 0.0 ) { continue; }
       if ( giOccluded( ray, reach, dynEnabled, dynBounds ) ) { continue; }
 
-      sum += s.radiance * albedo * NdotL * ( 1.0 / PI );
+      var radiance = s.radiance;
+      // Below the water line the light has crossed the medium on a slanted path; the
+      // shadow ray above already answered "is it blocked", this answers "what colour".
+      if ( p.y < medium.x ) {
+        let path = ( medium.x - p.y ) / max( 0.08, s.dir.y );
+        radiance *= exp( -medium.yzw * path );
+      }
+      sum += radiance * albedo * NdotL * ( 1.0 / PI );
     }
 
     return sum * weight;

@@ -1,5 +1,6 @@
 import * as THREE from 'three/webgpu';
 import type { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { CSMShadowNode } from 'three/examples/jsm/csm/CSMShadowNode.js';
 
 import { createScene } from '../../shared/gi/surfel/scene.ts';
 import { Layer, Mobility, applyMobility } from '../../shared/world/index.ts';
@@ -11,6 +12,8 @@ import { createRock, createRockMaterial, type RockTextures } from '../../entitie
 import { createPalm, type Palm } from '../../entities/palm/index.ts';
 import { createShrub, type Shrub } from '../../entities/shrub/index.ts';
 import { updateFoliageSun } from '../../entities/foliage/translucency.ts';
+import { WATER_ABSORB } from '../../entities/water/medium.ts';
+import { setGiMedium } from '../../shared/gi/surfel/sceneLights.ts';
 
 export interface BeachScene {
   scene: THREE.Scene;
@@ -53,16 +56,19 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
   // is what lights both visible cut faces and keeps the palm shadows off the beach.
   sun.color.setRGB(1.0, 0.88, 0.70);
   sun.castShadow = true;
-  sun.shadow.mapSize.set(4096, 4096);
+  sun.shadow.mapSize.set(2048, 2048);
   sun.shadow.camera.near = 1;
   sun.shadow.camera.far = 120;
-  sun.shadow.camera.left = -17;
-  sun.shadow.camera.right = 17;
-  sun.shadow.camera.top = 17;
-  sun.shadow.camera.bottom = -17;
   sun.shadow.bias = -0.0004;
   sun.shadow.normalBias = 0.02;
   sun.shadow.radius = 2;
+  // Cascaded shadows: the map resolution follows the camera. Three cascades split
+  // the view frustum out to 60 m, so the slab under the camera gets the finest
+  // texels and the far palm crowns still cast; the cascade frusta are rebuilt from
+  // the camera each frame, so orbiting keeps the near cascade near.
+  const csm = new CSMShadowNode(sun, { cascades: 3, maxFar: 60, mode: 'practical', lightMargin: 25 });
+  csm.fade = true;
+  sun.shadow.shadowNode = csm;
 
   // --- textures ------------------------------------------------------------------
   const base = import.meta.env.BASE_URL;
@@ -87,6 +93,8 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
 
   // --- island --------------------------------------------------------------------
   const field = new IslandField(7, 6, -3.2);
+  // The tracer attenuates sunlight through the lagoon: bounce off the floor is teal.
+  setGiMedium(field.waterLevel, WATER_ABSORB);
   const island = createIsland({ field, textures: cliffTextures });
   scene.add(island.group);
   applyMobility(island.group, Mobility.Static);
@@ -211,6 +219,7 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
     studioFloor.layers.set(Layer.GiStatic);
   }
 
+  const sunDirection = new THREE.Vector3();
   return {
     scene,
     camera,
@@ -219,7 +228,7 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
     water,
     field,
     update(elapsedSeconds) {
-      island.update(elapsedSeconds, sun.color);
+      island.update(elapsedSeconds, sun.color, sunDirection.copy(sun.position).sub(sun.target.position).normalize());
       water.update();
       updateFoliageSun(sun);
       for (const palm of palms) palm.update(elapsedSeconds);

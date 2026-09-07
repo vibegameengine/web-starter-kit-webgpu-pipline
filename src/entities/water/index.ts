@@ -34,6 +34,7 @@ import {
   vec4,
 } from 'three/tsl';
 import type { IslandField } from '../island/heightField.ts';
+import { WATER_ABSORB } from './medium.ts';
 
 export interface WaterOptions {
   field: IslandField;
@@ -82,7 +83,7 @@ export function createWater(options: WaterOptions): Water {
   heightTexture.name = 'islandHeight';
 
   const uniforms = {
-    absorb: uniform(new THREE.Vector3(2.0, 0.36, 0.15)),
+    absorb: uniform(WATER_ABSORB.clone()),
     scatter: uniform(new THREE.Color(0.005, 0.135, 0.30)),
     scatterStrength: uniform(1.0),
     envStrength: uniform(0.7),
