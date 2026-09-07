@@ -48,7 +48,7 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
   controls.target.set(0.4, -0.7, 0.0);
   // Close-up presets for judging detail: `?cam=shore|rocks|water|wide`.
   const presets: Record<string, [THREE.Vector3, THREE.Vector3]> = {
-    shore: [new THREE.Vector3(3.2, 2.6, 5.2), new THREE.Vector3(1.2, -0.3, 1.2)],
+    shore: [new THREE.Vector3(1.8, 2.4, 6.5), new THREE.Vector3(0.2, -0.3, 1.5)],
     rocks: [new THREE.Vector3(-5.5, 3.0, 0.5), new THREE.Vector3(-2.5, -0.4, -3.8)],
     water: [new THREE.Vector3(-2.0, 3.5, 7.5), new THREE.Vector3(-1.5, -0.6, 1.5)],
   };

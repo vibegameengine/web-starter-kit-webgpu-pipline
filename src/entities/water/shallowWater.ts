@@ -7,7 +7,7 @@ import {
   length,
   max,
   min,
-  select,
+  mix,
   sin,
   smoothstep,
   step,
@@ -169,6 +169,14 @@ export class ShallowWater {
         // No pipe through the slab boundary.
         next[components[i]].assign(accelerated.mul(inside(qn)));
       });
+      // A little of the neighbours' flow in each pipe: the collocated scheme's
+      // odd-even mode (a sawtooth at cell scale) has nothing else to damp it.
+      const fl = this.fluxPrev.sample(asUv(q.sub(vec2(texel, 0.0))));
+      const fr = this.fluxPrev.sample(asUv(q.add(vec2(texel, 0.0))));
+      const fb = this.fluxPrev.sample(asUv(q.sub(vec2(0.0, texel))));
+      const ff = this.fluxPrev.sample(asUv(q.add(vec2(0.0, texel))));
+      const smoothed = fl.add(fr).add(fb).add(ff).mul(0.25);
+      next.assign(mix(next, max(smoothed, 0.0), 0.08));
       // Never drain more than the column holds this step.
       const total = next.x.add(next.y).add(next.z).add(next.w);
       const scale = min(float(1.0), d.mul(l).mul(l).div(total.mul(dt).add(1e-6)));
@@ -210,7 +218,10 @@ export class ShallowWater {
       const generatorF = smoothstep(0.97, 1.0, q.y);
       const generator = max(generatorL, generatorF);
       const forced = max(swell.sub(b), 0.0);
-      d.assign(select(generator.greaterThan(0.001), forced.mul(generator).add(d.mul(float(1.0).sub(generator))), d));
+      // Relax toward the incoming wave rather than impose it: a hard-set column next
+      // to a free one is a step every sub-step, and the grid rings at its own scale.
+      const relax = generator.mul(dt.mul(12.0)).min(1.0);
+      d.assign(mix(d, forced, relax));
 
       // Foam is born where the flow is fast over shallow water (breaking, run-up)
       // and where the flow converges hard.
@@ -226,7 +237,7 @@ export class ShallowWater {
 
   /** Largest stable sub-step for the deepest water the slab can hold. */
   stableStep(maxDepth: number): number {
-    return (0.5 * this.cell) / Math.sqrt(9.81 * Math.max(0.05, maxDepth));
+    return (0.4 * this.cell) / Math.sqrt(9.81 * Math.max(0.05, maxDepth));
   }
 
   /** Advances the water by `dt` seconds, in as many sub-steps as CFL requires. */
