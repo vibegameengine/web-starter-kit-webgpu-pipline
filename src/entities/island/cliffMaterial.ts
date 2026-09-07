@@ -49,6 +49,9 @@ export function createCliffMaterial(tex: CliffTextures): THREE.MeshStandardNodeM
   material.map = tex.dirtColor;
   material.roughness = 0.95;
   material.metalness = 0;
+  // Both sides: a view ray refracted through the lagoon can leave the slab through
+  // a cut face and must find the wall from the inside, or the water shows the backdrop.
+  material.side = THREE.DoubleSide;
   material.name = 'cliff';
   material.userData.lightmapAlbedo = true;
 

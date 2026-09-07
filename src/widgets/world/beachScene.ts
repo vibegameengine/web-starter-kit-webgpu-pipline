@@ -46,6 +46,17 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
   camera.updateProjectionMatrix();
   camera.position.set(-15.5, 14.5, 20.5);
   controls.target.set(0.4, -0.7, 0.0);
+  // Close-up presets for judging detail: `?cam=shore|rocks|water|wide`.
+  const presets: Record<string, [THREE.Vector3, THREE.Vector3]> = {
+    shore: [new THREE.Vector3(3.2, 2.6, 5.2), new THREE.Vector3(1.2, -0.3, 1.2)],
+    rocks: [new THREE.Vector3(-5.5, 3.0, 0.5), new THREE.Vector3(-2.5, -0.4, -3.8)],
+    water: [new THREE.Vector3(-2.0, 3.5, 7.5), new THREE.Vector3(-1.5, -0.6, 1.5)],
+  };
+  const preset = presets[new URLSearchParams(window.location.search).get('cam') ?? ''];
+  if (preset) {
+    camera.position.copy(preset[0]);
+    controls.target.copy(preset[1]);
+  }
   controls.update();
   camera.layers.enable(Layer.Debug);
 
@@ -179,7 +190,7 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
   }
 
   // --- water and backdrop (outside the GI) -------------------------------------
-  const water = createWater({ field, environment, sun });
+  const water = createWater({ renderer, field, environment, sun });
   scene.add(water.group);
   const backdrop = createBackdrop({ islandBottom: field.bottom, islandHalf: field.half });
   scene.add(backdrop);
@@ -206,7 +217,7 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
     bindScreen: water.bindScreen,
     update(elapsedSeconds) {
       island.update(elapsedSeconds, sun.color, sunDirection.copy(sun.position).sub(sun.target.position).normalize());
-      water.update();
+      water.update(elapsedSeconds);
       updateFoliageSun(sun);
       for (const palm of palms) palm.update(elapsedSeconds);
       for (const shrub of shrubs) shrub.update(elapsedSeconds);

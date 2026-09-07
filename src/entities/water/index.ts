@@ -17,6 +17,7 @@ import {
   float,
   getViewPosition,
   max,
+  min,
   mix,
   mx_fractal_noise_float,
   mx_noise_float,
@@ -37,14 +38,18 @@ import {
   time,
   transformNormalToView,
   uniform,
+  uv,
   vec2,
   vec3,
   vec4,
 } from 'three/tsl';
 import type { IslandField } from '../island/heightField.ts';
 import { WATER_ABSORB } from './medium.ts';
+import { ShallowWater } from './shallowWater.ts';
+import { WaterInspector } from './waterInspector.ts';
 
 export interface WaterOptions {
+  renderer: THREE.WebGPURenderer;
   field: IslandField;
   /** Equirectangular HDR the sky reflection is read from. */
   environment: THREE.Texture;
@@ -72,7 +77,8 @@ export interface Water {
    * pipeline), so this is called once per frame-graph rebuild, not per frame.
    */
   bindScreen(color: THREE.Texture, depth: THREE.Texture): void;
-  update(): void;
+  /** Advances the foam field by the elapsed time and refreshes the sun uniforms. */
+  update(elapsedSeconds: number): void;
 }
 
 /** One Gerstner wave: direction, wavelength, amplitude, steepness. */
@@ -104,7 +110,7 @@ const GRAVITY = 9.81;
  * Only the pipeline's overlay pass draws it (`Layer.Overlay`); the GI never sees it.
  */
 export function createWater(options: WaterOptions): Water {
-  const { field, environment, sun, cutDepth = 3.0 } = options;
+  const { renderer, field, environment, sun, cutDepth = 3.0 } = options;
   const half = field.half;
 
   const heightTexture = field.toTexture(256);
@@ -116,14 +122,30 @@ export function createWater(options: WaterOptions): Water {
     scatterStrength: uniform(1.0),
     envStrength: uniform(0.55),
     foamStrength: uniform(1.0),
-    causticStrength: uniform(1.4),
+    causticStrength: uniform(1.0),
     refractionStrength: uniform(0.06),
     sunColor: uniform(new THREE.Color(1, 0.95, 0.85)),
     sunDir: uniform(new THREE.Vector3(0, 1, 0)),
   };
   const waterLevel = uniform(field.waterLevel);
   const slabHalf = uniform(half);
-  const debugMode = new URLSearchParams(window.location.search).get('waterDebug');
+  const params = new URLSearchParams(window.location.search);
+  const debugMode = params.get('waterDebug');
+  // The physical surface: shallow-water equations on the bathymetry. `?waterSim=0`
+  // falls back to the analytic Gerstner swell.
+  const useSim = params.get('waterSim') !== '0';
+  const sim = useSim
+    ? new ShallowWater({ renderer, bathymetry: heightTexture, half, waterLevel: field.waterLevel, size: 512 })
+    : null;
+  // The deepest water the floor allows, for the CFL sub-step; the slab bottom is not it.
+  let maxDepth = 0.2;
+  for (let j = 0; j < 64; j++) for (let i = 0; i < 64; i++) {
+    const x = -half + ((i + 0.5) / 64) * 2 * half;
+    const z = -half + ((j + 0.5) / 64) * 2 * half;
+    maxDepth = Math.max(maxDepth, field.waterLevel - field.height(x, z));
+  }
+  maxDepth += 0.15;
+  sim?.preroll(4.0, maxDepth);
 
   /** Sand height (with boulders stamped in) under (x, z); +z is row-down in the texture. */
   const sandHeight = Fn(([xz]: [ReturnType<typeof vec2>]) => {
@@ -189,20 +211,103 @@ export function createWater(options: WaterOptions): Water {
     return vec4(n, jacobian);
   });
 
+  /** Free-surface height η = b + d from the simulation; dry cells sit below the sand. */
+  const simSurface = sim
+    ? Fn(([xz]: [ReturnType<typeof vec2>]) => {
+        const q = sim.uvOf(xz);
+        const d = ((sim.stateNode.sample(q) as typeof sim.stateNode).level(float(0.0)) as ReturnType<typeof vec4>).r;
+        const b = (texture(heightTexture, q).level(float(0.0)) as ReturnType<typeof vec4>).r;
+        // A thin film on high ground (a boulder's flank) must not lift the sheet into
+        // a wall: the surface never rises past the level plus the largest wave.
+        return select(d.greaterThan(0.003), min(b.add(d), waterLevel.add(0.12)), waterLevel.sub(0.15));
+      })
+    : null;
+
   /** Two drifting Worley layers; the cell edges are the bright caustic filaments. */
   const caustic = Fn(([xz, depth]: [ReturnType<typeof vec2>, ReturnType<typeof float>]) => {
     const t = time;
-    const q1 = vec3(xz.x.mul(3.0).add(t.mul(0.12)), xz.y.mul(3.0).sub(t.mul(0.09)), t.mul(0.30));
-    const q2 = vec3(xz.x.mul(4.2).sub(t.mul(0.08)), xz.y.mul(4.2).add(t.mul(0.13)), t.mul(0.24).add(5.0));
+    const q1 = vec3(xz.x.mul(6.5).add(t.mul(0.12)), xz.y.mul(6.5).sub(t.mul(0.09)), t.mul(0.30));
+    const q2 = vec3(xz.x.mul(9.0).sub(t.mul(0.08)), xz.y.mul(9.0).add(t.mul(0.13)), t.mul(0.24).add(5.0));
     const w1 = mx_worley_noise_vec2(q1, 1.0);
     const w2 = mx_worley_noise_vec2(q2, 1.0);
-    const line1 = smoothstep(0.07, 0.0, w1.y.sub(w1.x));
-    const line2 = smoothstep(0.07, 0.0, w2.y.sub(w2.x));
+    const line1 = smoothstep(0.10, 0.0, w1.y.sub(w1.x));
+    const line2 = smoothstep(0.10, 0.0, w2.y.sub(w2.x));
     const filaments = line1.mul(0.6).add(line2.mul(0.6)).add(line1.mul(line2).mul(1.8));
     // Fade in just below the surface, decay with depth as the light spreads.
     const fade = smoothstep(0.0, 0.05, depth).mul(exp(depth.mul(-1.5)));
     return filaments.mul(fade);
   });
+
+  // --- persistent foam field ---------------------------------------------------
+  // Sea of Thieves / Tidewater recipe: foam is born where the surface folds (Jacobian)
+  // and where the water is shallow against sand or a boulder, drifts with the swell
+  // toward the beach, spreads, and decays. A ping-pong texture over the slab, one
+  // quad draw per frame; the surface shader reads it by world xz.
+  const FOAM_SIZE = 1024;
+  const makeFoamTarget = () => {
+    const target = new THREE.RenderTarget(FOAM_SIZE, FOAM_SIZE, {
+      type: THREE.HalfFloatType,
+      format: THREE.RGBAFormat,
+      depthBuffer: false,
+      generateMipmaps: false,
+    });
+    target.texture.minFilter = THREE.LinearFilter;
+    target.texture.magFilter = THREE.LinearFilter;
+    target.texture.wrapS = target.texture.wrapT = THREE.ClampToEdgeWrapping;
+    return target;
+  };
+  let foamRead = makeFoamTarget();
+  let foamWrite = makeFoamTarget();
+  const foamPrev = texture(foamRead.texture);
+  /** The field as the surface reads it; its texture is swapped after every step. */
+  const foamField = texture(foamRead.texture);
+  const foamDt = uniform(1 / 60);
+  const foamDecaySeconds = uniform(2.8);
+  const foamDriftMetresPerSecond = uniform(0.18);
+
+  const foamSim = new THREE.MeshBasicNodeMaterial();
+  foamSim.name = 'lagoonFoamField';
+  foamSim.blending = THREE.NoBlending;
+  foamSim.depthTest = false;
+  foamSim.depthWrite = false;
+  foamSim.colorNode = Fn(() => {
+    const q = uv();
+    const xz = q.sub(0.5).mul(2.0).mul(slabHalf);
+    // Advection: with the simulated flow, or the primary swell's drift without it.
+    const flow: THREE.Node = sim ? sim.stateNode.sample(q).gb.mul(foamDt) : vec2(WAVES[0].dx, WAVES[0].dz).mul(foamDriftMetresPerSecond).mul(foamDt);
+    const from = q.sub((flow as ReturnType<typeof vec2>).div(slabHalf.mul(2.0)));
+    const texel = float(1.5 / FOAM_SIZE);
+    const spread = foamPrev.sample(from).r
+      .add(foamPrev.sample(from.add(vec2(texel, 0.0))).r)
+      .add(foamPrev.sample(from.sub(vec2(texel, 0.0))).r)
+      .add(foamPrev.sample(from.add(vec2(0.0, texel))).r)
+      .add(foamPrev.sample(from.sub(vec2(0.0, texel))).r)
+      .mul(0.2);
+    const decayed = spread.mul(exp(foamDt.negate().div(foamDecaySeconds)));
+
+    const depth = waterLevel.sub(sandHeight(xz));
+    const lace = mx_fractal_noise_float(vec3(xz.x.mul(3.0), xz.y.mul(3.0), time.mul(0.3)), 3, 2.2, 0.55).mul(0.5).add(0.5);
+    const crest = sim ? sim.stateNode.sample(q).a : smoothstep(0.15, -0.35, gerstnerNormalJacobian(xz).w);
+    const shallow = smoothstep(0.42, 0.0, depth).mul(smoothstep(-0.04, 0.04, depth));
+    const shore = shallow.mul(smoothstep(0.25, 0.75, lace)).mul(0.9);
+    const born = max(crest.mul(0.85), shore);
+    const foam = max(decayed, born);
+    return vec4(foam, 0.0, 0.0, 1.0);
+  })();
+  const foamQuad = new THREE.QuadMesh(foamSim);
+
+  const stepFoam = (dt: number) => {
+    foamDt.value = Math.min(0.05, Math.max(0.001, dt));
+    foamPrev.value = foamRead.texture;
+    const previousTarget = renderer.getRenderTarget();
+    renderer.setRenderTarget(foamWrite);
+    foamQuad.render(renderer);
+    renderer.setRenderTarget(previousTarget);
+    const swap = foamRead;
+    foamRead = foamWrite;
+    foamWrite = swap;
+    foamField.value = foamRead.texture;
+  };
 
   function buildMaterial(screen: { color: THREE.Texture; depth: THREE.Texture }, top: boolean): THREE.MeshStandardNodeMaterial {
     const material = new THREE.MeshStandardNodeMaterial();
@@ -220,14 +325,25 @@ export function createWater(options: WaterOptions): Water {
     const t = time;
 
     if (top) {
-      material.positionNode = positionLocal.add(gerstnerDisplacement(positionLocal.xz));
+      material.positionNode = simSurface
+        ? vec3(positionLocal.x, simSurface(positionLocal.xz).mul(rimMask(positionLocal.xz)).add(waterLevel.mul(rimMask(positionLocal.xz).oneMinus())), positionLocal.z)
+        : positionLocal.add(gerstnerDisplacement(positionLocal.xz));
     }
 
     // --- normal ------------------------------------------------------------------
-    const wave = top ? gerstnerNormalJacobian(p.xz) : vec4(normalWorld, 1.0);
+    const wave = top && !sim ? gerstnerNormalJacobian(p.xz) : vec4(normalWorld, 1.0);
+    const simNormal = sim && simSurface && top
+      ? Fn(() => {
+          // Gradient of the simulated surface at cell spacing.
+          const h = float(sim.cell);
+          const ex = simSurface(p.xz.add(vec2(h, 0.0))).sub(simSurface(p.xz.sub(vec2(h, 0.0)))).div(h.mul(2.0));
+          const ez = simSurface(p.xz.add(vec2(0.0, h))).sub(simSurface(p.xz.sub(vec2(0.0, h)))).div(h.mul(2.0));
+          return normalize(vec3(ex.negate(), 1.0, ez.negate()));
+        })()
+      : null;
     const nWorld = Fn(() => {
       if (!top) return normalWorld;
-      const base = wave.xyz;
+      const base = simNormal ?? wave.xyz;
       // Ripple detail: gradient of drifting noise at two scales.
       const e = float(0.03);
       const q1 = vec3(p.x.mul(5.5).add(t.mul(0.35)), p.z.mul(5.5).sub(t.mul(0.2)), t.mul(0.25));
@@ -267,9 +383,19 @@ export function createWater(options: WaterOptions): Water {
 
     const floorView = getViewPosition(uvF, depthF, cameraProjectionMatrixInverse);
     const floorWorld = cameraWorldMatrix.mul(vec4(floorView, 1.0)).xyz;
-    const pathLength = clamp(distance(p, floorWorld), 0.0, 10.0);
-    const verticalDepth = max(waterLevel.sub(floorWorld.y), 0.0);
-    const sceneColor = texture(screen.color, uvF).rgb;
+    // A ray that leaves the slab before it meets anything (the back and right edges
+    // have no cut face; the water block simply ends) is deep water to the boundary:
+    // the path stops at the boundary and nothing shows through.
+    const floorOutside = max(abs(floorWorld.x), abs(floorWorld.z)).greaterThan(slabHalf.add(0.6));
+    const viewDirEarly = normalize(p.sub(cameraPosition));
+    const boundaryT = Fn(() => {
+      const tx = select(viewDirEarly.x.greaterThan(0.0), slabHalf.sub(p.x), slabHalf.negate().sub(p.x)).div(select(abs(viewDirEarly.x).greaterThan(1e-4), viewDirEarly.x, float(1e-4)));
+      const tz = select(viewDirEarly.z.greaterThan(0.0), slabHalf.sub(p.z), slabHalf.negate().sub(p.z)).div(select(abs(viewDirEarly.z).greaterThan(1e-4), viewDirEarly.z, float(1e-4)));
+      return clamp(min(abs(tx), abs(tz)), 0.0, 10.0);
+    })();
+    const pathLength = select(floorOutside, boundaryT.add(1.5), clamp(distance(p, floorWorld), 0.0, 10.0));
+    const verticalDepth = select(floorOutside, float(2.0), max(waterLevel.sub(floorWorld.y), 0.0));
+    const sceneColor = select(floorOutside, vec3(0.0), texture(screen.color, uvF).rgb);
 
     // --- light through the water --------------------------------------------------
     const sunDir = vec3(uniforms.sunDir);
@@ -299,29 +425,50 @@ export function createWater(options: WaterOptions): Water {
       const band = smoothstep(0.55, 0.0, verticalDepth);
       const edge = smoothstep(0.08, 0.0, verticalDepth);
       const surge = cos(verticalDepth.mul(28.0).sub(t.mul(2.0)).add(lace.mul(4.0))).mul(0.5).add(0.5);
-      const shoreShape = lace.mul(0.75).add(fine.mul(0.3)).add(surge.mul(0.4).mul(band)).add(band.mul(0.9)).add(edge.mul(0.35)).sub(1.05);
-      const shore = smoothstep(0.0, 0.45, shoreShape).mul(band.mul(0.9).add(0.1)).mul(smoothstep(0.0, 0.05, band));
-      // Folding crest: the Jacobian goes negative where a face steepens past itself.
-      const crest = smoothstep(0.15, -0.35, wave.w).mul(smoothstep(0.3, 0.7, lace.mul(0.5).add(0.5)));
-      return clamp(shore.add(crest), 0.0, 1.0).mul(uniforms.foamStrength);
+      // Thin contact line against anything, from the real per-pixel depth.
+      const contact = smoothstep(0.0, 0.5, edge.mul(1.2).add(fine.mul(0.4)).add(band.mul(0.4)).sub(0.55)).mul(band);
+      // The drifting field, broken into lace by the noise so it never reads as a wash.
+      const field = foamField.sample(p.xz.div(slabHalf.mul(2.0)).add(0.5)).r;
+      const drifting = smoothstep(0.0, 0.6, field.mul(1.2).add(lace.mul(0.45)).add(fine.mul(0.2)).add(surge.mul(0.15).mul(band)).sub(0.55));
+      return clamp(max(contact, drifting), 0.0, 1.0).mul(uniforms.foamStrength);
     })();
     const foamLight = vec3(uniforms.sunColor).mul(sunUp.mul(1.3)).add(vec3(0.35, 0.4, 0.45));
     const foamColor = vec3(0.92, 0.95, 0.96).mul(foamLight);
 
+    // Glitter: the sun caught by micro-facets the mesh cannot carry. A high-frequency
+    // noise tilts the normal; the half-vector test is sharpened well past the GGX lobe.
+    const glitter = Fn(() => {
+      if (!top) return vec3(0.0);
+      const jitter = vec3(
+        mx_noise_float(vec3(p.x.mul(60.0), p.z.mul(60.0), t.mul(1.7))),
+        float(0.0),
+        mx_noise_float(vec3(p.x.mul(60.0).add(7.0), p.z.mul(60.0), t.mul(1.3))),
+      ).mul(0.12);
+      const nGlint = normalize(nWorld.add(jitter));
+      const halfVector = normalize(sunDir.sub(viewDir));
+      const spec = pow(clamp(dot(nGlint, halfVector), 0.0, 1.0), 900.0);
+      const sparkle = smoothstep(0.55, 0.9, mx_noise_float(vec3(p.x.mul(40.0), p.z.mul(40.0), t.mul(2.5))).mul(0.5).add(0.5));
+      return vec3(uniforms.sunColor).mul(spec).mul(sparkle).mul(sunUp).mul(6.0);
+    })();
+
     // Thin crest lit from behind: more of the sun makes it through the peak.
-    const peak = top ? clamp(p.y.sub(waterLevel).div(0.05), 0.0, 1.0) : float(0.0);
+    const peak = top ? clamp(p.y.sub(waterLevel).div(0.06), 0.0, 1.0) : float(0.0);
     const peakGlow = vec3(uniforms.scatter).mul(sunLight).mul(peak).mul(1.5);
 
-    const shaded: THREE.Node = mix(under.add(reflection).add(peakGlow), foamColor, foamMask);
+    const shaded: THREE.Node = mix(under.add(reflection).add(peakGlow), foamColor, foamMask).add(glitter);
+    const simState = (sim ? sim.stateNode.sample(sim.uvOf(p.xz) as unknown as ReturnType<typeof vec2>) : vec4(0.0)) as ReturnType<typeof vec4>;
+    // Run-up thinner than a couple of centimetres is wet sand, not a water surface.
+    const thinFilm = top && sim ? simState.r.lessThan(0.02) : float(0.0).greaterThan(1.0);
     const debug: THREE.Node | null =
       debugMode === 'depth' ? vec3(verticalDepth.mul(0.5))
       : debugMode === 'path' ? vec3(pathLength.mul(0.3))
       : debugMode === 'foam' ? vec3(foamMask)
       : debugMode === 'jacobian' ? vec3(clamp(wave.w.negate().add(0.5), 0.0, 1.0))
+      : debugMode === 'sim' && sim ? vec3(p.y.sub(waterLevel).mul(8.0).add(0.5), simState.gb.abs().mul(0.5))
       : null;
     const shown = debug ?? shaded;
     material.emissiveNode = Fn(() => {
-      Discard(behindScene);
+      Discard(behindScene.or(thinFilm));
       return shown;
     })();
     return material;
@@ -381,12 +528,28 @@ export function createWater(options: WaterOptions): Water {
   };
   bindScreen(placeholderColor, placeholderDepth);
 
+  // Numbers, not impressions: `__water.simStats()` reads the state back, and
+  // `?waterInspect=1` (or `=z:<metres>`) draws the map and a section on screen.
+  (window as unknown as Record<string, unknown>).__water = {
+    simStats: async () => (sim ? sim.readStats() : null),
+  };
+  const inspectParam = params.get('waterInspect');
+  const inspector = sim && inspectParam
+    ? new WaterInspector(renderer, sim, field, { sectionZ: inspectParam.startsWith('z:') ? Number(inspectParam.slice(2)) : undefined })
+    : null;
+
   const sunDirection = new THREE.Vector3();
+  let previousTime = -1;
   return {
     group,
     uniforms,
     bindScreen,
-    update() {
+    update(elapsedSeconds) {
+      const dt = previousTime < 0 ? 1 / 60 : elapsedSeconds - previousTime;
+      previousTime = elapsedSeconds;
+      sim?.step(Math.min(0.05, Math.max(0.001, dt)), maxDepth);
+      inspector?.update(performance.now());
+      stepFoam(dt);
       sunDirection.copy(sun.position).sub(sun.target.position).normalize();
       (uniforms.sunDir.value as THREE.Vector3).copy(sunDirection);
       (uniforms.sunColor.value as THREE.Color).copy(sun.color).multiplyScalar(Math.min(1.5, sun.intensity * 0.5));
