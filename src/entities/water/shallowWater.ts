@@ -77,7 +77,7 @@ export class ShallowWater {
   private _simTime = 0;
 
   constructor(options: ShallowWaterOptions) {
-    const { renderer, bathymetry, half, waterLevel, size = 512, swellAmplitude = 0.04, swellPeriod = 1.2 } = options;
+    const { renderer, bathymetry, half, waterLevel, size = 512, swellAmplitude = 0.06, swellPeriod = 1.4 } = options;
     this.renderer = renderer;
     this.half = half;
     this.size = size;

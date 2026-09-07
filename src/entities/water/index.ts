@@ -317,7 +317,7 @@ export function createWater(options: WaterOptions): Water {
     const foam = max(decayed, born);
     // Wetness: where water stands now, or stood in the last half minute. The sand
     // shader reads it; sand the swash has reached stays dark and glossy as it dries.
-    const standing = sim ? smoothstep(0.002, 0.012, sim.stateNode.sample(q).r) : smoothstep(0.02, 0.0, depth.negate());
+    const standing = sim ? smoothstep(0.0005, 0.006, sim.stateNode.sample(q).r) : smoothstep(0.02, 0.0, depth.negate());
     const wetPrev = foamPrev.sample(q).g;
     const wetness = max(standing, wetPrev.mul(exp(foamDt.negate().div(28.0))));
     return vec4(foam, wetness, 0.0, 1.0);
@@ -456,7 +456,7 @@ export function createWater(options: WaterOptions): Water {
       const edge = smoothstep(0.08, 0.0, verticalDepth);
       const surge = cos(verticalDepth.mul(28.0).sub(t.mul(2.0)).add(lace.mul(4.0))).mul(0.5).add(0.5);
       // Thin contact line against anything, from the real per-pixel depth.
-      const contact = smoothstep(0.0, 0.7, edge.mul(1.0).add(fine.mul(0.5)).add(band.mul(0.35)).sub(0.6)).mul(band).mul(0.85);
+      const contact = smoothstep(0.0, 0.7, edge.mul(0.9).add(fine.mul(0.55)).add(lace.mul(0.3)).add(band.mul(0.3)).sub(0.7)).mul(band).mul(0.7);
       // The drifting field, broken into lace by the noise so it never reads as a wash.
       const field = foamField.sample(p.xz.div(slabHalf.mul(2.0)).add(0.5)).r;
       const drifting = smoothstep(0.0, 0.8, field.mul(1.1).add(lace.mul(0.5)).add(fine.mul(0.25)).add(surge.mul(0.15).mul(band)).sub(0.6));

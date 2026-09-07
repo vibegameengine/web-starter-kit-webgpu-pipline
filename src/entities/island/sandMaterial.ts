@@ -72,7 +72,7 @@ export function createSandMaterial(u: SandMaterialUniforms): THREE.MeshStandardN
   // below the water line; the static band is only a floor under the live one.
   const fieldUv = p.xz.div(vec3(u.slabHalf).x.mul(2.0)).add(0.5);
   const swash = u.wetness.sample(fieldUv as unknown as ReturnType<typeof vec3>).g;
-  const wet = max(smoothstep(0.08, 0.0, aboveWater), smoothstep(0.15, 0.6, swash));
+  const wet = max(smoothstep(0.08, 0.0, aboveWater), smoothstep(0.04, 0.35, swash));
   const submerged = smoothstep(0.02, -0.06, aboveWater);
 
   const dry = color(0.86, 0.71, 0.48);

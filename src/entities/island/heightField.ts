@@ -36,8 +36,9 @@ export class IslandField {
 
     // Underwater floor: gentle slope with a few humps, deepest at the far corner.
     const floor = -0.95 + 0.25 * n.fbm2(x * 0.22, z * 0.22, 3) - 0.35 * smooth(-0.15, -1.2, t);
-    // Beach berm above the water line: the shore ramp, then a slow dune rise.
-    const berm = 0.02 + 0.55 * smooth(-0.08, 0.42, t) + 0.5 * smooth(0.3, 1.1, t);
+    // Beach above the water line: a gentle foreshore first (slope ~0.03, where the
+    // swash runs up and the sand stays wet), then the berm and a slow dune rise.
+    const berm = 0.02 + 0.12 * smooth(-0.08, 0.5, t) + 0.43 * smooth(0.32, 0.8, t) + 0.5 * smooth(0.55, 1.1, t);
     const dunes = 0.08 * n.fbm2(x * 0.35 + 9.0, z * 0.35, 3) * smooth(0.1, 0.6, t);
 
     let y = mix(floor, berm + dunes, smooth(-0.32, 0.06, t));
