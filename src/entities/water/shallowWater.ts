@@ -383,7 +383,11 @@ export class ShallowWater {
       // The run-up front: the tongue's leading edge, thin and moving. Judged over the
       // depths the sheet is drawn at (4 mm .. 8 cm), not only the invisible film.
       const speedHere = length(vec2(u, v));
-      const front = smoothstep(0.25, 0.7, speedHere).mul(smoothstep(0.004, 0.012, h)).mul(smoothstep(0.08, 0.03, h)).mul(wet);
+      // ...and only over a gentle bed: the film sloshing at the foot of a boulder is
+      // not a run-up front, and it painted a jagged collar around every rock.
+      const bedSlope = length(vec2(bedOf(1, 0).sub(bedOf(-1, 0)), bedOf(0, 1).sub(bedOf(0, -1)))).div(dx.mul(2.0));
+      const gentleBed = smoothstep(0.6, 0.25, bedSlope);
+      const front = smoothstep(0.25, 0.7, speedHere).mul(smoothstep(0.004, 0.012, h)).mul(smoothstep(0.08, 0.03, h)).mul(wet).mul(gentleBed);
       const foam = clamp(max(bore, front), 0.0, 1.0);
       return vec4(depth, clamp(u, -6.0, 6.0).mul(wet), clamp(v, -6.0, 6.0).mul(wet), foam);
     })();

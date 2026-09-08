@@ -3,7 +3,7 @@ import { Fn, float, texture, uniform, uv, vec2, vec3, vec4 } from 'three/tsl';
 
 /**
  * The free surface, baked once per frame into one texture over the slab
- * (docs/water/grill-session.md Q11/Q23/Q31): D = (η − level, ∂η/∂x, ∂η/∂z, source).
+ * (docs/water/grill-session.md Q11/Q23/Q31): D = (η − level, ∂η/∂x, ∂η/∂z, film depth).
  *
  * Everything that needs the surface — the mesh, the fragment normal, the foam field,
  * the caustic map, the sand — samples this texture. The spectral wind sum and the
@@ -24,6 +24,8 @@ export interface SurfaceFieldOptions {
   rim: (xz: THREE.Node) => THREE.Node;
   /** The wind sum is capped so a freak superposition cannot pierce the sand. */
   windCap: number;
+  /** Water depth over the bed at world xz, smoothly reconstructed; goes to W. */
+  film: (xz: THREE.Node) => THREE.Node;
 }
 
 export class SurfaceField {
@@ -37,7 +39,7 @@ export class SurfaceField {
   private readonly renderer: THREE.WebGPURenderer;
 
   constructor(options: SurfaceFieldOptions) {
-    const { renderer, size = 1024, half, waterLevel, simHeight, wind, rim, windCap } = options;
+    const { renderer, size = 1024, half, waterLevel, simHeight, wind, rim, windCap, film } = options;
     this.renderer = renderer;
     this.size = size;
     this.texel = (2 * half) / size;
@@ -84,7 +86,7 @@ export class SurfaceField {
       const w = wind(xz) as V3;
       const eta = etaC.sub(level).add(w.x.min(float(windCap))).mul(mask);
       const slope = simSlope.add(w.yz).mul(mask);
-      return vec4(eta, slope.x, slope.y, 0.0);
+      return vec4(eta, slope.x, slope.y, film(xz) as F);
     })();
     this.quad = new THREE.QuadMesh(material);
   }

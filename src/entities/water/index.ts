@@ -206,8 +206,40 @@ export function createWater(options: WaterOptions): Water {
     const alive = smoothstep(0.0, 0.08, depth).mul(rimMask(xz));
     return wind.evaluate(xz, depth).mul(alive);
   });
-  /** The free surface, baked once per frame: (η − level, ∂η/∂x, ∂η/∂z, source). */
-  const surface = new SurfaceField({ renderer, size: 1024, half, waterLevel: field.waterLevel, simHeight: simBase, wind: windAt, rim: rimMask, windCap });
+  /**
+   * Water depth over the bed, reconstructed with a cubic B-spline (16 taps) of the
+   * solver's cells: the edge of the run-up tongue is then a smooth curve through the
+   * cells, not the bilinear contour that shows every 3 cm cell as a kink (grill Q38).
+   */
+  const filmAt = Fn(([xz]: [ReturnType<typeof vec2>]) => {
+    const n = float(sim.size);
+    const tc = (sim.uvOf(xz) as unknown as ReturnType<typeof vec2>).mul(n).sub(0.5);
+    const base = tc.floor();
+    const f = tc.sub(base);
+    const weights = (t: ReturnType<typeof float>) => {
+      const t2 = t.mul(t);
+      const t3 = t2.mul(t);
+      return [
+        float(1.0).sub(t).pow(3.0).div(6.0),
+        t3.mul(3.0).sub(t2.mul(6.0)).add(4.0).div(6.0),
+        t3.mul(-3.0).add(t2.mul(3.0)).add(t.mul(3.0)).add(1.0).div(6.0),
+        t3.div(6.0),
+      ];
+    };
+    const wx = weights(f.x);
+    const wz = weights(f.y);
+    const sum = float(0.0).toVar();
+    for (let j = 0; j < 4; j++) {
+      for (let i = 0; i < 4; i++) {
+        const tap = base.add(vec2(i - 1, j - 1)).add(0.5).div(n);
+        const d = ((sim.stateNode.sample(tap as unknown as ReturnType<typeof vec2>) as typeof sim.stateNode).level(float(0.0)) as ReturnType<typeof vec4>).r;
+        sum.addAssign(d.mul(wx[i]).mul(wz[j]));
+      }
+    }
+    return sum;
+  });
+  /** The free surface, baked once per frame: (η − level, ∂η/∂x, ∂η/∂z, film depth). */
+  const surface = new SurfaceField({ renderer, size: 1024, half, waterLevel: field.waterLevel, simHeight: simBase, wind: windAt, rim: rimMask, windCap, film: filmAt as unknown as (xz: THREE.Node) => THREE.Node });
   const fieldAt = (xz: THREE.Node) => (surface.node.sample(surface.uvOf(xz) as unknown as ReturnType<typeof vec2>) as typeof surface.node).level(float(0.0)) as unknown as ReturnType<typeof vec4>;
 
   /** Two drifting Worley layers; the cell edges are the bright caustic filaments. */
@@ -303,7 +335,8 @@ export function createWater(options: WaterOptions): Water {
     const climb = state.g.mul(gradB.x).add(state.b.mul(gradB.y));
     const steep = smoothstep(0.6, 1.4, gradB.length());
     const impact = smoothstep(0.3, 1.2, climb).mul(steep).mul(smoothstep(0.01, 0.05, state.r));
-    return vec4(foam, wetness, impact, 1.0);
+    // The foot of the impact is aerated white: the burst goes into the foam too.
+    return vec4(max(foam, impact.mul(0.9)), wetness, impact, 1.0);
   })();
   const foamQuad = new THREE.QuadMesh(foamSim);
   /** Droplets where the water hits the boulders (spray.ts). */
@@ -526,8 +559,10 @@ export function createWater(options: WaterOptions): Water {
     // `?waterFilm=0` draws every sheet pixel: a hole is then either geometry or the
     // scene depth, never this gate.
     const gateOn = params.get('waterFilm') !== '0';
-    const thinFilm = !gateOn ? float(0.0).greaterThan(1.0) : top ? simState.r.lessThan(needed).or(sheetAboveFloor.lessThan(0.004)) : cutDry;
-    const filmFade = top ? smoothstep(needed, needed.add(0.026), simState.r).mul(smoothstep(0.004, 0.03, sheetAboveFloor)) : float(1.0);
+    // The film depth from the field's smooth reconstruction, not the raw cells.
+    const filmDepth = fieldAt(p.xz).w;
+    const thinFilm = !gateOn ? float(0.0).greaterThan(1.0) : top ? filmDepth.lessThan(needed).or(sheetAboveFloor.lessThan(0.004)) : cutDry;
+    const filmFade = top ? smoothstep(needed, needed.add(0.026), filmDepth).mul(smoothstep(0.004, 0.03, sheetAboveFloor)) : float(1.0);
     const debug: THREE.Node | null =
       debugMode === 'depth' ? vec3(verticalDepth.mul(0.5))
       : debugMode === 'path' ? vec3(pathLength.mul(0.3))
@@ -605,7 +640,7 @@ export function createWater(options: WaterOptions): Water {
   placeholderColor.needsUpdate = true;
   let materials: THREE.MeshStandardNodeMaterial[] = [];
   const bindScreen = (color: THREE.Texture, depth: THREE.Texture, normal: THREE.Texture) => {
-    spray.bindDepth(depth);
+    spray.bindScreen(color, depth);
     const previous = materials;
     const surface = buildMaterial({ color, depth, normal }, true);
     const cut = buildMaterial({ color, depth, normal }, false);

@@ -1,5 +1,5 @@
 import * as THREE from 'three/webgpu';
-import { positionWorld, vec4 } from 'three/tsl';
+import { Fn, max, positionWorld, texture, uv, vec4 } from 'three/tsl';
 
 /**
  * The bed the water runs over, taken from the geometry itself: the sand and every
@@ -19,8 +19,14 @@ export function bakeBathymetry(options: {
   size?: number;
   /** Height written where nothing is seen (outside the slab, or a gap). */
   floor?: number;
+  /**
+   * A base bed to merge with (the analytic sand, exact and smooth): the result is
+   * max(base, rendered). A sand *mesh* rendered from above is piecewise linear at its
+   * segment size, and a run-up front over those facets zigzags with them.
+   */
+  base?: THREE.Texture;
 }): THREE.Texture {
-  const { renderer, objects, half, size = 512, floor = -10 } = options;
+  const { renderer, objects, half, size = 512, floor = -10, base } = options;
   const target = new THREE.RenderTarget(size, size, {
     type: THREE.HalfFloatType,
     format: THREE.RGBAFormat,
@@ -69,10 +75,39 @@ export function bakeBathymetry(options: {
   const previousTarget = renderer.getRenderTarget();
   renderer.setRenderTarget(target);
   renderer.render(stage, camera);
-  renderer.setRenderTarget(previousTarget);
 
   for (const { object, parent } of parents) {
     if (parent) parent.add(object); else stage.remove(object);
   }
-  return target.texture;
+  if (!base) {
+    renderer.setRenderTarget(previousTarget);
+    return target.texture;
+  }
+  // Merge: the higher of the analytic bed and what the geometry put there.
+  const merged = new THREE.RenderTarget(size, size, {
+    type: THREE.HalfFloatType,
+    format: THREE.RGBAFormat,
+    depthBuffer: false,
+    generateMipmaps: false,
+  });
+  merged.texture.name = 'bathymetry';
+  merged.texture.minFilter = THREE.LinearFilter;
+  merged.texture.magFilter = THREE.LinearFilter;
+  merged.texture.wrapS = merged.texture.wrapT = THREE.ClampToEdgeWrapping;
+  merged.texture.userData.renderTarget = merged;
+  const mergeMaterial = new THREE.MeshBasicNodeMaterial();
+  mergeMaterial.blending = THREE.NoBlending;
+  mergeMaterial.depthTest = false;
+  mergeMaterial.depthWrite = false;
+  mergeMaterial.toneMapped = false;
+  mergeMaterial.fragmentNode = Fn(() => {
+    const q = uv();
+    return vec4(max(texture(base, q).r, texture(target.texture, q).r), 0.0, 0.0, 1.0);
+  })();
+  const quad = new THREE.QuadMesh(mergeMaterial);
+  renderer.setRenderTarget(merged);
+  quad.render(renderer);
+  renderer.setRenderTarget(previousTarget);
+  target.dispose();
+  return merged.texture;
 }
