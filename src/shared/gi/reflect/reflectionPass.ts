@@ -26,6 +26,14 @@ export interface ReflectionSettings {
   intensity: number;
   /** Fraction of the screen resolution the rays are traced at. */
   resolutionScale: number;
+  /**
+   * Frames between traces. The pass keeps its result in a storage buffer the
+   * composite reads by parity, so a skipped frame shows the last trace unchanged
+   * rather than nothing — the same one-frame lag its own reprojected history
+   * already carries. 1 traces every frame. Measured at 4K, 2026-09-08: 3.2 ms of
+   * a 15.2 ms frame per trace.
+   */
+  traceInterval: number;
   /** Screen-trace steps before the ray is handed to the BVH. */
   screenSteps: number;
 }
@@ -38,6 +46,7 @@ export const DEFAULT_REFLECTION_SETTINGS: Readonly<ReflectionSettings> = {
   historyWeight: 0.85,
   intensity: 1,
   resolutionScale: 0.5,
+  traceInterval: 2,
   screenSteps: 40,
 };
 
@@ -290,6 +299,7 @@ export class ReflectionPass {
   private readNodes: THREE.StorageBufferNode[] | null = null;
   private readerObject: ReflectionReader | null = null;
   private kernel: THREE.ComputeNode | null = null;
+  private sinceTrace = 0;
   private boundStatic: ContactBVHBundle | null = null;
   private boundDynamic: DynamicBVHBundle | null = null;
   /**
@@ -377,6 +387,13 @@ export class ReflectionPass {
     }
     this.colorNode!.value = color;
     this.colorSamplerNode!.value = color;
+    // Amortised: on a skipped frame nothing is dispatched and neither the parity nor
+    // the previous view-projection moves, so the composite reads the last trace and
+    // the next one reprojects from where that trace actually stood. A rebuild or a
+    // resize (historyValid false) always traces.
+    const interval = Math.max(1, Math.round(this.settings.traceInterval));
+    this.sinceTrace = (this.sinceTrace + 1) % interval;
+    if (this.sinceTrace !== 0 && this.historyValid) return true;
     const cam = this.camera;
     this.uCamWorld.value.copy(cam.matrixWorld);
     this.uView.value.copy(cam.matrixWorldInverse);
