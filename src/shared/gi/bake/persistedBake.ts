@@ -24,6 +24,16 @@ export async function bakeKey(sceneName: string): Promise<string> {
   return hex(await digest(new TextEncoder().encode(`bake:${sceneName}`)));
 }
 
+/**
+ * The name of the surfel-only cache: the warmed radiance cache with no lightmap
+ * beside it (`size: 0`, empty `pixels`). `mode=surfel` used to warm the cache from
+ * scratch on every launch — several seconds of orbiting integration for a result
+ * that is a property of the level, not of the run.
+ */
+export async function surfelKey(sceneName: string): Promise<string> {
+  return hex(await digest(new TextEncoder().encode(`surfels:${sceneName}`)));
+}
+
 export async function encodeBake(bake: PersistedBake): Promise<ArrayBuffer> {
   const { surfels: s } = bake;
   const chunks = [bake.pixels, s.spatial, s.moments, s.depth, s.guiding];
@@ -39,7 +49,8 @@ export async function encodeBake(bake: PersistedBake): Promise<ArrayBuffer> {
 export async function decodeBake(buffer: ArrayBuffer): Promise<PersistedBake> {
   if (buffer.byteLength < 64 || buffer.byteLength % 4) throw new Error('Truncated bake');
   const [magic, version, size, capacity, count, spatial, moments, depth] = new Uint32Array(buffer, 0, 8);
-  if (magic !== 0x42474957 || version !== 2 || size < 2 || size > 4096 || !Number.isInteger(Math.log2(size)) || count < 1 || count > capacity || capacity > 1048576 || spatial !== count * 8 || moments !== count * 20 || depth !== count * 64) throw new Error('Incompatible bake header');
+  // `size` 0 is a surfel-only cache: the warmed radiance cache with no lightmap.
+  if (magic !== 0x42474957 || version !== 2 || (size !== 0 && (size < 2 || size > 4096 || !Number.isInteger(Math.log2(size)))) || count < 1 || count > capacity || capacity > 1048576 || spatial !== count * 8 || moments !== count * 20 || depth !== count * 64) throw new Error('Incompatible bake header');
   const lengths = [size * size * 4, spatial, moments, depth, count * 72];
   const end = 32 + lengths.reduce((a, b) => a + b * 4, 0);
   if (end + 32 !== buffer.byteLength || hex(await digest(new Uint8Array(buffer, 0, end))) !== hex(new Uint8Array(buffer, end))) throw new Error('Bake checksum mismatch');
@@ -87,8 +98,8 @@ export async function saveBake(key: string, bake: PersistedBake): Promise<void> 
     // Written whole, then renamed: a launch that dies mid-write leaves no half bake
     // under the real name to be read as corrupt next time.
     local.fs.mkdirSync(local.dir, { recursive: true });
-    // One scene, one bake: every other file in the directory is stale.
-    for (const name of local.fs.readdirSync(local.dir)) if (name !== `${key}.bin`) local.fs.unlinkSync(`${local.dir}/${name}`);
+    // One bake of each kind per scene: replace this key's files, leave the other kind.
+    for (const name of local.fs.readdirSync(local.dir)) if (name.startsWith(key)) local.fs.unlinkSync(`${local.dir}/${name}`);
     const temporary = `${local.dir}/${key}.${Date.now()}.tmp`;
     local.fs.writeFileSync(temporary, new Uint8Array(encoded));
     local.fs.renameSync(temporary, `${local.dir}/${key}.bin`);

@@ -23,7 +23,7 @@ import { readFloatTexture, readValidationTexture } from '../../shared/render/gpu
 import { createLightmapPages, type LightmapPageSource } from '../../shared/render/virtualTexture/lightmapPages.ts';
 import { VirtualLightmap } from '../../shared/render/virtualTexture/virtualLightmap.ts';
 import { createLightmapDemand } from '../../shared/render/virtualTexture/lightmapDemand.ts';
-import { bakeKey, bakeStorageKind, loadBake, saveBake } from '../../shared/gi/bake/persistedBake.ts';
+import { bakeKey, bakeStorageKind, loadBake, saveBake, surfelKey } from '../../shared/gi/bake/persistedBake.ts';
 import { loadStreamedBake } from '../../shared/gi/bake/streamedBake.ts';
 import { U_BAKED_LOD_OVERRIDE } from '../../shared/gi/bake/bakedHitLod.ts';
 import { padLightmapCharts } from '../../shared/gi/bake/chartPadding.ts';
@@ -555,7 +555,36 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
     if (previousVirtual !== virtualLightmap) previousVirtual?.dispose();
   }
 
-  async function prepareSurfel(durationMs: number): Promise<void> {
+  /**
+   * The surfel cache: warmed once, saved, and read back on every later launch.
+   *
+   * Warming IS the bake — seconds of orbiting integration — and it used to run on
+   * every start because this path never consulted a cache. The cache is a property
+   * of the level, not of the run: `npm run bake:clear` is what invalidates it.
+   */
+  async function prepareSurfel(durationMs: number, forceBake = false): Promise<void> {
+    const persistent = params.get('bakeCache') !== '0';
+    let key = '';
+    bakeCache.source = 'none'; bakeCache.storage = 'none'; bakeCache.saved = false; bakeCache.error = '';
+    if (persistent) {
+      setLoading('Checking saved surfel cache');
+      try {
+        key = await surfelKey(params.get('scene') ?? 'default');
+        bakeCache.key = key;
+        const saved = forceBake ? null : await loadBake(key);
+        if (saved?.surfels.count) {
+          setLoading('Restoring saved surfel cache');
+          gi.resetCache(renderer);
+          gi.restoreStaticBake(renderer, saved.surfels);
+          bakeCache.source = 'saved'; bakeCache.storage = bakeStorageKind() === 'fs' ? 'file' : 'bundle'; bakeCache.saved = true;
+          console.log(`[surfel-cache] restored ${saved.surfels.count} surfels; no warming`);
+          return;
+        }
+      } catch (error) {
+        bakeCache.error = String(error);
+        console.warn(`[surfel-cache] cannot reuse saved data: ${error}`);
+      }
+    }
     gi.resetCache(renderer);
     if (durationMs <= 0) return;
     setLoading(`Warming surfel cache (${(durationMs / 1000).toFixed(0)}s)`);
@@ -565,6 +594,20 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
         setLoading(`Warming ${(fraction * 100).toFixed(0)}% · ${frames} views`);
       },
     });
+    bakeCache.source = 'baked'; bakeCache.storage = 'computed';
+    if (!key) return;
+    setLoading('Saving surfel cache');
+    try {
+      const count = await gi.readAllocatedCount(renderer);
+      const surfels = await gi.captureStaticBake(renderer, count);
+      // No lightmap beside it: size 0, no pixels, nothing to pack into pages.
+      await saveBake(key, { size: 0, pixels: new Float32Array(0), surfels });
+      bakeCache.saved = true;
+      console.log(`[surfel-cache] saved ${count} surfels as ${key}`);
+    } catch (error) {
+      bakeCache.error = String(error);
+      console.warn(`[surfel-cache] cache is usable but could not be saved: ${error}`);
+    }
   }
 
   let switching = false;
@@ -597,7 +640,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
         gi.setFrozen(next === 'lightmap');
       } else {
         lightmapIntensity.value = 0;
-        await prepareSurfel(bakeParams.seconds * 1000);
+        await prepareSurfel(bakeParams.seconds * 1000, forceBake);
       }
       bakedSunVersion = world.sunVersion;
       baked = true;
@@ -1083,6 +1126,8 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
       return still;
     },
     computeCalls: () => renderer.info.compute.frameCalls,
+    /** The frame graph itself, for audits that instrument a pass (never production code). */
+    frameGraph: () => frameGraph,
     memory: () => ({ ...renderer.info.memory }),
     aa(mode?: Antialiasing) {
       if (mode) { aaParams.mode = mode; frameGraph.setAntialiasing(mode); }

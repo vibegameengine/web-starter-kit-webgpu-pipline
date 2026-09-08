@@ -31,10 +31,11 @@ console.log('open', new Date().toISOString().slice(11,19)); await page.goto(url)
 await page.waitForFunction(() => window.__gpuPasses && document.querySelector('#loading-overlay')?.hidden, null, { timeout: 240000 });
 console.log('overlay hidden', new Date().toISOString().slice(11,19));
 // The bake save after the overlay stalls the main thread for seconds; wait for 30
-// consecutive frames under 100 ms before measuring anything.
+// consecutive frames under 500 ms before measuring anything. (100 ms never held
+// at 4K on 2026-09-08: the frame itself was longer than that, and the gate fired.)
 await page.evaluate(() => new Promise((resolve) => {
   let last = performance.now(), run = 0;
-  const f = () => { const t = performance.now(); run = t - last < 100 ? run + 1 : 0; last = t; if (run >= 30) resolve(); else requestAnimationFrame(f); };
+  const f = () => { const t = performance.now(); run = t - last < 500 ? run + 1 : 0; last = t; if (run >= 30) resolve(); else requestAnimationFrame(f); };
   requestAnimationFrame(f);
 }));
 console.log('frames steady', new Date().toISOString().slice(11,19));

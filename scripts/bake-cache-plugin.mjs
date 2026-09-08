@@ -51,12 +51,15 @@ export function bakeCachePlugin() {
             ? await decompressBake(payload, { maxOutputLength: 128 * 1024 * 1024 })
             : payload;
           if (data.length < 32 || data.readUInt32LE(0) !== 0x42474957) throw new Error('Invalid bake');
-          // One scene, one bake: whatever is in the directory is stale the moment a
-          // new bake is saved, so it goes. Keeping every key ever produced is how
-          // this directory reached 42 GB (2026-09-08).
-          await rm(directory, { recursive: true, force: true });
+          // One bake of each kind per scene: this key's files are replaced, the
+          // other kind's are left alone. Keeping every key ever produced is how this
+          // directory reached 42 GB (2026-09-08).
           await mkdir(directory, { recursive: true });
-          await packBakePages(directory, match[1], data);
+          for (const name of await readdir(directory)) {
+            if (name.startsWith(match[1])) await rm(path.join(directory, name), { recursive: true, force: true });
+          }
+          // A surfel-only cache declares no lightmap (size 0) and has no pages to pack.
+          if (data.readUInt32LE(8) > 0) await packBakePages(directory, match[1], data);
           await writeFile(temporary, data);
           await rename(temporary, path.join(directory, `${match[1]}.bin`));
           await writeFile(path.join(directory, `${match[1]}.json`), JSON.stringify({
