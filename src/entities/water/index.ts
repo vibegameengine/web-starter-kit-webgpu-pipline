@@ -394,7 +394,29 @@ export function createWater(options: WaterOptions): Water {
       // strays a few millimetres from the analytic bed the solver runs on, and a
       // millimetre tongue drawn exactly on that bed vanished under the mesh — the
       // visible water ended a metre short of where the solver had it.
-      material.positionNode = vec3(positionLocal.x, waterLevel.add(fieldAt(positionLocal.xz).x).add(0.004), positionLocal.z);
+      // The tongue of the swash is millimetres thick over sand that, in the scene, is
+      // a 6 cm mesh straying ±5 mm from the analytic bed the solver runs on. Where
+      // the solver says wet, the sheet is seated on the *rendered* sand: the vertex
+      // projects itself, reads the scene depth there, and rises to that floor plus
+      // the film — so the visible water reaches exactly where the water is.
+      material.positionNode = Fn(() => {
+        const field = fieldAt(positionLocal.xz);
+        const film = field.w;
+        const eta = waterLevel.add(field.x).add(0.004);
+        const clip = cameraProjectionMatrix.mul(cameraViewMatrix.mul(vec4(positionLocal.x, eta, positionLocal.z, 1.0)));
+        const ndc = clip.xy.div(max(clip.w, 1e-4));
+        const uvV = vec2(ndc.x.mul(0.5).add(0.5), float(0.5).sub(ndc.y.mul(0.5)));
+        const uvC = clamp(uvV, vec2(0.0), vec2(1.0)) as unknown as ReturnType<typeof vec2>;
+        const floorV = cameraWorldMatrix.mul(vec4(getViewPosition(uvC, texture(screen.depth, uvC).level(float(0.0)).x, cameraProjectionMatrixInverse), 1.0)).xyz;
+        // Only the sand under this very vertex counts (not a boulder or a leaf in
+        // front of it): the floor must lie within 5 cm of the vertex in the plane and
+        // stand no more than 3 cm over the analytic sheet — the mesh's stray, not a rock.
+        const near = distance(floorV.xz, positionLocal.xz).lessThan(0.05);
+        const stray = floorV.y.sub(eta);
+        const seat = near.and(stray.greaterThan(-0.002)).and(stray.lessThan(0.03)).and(film.greaterThan(0.001));
+        const y = select(seat, floorV.y.add(max(film, 0.002)), eta);
+        return vec3(positionLocal.x, y, positionLocal.z);
+      })();
     }
 
     // --- normal ------------------------------------------------------------------
