@@ -303,11 +303,7 @@ export function createWater(options: WaterOptions): Water {
       .add(foamPrev.sample(from.add(vec2(0.0, texel))).r)
       .add(foamPrev.sample(from.sub(vec2(0.0, texel))).r)
       .mul(0.2);
-    // Foam on water lives its whitecap e-folding; foam the swash left on the sand
-    // bursts within about a second, so only a thin line marks the run-up limit.
-    const wetNow = smoothstep(0.002, 0.01, sim.stateNode.sample(q).r);
-    const tau = mix(float(1.0), foamDecaySeconds, wetNow);
-    const decayed = spread.mul(exp(foamDt.negate().div(tau)));
+    const decayed = spread.mul(exp(foamDt.negate().div(foamDecaySeconds)));
 
     // Only the solver's sources: breaking, the run-up front, impact spray. The
     // analytic "shore lace" band that ignored the water is gone (grill Q12/Q20).
@@ -553,7 +549,17 @@ export function createWater(options: WaterOptions): Water {
     // ground above the water line (a boulder's flank) the run-up must be deeper still
     // before it reads as a surface: a film there is wet stone.
     const groundHere = sandHeight(p.xz);
-    const needed = float(0.004).add(max(groundHere.sub(waterLevel), 0.0));
+    // The swash is a film of millimetres running up a beach that stands above the
+    // water line: it must be drawn. Only against a steep flank (a boulder) does the
+    // ground's height over the line demand more depth before a film counts.
+    const gs = float(2.0 / 512);
+    const gUv = p.xz.div(slabHalf).mul(0.5).add(0.5);
+    const gradGround = vec2(
+      texture(heightTexture, gUv.add(vec2(gs, 0.0))).r.sub(texture(heightTexture, gUv.sub(vec2(gs, 0.0))).r),
+      texture(heightTexture, gUv.add(vec2(0.0, gs))).r.sub(texture(heightTexture, gUv.sub(vec2(0.0, gs))).r),
+    ).div(float(4 * (2 * half) / 512));
+    const steepGround = smoothstep(0.35, 0.9, gradGround.length());
+    const needed = float(0.0015).add(max(groundHere.sub(waterLevel), 0.0).mul(steepGround));
     // The sheet's real height over the real floor (scene depth), not the solver's
     // column over its own bathymetry: the two floors differ by centimetres, and a film
     // judged on the wrong one pokes through the sand as a row of teeth.
@@ -570,8 +576,8 @@ export function createWater(options: WaterOptions): Water {
     const gateOn = params.get('waterFilm') !== '0';
     // The film depth from the field's smooth reconstruction, not the raw cells.
     const filmDepth = fieldAt(p.xz).w;
-    const thinFilm = !gateOn ? float(0.0).greaterThan(1.0) : top ? filmDepth.lessThan(needed).or(sheetAboveFloor.lessThan(0.004)) : cutDry;
-    const filmFade = top ? smoothstep(needed, needed.add(0.026), filmDepth).mul(smoothstep(0.004, 0.03, sheetAboveFloor)) : float(1.0);
+    const thinFilm = !gateOn ? float(0.0).greaterThan(1.0) : top ? filmDepth.lessThan(needed).or(sheetAboveFloor.lessThan(0.001)) : cutDry;
+    const filmFade = top ? smoothstep(needed, needed.add(0.008), filmDepth).mul(smoothstep(0.001, 0.01, sheetAboveFloor)) : float(1.0);
     const debug: THREE.Node | null =
       debugMode === 'depth' ? vec3(verticalDepth.mul(0.5))
       : debugMode === 'path' ? vec3(pathLength.mul(0.3))
