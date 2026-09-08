@@ -17,7 +17,8 @@ import {
   velocity,
 } from 'three/tsl';
 import { bakedIndirect } from '../gi/bake/applyLightmap.ts';
-import { DFGLUT, getViewPosition, cameraProjectionMatrixInverse, normalize, renderOutput, hash, screenCoordinate, luminance } from 'three/tsl';
+import { DFGLUT, getViewPosition, cameraProjectionMatrixInverse, normalize, renderOutput, hash, screenCoordinate, luminance, cameraNear, cameraFar } from 'three/tsl';
+import { MotionBlur } from './motionBlur.ts';
 import { fxaa } from 'three/addons/tsl/display/FXAANode.js';
 import { bloom } from 'three/addons/tsl/display/BloomNode.js';
 import { TemporalAANode } from './temporalAA.ts';
@@ -172,6 +173,8 @@ export class FrameGraph {
   private exposureNode: TslNode | null = null;
   /** Film grain strength in display space, after tone mapping; null = none. */
   private grain: THREE.UniformNode<number> | null = null;
+  /** Per-pixel motion blur after the temporal resolve (see motionBlur.ts); null = off. */
+  private motionBlur: MotionBlur | null = null;
   /** Frame counter for the grain's per-frame noise. */
   private readonly frameIndex = uniform(0);
   /**
@@ -351,6 +354,13 @@ export class FrameGraph {
     this.needsComposite = true;
   }
 
+  /** Installs or removes the motion blur pass; the composite is rebuilt. */
+  setMotionBlur(pass: MotionBlur | null): void {
+    if (pass === this.motionBlur) return;
+    this.motionBlur = pass;
+    this.needsComposite = true;
+  }
+
   setAntialiasing(mode: Antialiasing): void {
     if (mode === this.antialiasing) return;
     this.antialiasing = mode;
@@ -501,6 +511,17 @@ export class FrameGraph {
     } else {
       resolved = composed;
     }
+    if (this.motionBlur) {
+      // After the resolve (the history stays sharp), on the resolved frame as a texture.
+      const sharp = rtt(resolved as ReturnType<typeof vec4>);
+      resolved = this.motionBlur.apply(
+        (at) => sharp.sample(at),
+        this.scenePass.getTexture('velocity'),
+        this.scenePass.getTexture('depth'),
+        cameraNear,
+        cameraFar,
+      ).toInspector('Post / Motion blur') as unknown as TslNode;
+    }
     // Exposure after AA (the history stays scene-referred), then the output transform
     // (tone map + colour space), then grain on the display-referred result.
     if (this.exposureNode) resolved = (resolved as ReturnType<typeof vec4>).mul(this.exposureNode) as unknown as TslNode;
@@ -614,12 +635,13 @@ export class FrameGraph {
    * G-buffer and the fog read the same projection — and pair with `endFrame()`.
    */
   beginFrame(): void {
+    // Motion-vector matrices for vertex-animated materials and the cut detection, in
+    // every AA mode; before the jitter, which must not enter the unjittered matrices.
+    this.taa.trackCamera();
     if (this.antialiasing === 'taa') {
       this.renderer.getDrawingBufferSize(frameSize);
       this.taa.beginFrame(frameSize.width, frameSize.height);
     }
-    // Motion-vector matrices for vertex-animated materials, in every AA mode.
-    this.taa.trackCamera();
   }
 
   endFrame(): void {
@@ -627,6 +649,10 @@ export class FrameGraph {
   }
 
   render(): void {
+    if (this.motionBlur) {
+      this.renderer.getDrawingBufferSize(frameSize);
+      this.motionBlur.update(frameSize.width, frameSize.height, this.taa.cut);
+    }
     if (this.needsComposite) this.rebuildComposite();
     this.frameIndex.value = (this.frameIndex.value + 1) % 4096;
     if (this.overlayCamera) {

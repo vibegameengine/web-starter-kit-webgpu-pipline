@@ -18,6 +18,7 @@ import { createContactBVH, type ContactBVHBundle } from '../../shared/gi/contact
 import { ReflectionPass, type ReflectionSettings } from '../../shared/gi/reflect/reflectionPass.ts';
 import { meanEnvironmentRadiance } from '../../shared/render/atmosphere/volumetricFog.ts';
 import { AutoExposure } from '../../shared/render/exposure.ts';
+import { DEFAULT_MOTION_BLUR, MotionBlur, type MotionBlurSettings } from '../../shared/render/motionBlur.ts';
 import { readFloatTexture, readValidationTexture } from '../../shared/render/gpuReadback.ts';
 import { createLightmapPages, type LightmapPageSource } from '../../shared/render/virtualTexture/lightmapPages.ts';
 import { VirtualLightmap } from '../../shared/render/virtualTexture/virtualLightmap.ts';
@@ -80,6 +81,8 @@ export interface SceneHost {
   contact?: Partial<ContactOcclusionSettings>;
   /** Traced reflections preset. On by default (`?reflections=0` turns it off). */
   reflections?: Partial<ReflectionSettings>;
+  /** Motion blur preset. Off by default (`?motionBlur=1` turns it on, `?shutter=` sets the shutter). */
+  motionBlur?: Partial<MotionBlurSettings>;
 }
 
 export interface PipelineUi {
@@ -804,6 +807,15 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   exposureFolder.add(grainState, 'enabled').name('film grain').onChange(syncGrain);
   exposureFolder.add(grainStrength, 'value', 0, 0.15, 0.005).name('grain strength');
   exposureFolder.close();
+  // Motion blur (shared/render/motionBlur.ts): after the temporal resolve, before exposure.
+  const motionBlurParam = params.get('motionBlur');
+  const motionBlur = new MotionBlur({
+    ...host.motionBlur,
+    enabled: motionBlurParam === null ? (host.motionBlur?.enabled ?? DEFAULT_MOTION_BLUR.enabled) : motionBlurParam !== '0',
+  });
+  const shutterParam = num('shutter'); if (shutterParam !== null) motionBlur.settings.shutter = shutterParam;
+  const syncMotionBlur = () => frameGraph.setMotionBlur(motionBlur.enabled ? motionBlur : null);
+  syncMotionBlur();
   const contactFolder = gui.addFolder('Contact occlusion');
   contactFolder.add(contact.settings, 'enabled').name('enabled').onChange((v: boolean) => { contact.setEnabled(v); syncContact(); });
   contactFolder.add(contact.settings, 'radius', 0.05, 2, 0.01).name('radius (m)');
@@ -825,6 +837,10 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   glareFolder.add(glare, 'enabled').name('veiling glare').onChange(syncGlare);
   glareFolder.add(glare, 'strength', 0, 0.5, 0.005).name('glare strength').onChange(syncGlare);
   glareFolder.add(glare, 'radius', 0, 1, 0.01).name('glare radius').onChange(syncGlare);
+  glareFolder.add(motionBlur.settings, 'enabled').name('motion blur').onChange(syncMotionBlur);
+  glareFolder.add(motionBlur.settings, 'shutter', 0, 1, 0.01).name('shutter');
+  glareFolder.add(motionBlur.settings, 'samples', 4, 24, 1).name('blur samples');
+  glareFolder.add(motionBlur.settings, 'depthExtent', 0.01, 1, 0.01).name('blur depth extent (m)');
   glareFolder.close();
   const bakeFolder = gui.addFolder('GI bake');
   // Both budgets are always present: the mode is a runtime switch now, so hiding the
@@ -885,7 +901,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   // Freeze time-of-day by default: the sun is derived from the env map, and moving it
   // would put the analytic light out of step with the image-based ambient.
   lightCfg.animate = params.get('animate') === '1';
-  const still = params.get('still') === '1';
+  let still = params.get('still') === '1';
 
   window.addEventListener('resize', () => {
     camera.aspect = window.innerWidth / window.innerHeight;
@@ -1008,6 +1024,16 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
     grain(value?: boolean) {
       if (typeof value === 'boolean') { grainState.enabled = value; syncGrain(); }
       return grainState.enabled;
+    },
+    motionBlur(value?: boolean) {
+      if (typeof value === 'boolean') { motionBlur.settings.enabled = value; syncMotionBlur(); }
+      return motionBlur.enabled;
+    },
+    motionBlurSettings: motionBlur.settings,
+    /** Holds or releases the scene's own animation (wind, water) at runtime. */
+    still(value?: boolean) {
+      if (typeof value === 'boolean') still = value;
+      return still;
     },
     computeCalls: () => renderer.info.compute.frameCalls,
     memory: () => ({ ...renderer.info.memory }),

@@ -105,6 +105,7 @@ export class TemporalAANode extends THREE.TempNode {
   private readonly textureNode: THREE.Node;
   private readonly texelSize = uniform(new THREE.Vector2(1 / 1600, 1 / 900));
   private readonly historyValid = uniform(0);
+  private cutThisFrame = false;
   private readonly originalProjection = new THREE.Matrix4();
   private readonly previousView = new THREE.Matrix4();
   private hasPreviousView = false;
@@ -179,19 +180,9 @@ export class TemporalAANode extends THREE.TempNode {
    */
   beginFrame(width: number, height: number): void {
     const cam = this.camera;
-    // A cut: the eye moved farther in one frame than any motion this scene has (a
-    // metre) or turned more than ~25°. Reprojection has nothing valid to offer then;
-    // drop the history rather than clip it toward the new frame and show a ghost.
-    if (this.hasPreviousView) {
-      const e = cam.matrixWorld.elements, p = this.previousView.elements;
-      const dx = e[12] - p[12], dy = e[13] - p[13], dz = e[14] - p[14];
-      // Third column of matrixWorld is the camera's own +z axis; its dot with last
-      // frame's is the cosine of the turn.
-      const turnCos = e[8] * p[8] + e[9] * p[9] + e[10] * p[10];
-      if (dx * dx + dy * dy + dz * dz > 1 || turnCos < Math.cos(THREE.MathUtils.degToRad(25))) this.historyReady = false;
-    }
-    this.previousView.copy(cam.matrixWorld);
-    this.hasPreviousView = true;
+    // A cut (see trackCamera): reprojection has nothing valid to offer then; drop the
+    // history rather than clip it toward the new frame and show a ghost.
+    if (this.cutThisFrame) this.historyReady = false;
     cam.updateProjectionMatrix();
     this.originalProjection.copy(cam.projectionMatrix);
     velocity.setProjectionMatrix(this.originalProjection);
@@ -210,6 +201,20 @@ export class TemporalAANode extends THREE.TempNode {
    */
   trackCamera(): void {
     const cam = this.camera;
+    // A cut: the eye moved farther in one frame than any motion this scene has (a
+    // metre) or turned more than ~25°. Detected here, in every AA mode, because the
+    // motion blur must not smear a cut frame either.
+    this.cutThisFrame = false;
+    if (this.hasPreviousView) {
+      const e = cam.matrixWorld.elements, p = this.previousView.elements;
+      const dx = e[12] - p[12], dy = e[13] - p[13], dz = e[14] - p[14];
+      // Third column of matrixWorld is the camera's own +z axis; its dot with last
+      // frame's is the cosine of the turn.
+      const turnCos = e[8] * p[8] + e[9] * p[9] + e[10] * p[10];
+      this.cutThisFrame = dx * dx + dy * dy + dz * dz > 1 || turnCos < Math.cos(THREE.MathUtils.degToRad(25));
+    }
+    this.previousView.copy(cam.matrixWorld);
+    this.hasPreviousView = true;
     U_PREVIOUS_VIEW_PROJECTION.value.copy(U_VIEW_PROJECTION.value);
     const wasJittered = this.jittered;
     if (wasJittered) cam.clearViewOffset();
@@ -233,8 +238,13 @@ export class TemporalAANode extends THREE.TempNode {
   }
 
   /** Audit: what the resolve was told this frame. */
-  get state(): { historyReady: boolean; historyValid: number; parity: number; jitter: number[]; weight: number } {
-    return { historyReady: this.historyReady, historyValid: this.historyValid.value, parity: this.parity, jitter: [this.uJitter.value.x, this.uJitter.value.y], weight: this.historyWeight.value };
+  get state(): { historyReady: boolean; historyValid: number; parity: number; jitter: number[]; weight: number; cut: boolean } {
+    return { historyReady: this.historyReady, historyValid: this.historyValid.value, parity: this.parity, jitter: [this.uJitter.value.x, this.uJitter.value.y], weight: this.historyWeight.value, cut: this.cutThisFrame };
+  }
+
+  /** True when this frame's camera jumped (a cut, see trackCamera); set by trackCamera. */
+  get cut(): boolean {
+    return this.cutThisFrame;
   }
 
   /** Drops the accumulated history (camera cut). */
