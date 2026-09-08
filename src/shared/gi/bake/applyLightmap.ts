@@ -1,7 +1,9 @@
 import * as THREE from 'three/webgpu';
 import {
+  Fn,
   attribute,
   materialColor,
+  property,
   texture,
   uniform,
   uv,
@@ -12,6 +14,13 @@ import { Layer } from '../../world/index.ts';
 /** Not a literal: a literal `* 0` is folded away and the tapped node never compiles. */
 const inspectorZero = uniform(0);
 const originalEmission = new WeakMap<THREE.Material, THREE.Node | null>();
+
+/**
+ * Fragment-stage property holding the lightmap radiance a material added to its
+ * output (albedo x baked irradiance x intensity), zero for materials without one. The
+ * frame graph's MRT copies it into the G-buffer's spare channels.
+ */
+export const bakedIndirect = property('vec3', 'bakedIndirect');
 
 /**
  * Routes the baked lightmap into every static material.
@@ -102,7 +111,13 @@ export function applyLightmap(
         .mul(intensityUniform)
         .add(preview.rgb.mul(inspectorZero));
 
-      standard.emissiveNode = existing ? vec3(existing).add(baked) : baked;
+      // Published for the G-buffer (see frameGraph's MRT): the composite subtracts the
+      // occluded part of exactly this term, so it must be the value that was added.
+      const published = Fn(() => {
+        bakedIndirect.assign(baked);
+        return baked;
+      })();
+      standard.emissiveNode = existing ? vec3(existing).add(published) : published;
       standard.needsUpdate = true;
       applied++;
     }

@@ -12,7 +12,9 @@ import {
   measureCoverage,
   rasteriseLightmapGBuffer,
 } from '../../shared/gi/bake/index.ts';
-import { uniform } from 'three/tsl';
+import { uniform, float, uint, vec4, mix } from 'three/tsl';
+import { ContactOcclusionPass, type ContactOcclusionSettings } from '../../shared/gi/contact/contactOcclusionPass.ts';
+import { createContactBVH, type ContactBVHBundle } from '../../shared/gi/contact/contactBvh.ts';
 import { readFloatTexture, readValidationTexture } from '../../shared/render/gpuReadback.ts';
 import { createLightmapPages, type LightmapPageSource } from '../../shared/render/virtualTexture/lightmapPages.ts';
 import { VirtualLightmap } from '../../shared/render/virtualTexture/virtualLightmap.ts';
@@ -75,6 +77,18 @@ export interface PipelineUi {
    * present = on unless `?glare=0`. Runtime toggle in the GUI.
    */
   glare?: { strength: number; radius: number };
+  /**
+   * Contact occlusion preset (radius, rays, strength). On by default (`?contact=0`
+   * turns it off); idle in `lightmap` mode, which has no BVH.
+   */
+  contact?: Partial<ContactOcclusionSettings>;
+}
+
+export interface PipelineUi {
+  setLoading(message: string): void;
+  clearLoading(): void;
+  showError(error: unknown): void;
+  /** `?hud=0`: no HUD, no GUI, no inspector widget in a judged frame. */
   showChrome: boolean;
 }
 
@@ -338,6 +352,69 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   // the scene. Off for the Cornell reference frame unless asked, on where a scene asks.
   const glareParam = params.get('glare');
   const glare = {
+  // Contact occlusion: short rays against the GI's own BVHs from the GI G-buffer, an
+  // occlusion of the indirect terms only. `?contact=0|1`, `?contactRadius=`.
+  const contactParam = params.get('contact');
+  const contact = new ContactOcclusionPass(renderer, camera, gi.blueNoiseTexture, {
+    ...host.contact,
+    enabled: contactParam === null ? (host.contact?.enabled ?? true) : contactParam !== '0',
+  });
+  const contactRadius = num('contactRadius'); if (contactRadius !== null) contact.settings.radius = contactRadius;
+  const contactScale = num('contactScale'); if (contactScale !== null) contact.settings.resolutionScale = contactScale;
+  const contactRays = num('contactRays'); if (contactRays !== null) contact.settings.rays = contactRays;
+  const contactIntensity = uniform(contact.settings.intensity);
+  // Full-detail static tree for the contact rays, built once the GI's tree exists (it
+  // supplies the material-id table) and only when the pass is on.
+  let contactBvh: ContactBVHBundle | null = null;
+  const contactTree = () => {
+    if (!contact.enabled) return null;
+    if (!contactBvh && gi.staticBvh) contactBvh = createContactBVH(scene, gi.staticBvh.materialIdByUUID);
+    return contactBvh;
+  };
+  let contactReaderBound: unknown = null;
+  const syncContact = () => {
+    const reader = contact.enabled ? contact.reader : null;
+    if (reader === contactReaderBound) return;
+    contactReaderBound = reader;
+    if (!reader) { frameGraph.setContactOcclusion(null); return; }
+    const width = reader.width;
+    const height = reader.height;
+    frameGraph.setContactOcclusion({
+      intensity: contactIntensity,
+      sample: (uv) => {
+        // The pass runs on a coarser grid; bilinear over its four nearest cells.
+        const fx = float(uv.x).mul(width).sub(0.5).clamp(0, width - 1);
+        const fy = float(uv.y).mul(height).sub(0.5).clamp(0, height - 1);
+        const x0 = uint(fx.floor()); const y0 = uint(fy.floor());
+        const x1 = x0.add(uint(1)).min(uint(width - 1)); const y1 = y0.add(uint(1)).min(uint(height - 1));
+        const tx = fx.fract(); const ty = fy.fract();
+        const at = (x: ReturnType<typeof uint>, y: ReturnType<typeof uint>) => {
+          const index = y.mul(uint(width)).add(x);
+          return reader.parity.lessThan(0.5).select(vec4(reader.current.element(index)), vec4(reader.previous.element(index)));
+        };
+        const top = mix(at(x0, y0), at(x1, y0), tx);
+        const bottom = mix(at(x0, y1), at(x1, y1), tx);
+        return mix(top, bottom, ty);
+      },
+    });
+  };
+
+  /**
+   * `surfel` resolves the cache on screen every frame; `lightmap` samples a texture
+   * and does no GI work at all.
+   *
+   * These are not two views of one state, they are two consumers of the *same* surfel
+   * pool, and the bake spends the whole pool on atlas texels. So a switch is not a
+   * toggle — each direction has to re-prepare the pool for its own occupant, which is
+   * why this is async and shows the loading overlay rather than flipping instantly.
+   */
+  type LightingMode = 'surfel' | 'lightmap' | 'hybrid';
+  let lightingMode: LightingMode = requestedLightingMode === 'lightmap' || requestedLightingMode === 'surfel' ? requestedLightingMode : 'hybrid';
+  const bakedHitTransport = params.get('bakedHits') !== '0';
+  gi.bakedFeedbackEnabled = params.get('giPageFeedback') !== '0';
+  let cameraPageDemandEnabled = true;
+
+  async function prepareLightmap(iterations: number, forceBake = false): Promise<void> {
     enabled: glareParam === null ? host.glare !== undefined : glareParam !== '0',
     strength: num('glareStrength') ?? host.glare?.strength ?? 0.04,
     radius: num('glareRadius') ?? host.glare?.radius ?? 0.7,
@@ -672,6 +749,15 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   bakeFolder.add(bakeParams, 'seconds', 1, 30, 0.5).name('surfel budget s');
   const frozenCtrl = bakeFolder
     .add(bakeParams, 'frozen')
+  const contactFolder = gui.addFolder('Contact occlusion');
+  contactFolder.add(contact.settings, 'enabled').name('enabled').onChange((v: boolean) => { contact.setEnabled(v); syncContact(); });
+  contactFolder.add(contact.settings, 'radius', 0.05, 2, 0.01).name('radius (m)');
+  contactFolder.add(contact.settings, 'rays', 1, 8, 1).name('rays / frame');
+  // Grid scale is boot-time only (`?contactScale=`): reallocating the buffers at
+  // runtime left the frame in a broken, seconds-long state (2026-09-08, unexplained).
+  contactFolder.add(contact.settings, 'historyWeight', 0, 0.97, 0.01).name('history');
+  contactFolder.add(contact.settings, 'intensity', 0, 1, 0.01).name('strength').onChange((v: number) => { contactIntensity.value = v; });
+  contactFolder.close();
     .name('frozen')
     .onChange((v: boolean) => {
       if (lightingMode === 'surfel') gi.setFrozen(v);
@@ -741,6 +827,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
     .name('bounce n')
     .onChange(() => gi.setGiScales(giParams.fromDirect, giParams.fromIndirect));
   giFolder
+  const still = params.get('still') === '1';
     .add(giParams, 'albedoBoost', 1, 4, 0.05)
     .name('albedo boost')
     .onChange((v: number) => gi.setAlbedoBoost(v));
@@ -837,6 +924,18 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   };
   const freezeAt = num('freezeAt');
   if (freezeAt !== null) {
+    split(view: SplitView, at = 0.5) {
+      frameGraph.splitPosition = at;
+      frameGraph.setSplitView(view);
+      frameGraph.forceRebuild();
+    },
+    contact(value?: boolean) {
+      if (typeof value === 'boolean') { contact.setEnabled(value); syncContact(); }
+      return contact.enabled;
+    },
+    contactSettings: contact.settings,
+    computeCalls: () => renderer.info.compute.frameCalls,
+    memory: () => ({ ...renderer.info.memory }),
     dynamic?.update(freezeAt);
     frozen = true;
   }
@@ -1016,10 +1115,17 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
     updateAnimation();
     camera.updateMatrixWorld();
     if (!frozen) dynamic?.update(now * 0.001);
-    host.update?.(now * 0.001);
+    // `?still=1` holds the scene's own animation (wind, water) so a check can compare
+    // two frames of one session without motion between them.
+    if (!still) host.update?.(now * 0.001);
+    fog.update(now);
     if (!switching && lightingMode === 'hybrid' && virtualLightmap && lightmapDemand) {
       if (now >= nextPageDemandAt) {
         virtualLightmap.setDemand(cameraPageDemandEnabled
+      // Same G-buffer, same jittered camera, this frame: trace the contact rays now.
+      contact.update(contactTree(), gi.dynamicBvhBundle, gi.gbufferDepthTexture, gi.receiverTexture,
+        renderer.domElement.width, renderer.domElement.height, true);
+      syncContact();
           ? lightmapDemand(camera, renderer.domElement.width, renderer.domElement.height, virtualLightmap.anisotropy.value) : [], gi.getBakedPageDemand(now));
         nextPageDemandAt = now + 150;
     frameGraph.beginFrame();

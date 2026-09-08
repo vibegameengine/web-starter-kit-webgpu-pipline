@@ -16,6 +16,7 @@ import {
   velocity,
 } from 'three/tsl';
 import { fxaa } from 'three/addons/tsl/display/FXAANode.js';
+import { bakedIndirect } from '../gi/bake/applyLightmap.ts';
 import { bloom } from 'three/addons/tsl/display/BloomNode.js';
 import { TemporalAANode } from './temporalAA.ts';
 
@@ -31,6 +32,15 @@ type TslNode = THREE.Node;
 const frameSize = new THREE.Vector2();
 
 export const GiMode = {
+/** Inverse of the contact pass's octahedral encoding (see contactOcclusionPass.ts). */
+const octDecode = (p: ReturnType<typeof vec2>) => {
+  const z = float(1).sub(p.x.abs()).sub(p.y.abs());
+  const t = z.negate().max(0);
+  const x = p.x.add(p.x.greaterThanEqual(0).select(t.negate(), t));
+  const y = p.y.add(p.y.greaterThanEqual(0).select(t.negate(), t));
+  return vec3(x, y, z).normalize();
+};
+
   Direct: 'direct',
   Indirect: 'indirect',
   Combined: 'combined',
@@ -56,6 +66,10 @@ export const SplitView = {
   /** The baked lightmap texture, shown flat. */
   Lightmap: 'lightmap',
 } as const;
+  /** Contact occlusion: visible fraction of the near hemisphere, white = open. */
+  Contact: 'contact',
+  /** Contact bent normal, world space, 0.5 + 0.5. */
+  BentNormal: 'bentNormal',
 export type SplitView = (typeof SplitView)[keyof typeof SplitView];
 
 export interface FrameGraphOptions {
@@ -151,6 +165,12 @@ export class FrameGraph {
   private glare: { strength: THREE.UniformNode<number>; radius: THREE.UniformNode<number> } | null = null;
   private antialiasing: Antialiasing;
   /** Owns the jitter and the history; idle unless the mode is `taa`. */
+  /**
+   * Contact occlusion reader: `(screenUV) => vec4(oct.xy, visibility, viewDepth)` from
+   * the pass's storage buffers, plus its strength. Multiplies the indirect terms only;
+   * direct light is already shadowed. Null = off.
+   */
+  private contact: { sample: (uv: TslNode) => TslNode; intensity: THREE.UniformNode<number> } | null = null;
   readonly taa: TemporalAANode;
 
   constructor(
@@ -188,8 +208,10 @@ export class FrameGraph {
       mrt({
         output: output,
         albedo: vec4(diffuseColor.rgb, bakedReceiver),
-        normal: normalView,
-        velocity: velocity,
+        // The spare channels carry the lightmap's radiance (albedo x baked irradiance)
+        // so contact occlusion can take it back out of the scene colour later.
+        normal: vec4(normalView, bakedIndirect.r),
+        velocity: vec4(velocity, bakedIndirect.g, bakedIndirect.b),
         // NO metalness/roughness attachment here, though this is where it belongs.
         // Four RGBA16F attachments is 32 bytes per sample, which is exactly
         // `maxColorAttachmentBytesPerSample` on this adapter; a fifth of any format
@@ -281,6 +303,13 @@ export class FrameGraph {
   }
 
   setAntialiasing(mode: Antialiasing): void {
+  /** Installs or removes the contact-occlusion reader; the composite is rebuilt. */
+  setContactOcclusion(reader: { sample: (uv: TslNode) => TslNode; intensity: THREE.UniformNode<number> } | null): void {
+    if (reader === this.contact) return;
+    this.contact = reader;
+    this.needsComposite = true;
+  }
+
     if (mode === this.antialiasing) return;
     this.antialiasing = mode;
     this.taa.reset();
@@ -318,6 +347,17 @@ export class FrameGraph {
     let indirect: TslNode | null = null;
 
     if (this.giTexture && this.albedoTexture) {
+    // Contact occlusion of everything indirect: the live surfel term below and, through
+    // the G-buffer's baked-indirect channels, the lightmap term inside the scene colour.
+    let occlusion: TslNode | null = null;
+    if (this.contact) {
+      const c = this.contact.sample(screenUV as unknown as TslNode) as ReturnType<typeof vec4>;
+      // `.toInspector` here, not `this.tap()`: taps accumulate across rebuilds, and a
+      // reallocated contact buffer would leave the old one bound for good (every
+      // rebuild added a storage binding until the fragment shader failed to compile).
+      occlusion = mix(float(1), c.z.toInspector('Contact / Visibility'), this.contact.intensity) as unknown as TslNode;
+    }
+
       const albedo = texture(this.albedoTexture, screenUV);
       giRaw = texture(this.giTexture, screenUV).toInspector('GI / Surfel');
       indirect = (giRaw as ReturnType<typeof texture>)
@@ -434,6 +474,15 @@ export class FrameGraph {
       case SplitView.Cache:
         if (this.cacheAtlasNode) {
           // Remap the right pane back to a full 0..1 square so the atlas is shown
+      case SplitView.Contact:
+        if (this.contact) right = vec4(vec3((this.contact.sample(screenUV as unknown as TslNode) as ReturnType<typeof vec4>).z), 1);
+        break;
+      case SplitView.BentNormal:
+        if (this.contact) {
+          const c = this.contact.sample(screenUV as unknown as TslNode) as ReturnType<typeof vec4>;
+          right = vec4(octDecode(c.xy as ReturnType<typeof vec2>).mul(0.5).add(0.5), 1);
+        }
+        break;
           // whole rather than cropped to whatever aspect the pane happens to be.
           const local = vec2(
             screenUV.x.sub(this.splitPosition).div(1 - this.splitPosition),

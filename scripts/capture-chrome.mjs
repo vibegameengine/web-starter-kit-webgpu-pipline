@@ -1,5 +1,6 @@
 // Real-browser screenshot via system Chrome (WebGPU-capable).
-// Usage: node scripts/capture-chrome.mjs [out.png] [--url ...] [--wait 8000] [--headed]
+// Usage: node scripts/capture-chrome.mjs [out.png] [--url ...] [--wait 8000]
+// Always a headed Chrome window: headless runs are not trusted for anything here.
 import { chromium } from 'playwright';
 import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
@@ -17,7 +18,7 @@ const url = flag('url', 'http://127.0.0.1:5188/');
 const wait = Number(flag('wait', '10000'));
 const width = Number(flag('w', '1600'));
 const height = Number(flag('h', '900'));
-const headed = has('headed');
+const headed = true; // headless is never used: user rule 2026-09-08
 
 mkdirSync(dirname(out), { recursive: true });
 
@@ -33,7 +34,7 @@ const chromeArgs = [
 
 const browser = await chromium.launch({
   channel: 'chrome', // system Google Chrome — real WebGPU path
-  headless: headed ? false : true,
+  headless: false,
   args: chromeArgs,
 });
 

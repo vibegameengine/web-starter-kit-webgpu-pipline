@@ -171,6 +171,14 @@ export class SurfelGI {
   static async create(
   /** The 128x128 LDR blue-noise tile (nearest, repeat), shared with screen-space filters. */
   get blueNoiseTexture(): THREE.Texture { return this.blueNoise; }
+  /** The static BVH bundle (null before `buildScene`), for passes that trace the same world. */
+  get staticBvh(): SceneBVHBundle | null { return this.bvh; }
+  /** The movers' BVH bundle, replaced on membership changes; read it every frame. */
+  get dynamicBvhBundle(): DynamicBVHBundle | null { return this.dynamicBvh; }
+  /** Depth of the GI's own G-buffer, rendered this frame by the scene camera. */
+  get gbufferDepthTexture(): THREE.Texture { return this.gbuffer.target.depthTexture!; }
+  /** The 128x128 LDR blue-noise tile (nearest, repeat), shared with screen-space filters. */
+  get blueNoiseTexture(): THREE.Texture { return this.blueNoise; }
     renderer: THREE.WebGPURenderer,
     assets: SurfelGiAssets = {},
   ): Promise<SurfelGI> {

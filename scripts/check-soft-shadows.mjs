@@ -29,7 +29,7 @@ await mkdir(out, { recursive: true });
 const base = 'http://127.0.0.1:5188/?scene=beach&hud=0&freezeAt=0&gputime=1&cam=shore';
 const browser = await chromium.launch({
   channel: 'chrome',
-  headless: process.env.HEADLESS === '1',
+  headless: false,
   args: ['--enable-unsafe-webgpu', '--ignore-gpu-blocklist', '--use-angle=d3d11'],
 });
 
