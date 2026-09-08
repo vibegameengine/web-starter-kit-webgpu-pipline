@@ -417,10 +417,12 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
         const saved = forceBake ? null : await loadBake(key);
         if (saved) {
           setLoading('Restoring saved static lighting');
-          // `?atlasSurfels=0` keeps the receiver ownership and drops only the surfel
-          // data: the experiment for whether anything still reads it now that rays
-          // take unwrapped static hits from the atlas.
-          gi.restoreStaticBake(renderer, saved.surfels, params.get('atlasSurfels') !== '0');
+          // The surfel data the bake left in the pool is not restored: rays read
+          // unwrapped static hits from the atlas now, and measured 2026-09-09 on
+          // Cornell the data changes the frame by 0.058/255 against a 0.034/255
+          // drift, while costing 190976 pool slots and 143 MB against 16384 and
+          // 12.8 MB. `?atlasSurfels=1` puts it back.
+          gi.restoreStaticBake(renderer, saved.surfels, params.get('atlasSurfels') === '1');
           const texture = new THREE.DataTexture(Uint16Array.from(saved.pixels, THREE.DataUtils.toHalfFloat), saved.size, saved.size, THREE.RGBAFormat, THREE.HalfFloatType);
           texture.magFilter = texture.minFilter = THREE.LinearFilter; texture.needsUpdate = true;
           renderer.initTexture(texture);
@@ -556,9 +558,13 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
       frameGraph.setGiTextures(null, null);
       await prepareLightmap(bakeParams.passes, forceBake);
       lightmapIntensity.value = lightmapParams.intensity;
-      // The atlas is the static half and never re-integrates; the live chain stays
-      // running for everything that is not in it.
-      gi.setFrozen(false);
+      // The atlas is the static half and never re-integrates. The live chain keeps
+      // running for everything that is not in it — unless the scene has said it has
+      // no movers at all (`staticLighting`, or `?freezeAll=`), and then there is
+      // nothing for it to serve. Collapsing the three modes into one path briefly
+      // hard-coded `false` here, which ignored that flag and left the whole chain
+      // running on the beach: 33.2 ms a frame at 4K against 15.
+      gi.setFrozen(gi.freezeCompletely);
       bakedSunVersion = world.sunVersion;
       baked = true;
     } finally {
