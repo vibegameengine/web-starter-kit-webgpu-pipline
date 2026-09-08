@@ -1,6 +1,6 @@
 import * as THREE from 'three/webgpu';
 import type GUI from 'lil-gui';
-import { FrameGraph, GiMode, SplitView, VolumetricFog, type FogView, type VolumetricFogSettings } from '../../shared/render/index.ts';
+import { FrameGraph, GiMode, SplitView, VolumetricFog, type Antialiasing, type FogView, type VolumetricFogSettings } from '../../shared/render/index.ts';
 import { installReceiverPlaneShadows } from '../../shared/render/receiverPlaneShadow.ts';
 import { installSoftSunShadows, U_SUN_ANGULAR_DIAMETER_DEG } from '../../shared/render/softSunShadow.ts';
 import { CacheStats, WorldState, Layer, Mobility, applyMobility } from '../../shared/world/index.ts';
@@ -306,6 +306,9 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
    * why this is async and shows the loading overlay rather than flipping instantly.
    */
   type LightingMode = 'surfel' | 'lightmap' | 'hybrid';
+    // `?aa=taa|fxaa|none`; TAA is the default and the accumulation every later
+    // stochastic pass (soft shadows, occlusion, reflections) settles into.
+    antialiasing: (['taa', 'fxaa', 'none'] as Antialiasing[]).find((m) => m === params.get('aa')) ?? 'taa',
   let lightingMode: LightingMode = requestedLightingMode === 'lightmap' || requestedLightingMode === 'surfel' ? requestedLightingMode : 'hybrid';
   const bakedHitTransport = params.get('bakedHits') !== '0';
   gi.bakedFeedbackEnabled = params.get('giPageFeedback') !== '0';
@@ -693,6 +696,10 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   fogFolder.add(fogSettings, 'temporalBlend', 0, 0.97, 0.01).name('temporal blend');
   fogFolder.close();
   const glareFolder = gui.addFolder('Post');
+  const aaParams = { mode: frameGraph.antialiasingMode };
+  glareFolder.add(aaParams, 'mode', ['taa', 'fxaa', 'none']).name('anti-aliasing').onChange((m: Antialiasing) => frameGraph.setAntialiasing(m));
+  glareFolder.add(frameGraph.taa.historyWeight, 'value', 0, 0.97, 0.01).name('taa history');
+  glareFolder.add(frameGraph.taa.clipGamma, 'value', 0.5, 2, 0.05).name('taa clip gamma');
   glareFolder.add(renderer, 'toneMappingExposure', 0.1, 3, 0.01).name('exposure');
   glareFolder.add(glare, 'enabled').name('veiling glare').onChange(syncGlare);
   glareFolder.add(glare, 'strength', 0, 0.3, 0.005).name('glare strength').onChange(syncGlare);
@@ -853,6 +860,25 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
       if (typeof value === 'boolean') { glare.enabled = value; syncGlare(); }
       return glare.enabled;
     },
+    aa(mode?: Antialiasing) {
+      if (mode) { aaParams.mode = mode; frameGraph.setAntialiasing(mode); }
+      return frameGraph.antialiasingMode;
+    },
+  };
+  // Fog audit: toggle at runtime (the same path the GUI checkbox takes), read or set
+  // the knobs, and report the froxel grid — so a check can prove "off" is the old frame.
+  (window as unknown as Record<string, unknown>).__fog = {
+    enabled(value?: boolean) {
+      if (typeof value === 'boolean') { fog.setEnabled(value); syncFog(); }
+      return fog.enabled;
+    },
+    settings: fog.settings,
+    grid: [fog.width, fog.height, fog.depth],
+    invalidate: () => fog.invalidateHistory(),
+    glare(value?: boolean) {
+      if (typeof value === 'boolean') { glare.enabled = value; syncGlare(); }
+      return glare.enabled;
+    },
   };
   const originalStaticBvh = gi.getSceneBvh();
   let runtimeMoverSerial = 0;
@@ -996,6 +1022,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
         virtualLightmap.setDemand(cameraPageDemandEnabled
           ? lightmapDemand(camera, renderer.domElement.width, renderer.domElement.height, virtualLightmap.anisotropy.value) : [], gi.getBakedPageDemand(now));
         nextPageDemandAt = now + 150;
+    frameGraph.beginFrame();
       }
       if (!pausePageStreaming) virtualLightmap.update(now);
     }
@@ -1023,6 +1050,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
     if (firstFrame) {
       firstFrame = false;
       clearLoading();
+    frameGraph.endFrame();
     }
   });
 }

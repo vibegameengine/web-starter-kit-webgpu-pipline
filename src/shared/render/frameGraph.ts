@@ -17,6 +17,9 @@ import {
 } from 'three/tsl';
 import { fxaa } from 'three/addons/tsl/display/FXAANode.js';
 import { bloom } from 'three/addons/tsl/display/BloomNode.js';
+import { TemporalAANode } from './temporalAA.ts';
+
+export type Antialiasing = 'taa' | 'fxaa' | 'none';
 import { Layer } from '../world/index.ts';
 
 /**
@@ -24,6 +27,8 @@ import { Layer } from '../world/index.ts';
  * chain is typed against the shared surface rather than any one of them.
  */
 type TslNode = THREE.Node;
+
+const frameSize = new THREE.Vector2();
 
 export const GiMode = {
   Direct: 'direct',
@@ -64,6 +69,8 @@ export interface FrameGraphOptions {
    * colour and the scene depth available to their materials. See `onScreenTextures`.
    */
   overlay?: boolean;
+  /** `taa` (default) accumulates over frames with a jittered camera; `fxaa` is the old single-frame pass. */
+  antialiasing?: Antialiasing;
 }
 
 /**
@@ -142,6 +149,9 @@ export class FrameGraph {
    * lit surfaces. Energy conserving. Both knobs are uniforms; null drops the stage.
    */
   private glare: { strength: THREE.UniformNode<number>; radius: THREE.UniformNode<number> } | null = null;
+  private antialiasing: Antialiasing;
+  /** Owns the jitter and the history; idle unless the mode is `taa`. */
+  readonly taa: TemporalAANode;
 
   constructor(
     private readonly renderer: THREE.WebGPURenderer,
@@ -155,8 +165,10 @@ export class FrameGraph {
       splitView = SplitView.Off,
       debugTaps = true,
       overlay = false,
+      antialiasing = 'taa',
     } = options;
     this.camera = camera;
+    this.antialiasing = antialiasing;
     if (overlay) {
       const overlayCamera = camera.clone();
       overlayCamera.layers.set(Layer.Overlay);
@@ -190,6 +202,7 @@ export class FrameGraph {
       }),
     );
     this.scenePass = scenePass;
+    this.taa = new TemporalAANode(null, scenePass.getTextureNode('depth'), scenePass.getTextureNode('velocity'), camera);
 
     this.color = scenePass.getTextureNode('output').toInspector('Direct / HDR');
 
@@ -265,6 +278,17 @@ export class FrameGraph {
       return;
     }
     this.needsComposite = true;
+  }
+
+  setAntialiasing(mode: Antialiasing): void {
+    if (mode === this.antialiasing) return;
+    this.antialiasing = mode;
+    this.taa.reset();
+    this.needsComposite = true;
+  }
+
+  get antialiasingMode(): Antialiasing {
+    return this.antialiasing;
   }
 
   /** Rebuild on the next render — used when a baked-in constant like the divider moves. */
@@ -350,7 +374,17 @@ export class FrameGraph {
     }
 
     const composed = this.applySplit(beauty, giRaw, indirect);
-    this.post.outputNode = this.foldTaps(fxaa(composed) as unknown as TslNode);
+    let resolved: TslNode;
+    if (this.antialiasing === 'taa') {
+      // The frame is accumulated as a texture: the resolve loads its 3x3 texels.
+      this.taa.setInput(rtt(composed as ReturnType<typeof vec4>));
+      resolved = this.taa.getTextureNode().toInspector('AA / Temporal') as unknown as TslNode;
+    } else if (this.antialiasing === 'fxaa') {
+      resolved = fxaa(composed) as unknown as TslNode;
+    } else {
+      resolved = composed;
+    }
+    this.post.outputNode = this.foldTaps(resolved);
     this.post.needsUpdate = true;
     this.needsComposite = false;
   }
@@ -431,6 +465,20 @@ export class FrameGraph {
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.setSize(width, height);
     this.post.needsUpdate = true;
+  }
+
+  /**
+   * Jitter the camera for this frame. Call before anything renders with it — the GI's
+   * G-buffer and the fog read the same projection — and pair with `endFrame()`.
+   */
+  beginFrame(): void {
+    if (this.antialiasing !== 'taa') return;
+    this.renderer.getDrawingBufferSize(frameSize);
+    this.taa.beginFrame(frameSize.width, frameSize.height);
+  }
+
+  endFrame(): void {
+    this.taa.endFrame();
   }
 
   render(): void {

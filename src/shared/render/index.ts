@@ -4,7 +4,9 @@ export {
   GiMode,
   SplitView,
   type FrameGraphOptions,
+  type Antialiasing,
 } from './frameGraph.ts';
+export { TemporalAANode, temporalAA } from './temporalAA.ts';
 export {
   VolumetricFog,
   DEFAULT_FOG_SETTINGS,
