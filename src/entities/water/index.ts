@@ -314,7 +314,7 @@ export function createWater(options: WaterOptions): Water {
     const depthHere = sim.stateNode.sample(q).r;
     const onWater = smoothstep(0.0008, 0.004, depthHere);
     const tauWet = mix(float(1.5), foamDecaySeconds, smoothstep(0.01, 0.08, depthHere));
-    const tau = mix(float(0.3), tauWet, onWater);
+    const tau = mix(float(0.5), tauWet, onWater);
     const decayed = spread.mul(exp(foamDt.negate().div(tau)));
 
     // Only the solver's sources: breaking, the run-up front, impact spray. The
@@ -326,7 +326,7 @@ export function createWater(options: WaterOptions): Water {
     // Saturation of the sand: a 2 cm tongue soaks it, a 1 mm film barely does — the
     // run-up limit is where the tongue is thinnest, so the wet edge is a gradient, not
     // a line. Capillary spread (a small blur) and drainage (28 s) follow.
-    const standing = smoothstep(0.0005, 0.02, sim.stateNode.sample(q).r);
+    const standing = smoothstep(0.0005, 0.005, sim.stateNode.sample(q).r);
     const wt = float(0.6 / FOAM_SIZE);
     const wetPrev = foamPrev.sample(q).g.mul(0.4)
       .add(foamPrev.sample(q.add(vec2(wt, 0.0))).g.mul(0.15))
@@ -353,7 +353,11 @@ export function createWater(options: WaterOptions): Water {
     const emergent = smoothstep(-0.06, 0.0, bedAhead.sub(waterLevel));
     const impact = smoothstep(0.3, 1.2, climb).mul(steep).mul(smoothstep(0.01, 0.05, state.r)).mul(emergent);
     // The foot of the impact is aerated white: the burst goes into the foam too.
-    return vec4(max(foam, impact.mul(0.9)), wetness, impact, 1.0);
+    // A = the residue on dry sand only (what the swash left), read by the sand; the
+    // sheet reads R. One field, two consumers, one threshold each — never the same
+    // foam drawn twice at two thresholds.
+    const foamOut = max(foam, impact.mul(0.9));
+    return vec4(foamOut, wetness, impact, foamOut.mul(float(1.0).sub(onWater)));
   })();
   const foamQuad = new THREE.QuadMesh(foamSim);
   /** Droplets where the water hits the boulders (spray.ts). */
@@ -570,7 +574,7 @@ export function createWater(options: WaterOptions): Water {
       const lace = mx_fractal_noise_float(vec3(p.x.mul(5.0), p.z.mul(5.0), t.mul(0.45)), 4, 2.3, 0.55);
       const fine = mx_noise_float(vec3(p.x.mul(22.0), p.z.mul(22.0), t.mul(0.8)));
       const field = foamField.sample(p.xz.div(slabHalf.mul(2.0)).add(0.5)).r;
-      const coverage = float(1.0).sub(exp(field.negate().mul(2.5)));
+      const coverage = float(1.0).sub(exp(field.negate().mul(6.0)));
       const drifting = smoothstep(0.0, 0.8, coverage.mul(1.2).add(lace.mul(0.45)).add(fine.mul(0.25)).sub(0.55));
       return clamp(drifting, 0.0, 1.0).mul(uniforms.foamStrength);
     })();
@@ -616,7 +620,10 @@ export function createWater(options: WaterOptions): Water {
     // The film depth from the field's smooth reconstruction, not the raw cells.
     const filmDepth = fieldAt(p.xz).w;
     const thinFilm = !gateOn ? float(0.0).greaterThan(1.0) : top ? filmDepth.lessThan(needed).or(sheetAboveFloor.lessThan(0.0005)) : cutDry;
-    const filmFade = top ? smoothstep(needed, needed.add(0.008), filmDepth).mul(smoothstep(0.0005, 0.006, sheetAboveFloor)) : float(1.0);
+    // A film two millimetres over the gate is water, fully: the ramp is 2 mm, not
+    // 8 — an 8 mm ramp left the 4–8 mm tongue of the swash half transparent and
+    // without caustics, indistinguishable from wet sand (the critic's measurement).
+    const filmFade = !gateOn ? float(1.0) : top ? smoothstep(needed, needed.add(0.002), filmDepth).mul(smoothstep(0.0005, 0.004, sheetAboveFloor)) : float(1.0);
     const debug: THREE.Node | null =
       debugMode === 'depth' ? vec3(verticalDepth.mul(0.5))
       : debugMode === 'path' ? vec3(pathLength.mul(0.3))
@@ -748,6 +755,39 @@ export function createWater(options: WaterOptions): Water {
       let foamMax = 0, wetMax = 0, wetCount = 0;
       for (let i = 0; i < size * size; i++) { foamMax = Math.max(foamMax, foam[i]); wetMax = Math.max(wetMax, wetness[i]); if (wetness[i] > 0.2) wetCount++; }
       return { foamMax, wetMax, wetFraction: wetCount / (size * size) };
+    },
+    /** Solver clock against wall time, for the real-time question. */
+    simClock: () => ({ simTime: sim.simTime, now: performance.now() }),
+    /**
+     * Read-only critic measurer: one GPU moment along the row z — solver depth / u / v /
+     * foam source per cell, the bicubic film the sheet gate reads, the foam field (R) and
+     * wetness (G) at that cell, and the analytic bed over the water line.
+     */
+    shoreSnapshot: async (z: number) => {
+      const [state, fieldData] = await Promise.all([sim.readState(), water.readFoamField()]);
+      const simTimeAt = sim.simTime;
+      const size = state.size;
+      const cell = (2 * half) / size;
+      const j = Math.max(1, Math.min(size - 2, Math.floor(((z + half) / (2 * half)) * size)));
+      const fs = fieldData.size;
+      const jf = Math.max(0, Math.min(fs - 1, Math.floor(((z + half) / (2 * half)) * fs)));
+      const w = [1 / 6, 4 / 6, 1 / 6];
+      const rows: number[][] = [];
+      for (let i = 0; i < size; i++) {
+        let film = 0;
+        for (let b = -1; b <= 1; b++) {
+          for (let a = -1; a <= 1; a++) {
+            const ii = Math.max(0, Math.min(size - 1, i + a));
+            film += state.depth[(j + b) * size + ii] * w[a + 1] * w[b + 1];
+          }
+        }
+        const x = -half + (i + 0.5) * cell;
+        const fi = Math.max(0, Math.min(fs - 1, Math.floor(((x + half) / (2 * half)) * fs)));
+        const k = jf * fs + fi;
+        const c = j * size + i;
+        rows.push([x, state.depth[c], film, state.u[c], state.v[c], state.foam[c], fieldData.foam[k], fieldData.wetness[k], field.height(x, z) - field.waterLevel]);
+      }
+      return { simTime: simTimeAt, now: performance.now(), z, cell, level: field.waterLevel, rows };
     },
   };
   const inspectParam = params.get('waterInspect');
