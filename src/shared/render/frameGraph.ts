@@ -3,6 +3,7 @@ import {
   diffuseColor,
   mrt,
   normalView,
+  float,
   mix,
   output,
   pass,
@@ -15,6 +16,7 @@ import {
   velocity,
 } from 'three/tsl';
 import { fxaa } from 'three/addons/tsl/display/FXAANode.js';
+import { bloom } from 'three/addons/tsl/display/BloomNode.js';
 import { Layer } from '../world/index.ts';
 
 /**
@@ -79,7 +81,8 @@ export interface FrameGraphOptions {
  *
  * Slots still to fill, in UE order (docs/ue-pipeline-study-and-plan.md §3.4):
  *   Phase 1  cached static/dynamic cascade shadows, feeding the base pass
- *   Phase 4  sky LUT + aerial perspective + froxel fog, before AA
+ *   Phase 4  froxel fog is in (`setAtmosphere`, shared/render/atmosphere); sky LUT and
+ *            aerial perspective wait for a scene with a sky
  *   Phase 5  bloom → exposure → grade → grain, and TRAA in place of FXAA
  */
 export class FrameGraph {
@@ -124,6 +127,21 @@ export class FrameGraph {
    * scene pass depth. Both change identity on rebuild and resize, hence a callback.
    */
   onScreenTextures: ((color: THREE.Texture, depth: THREE.Texture, normal: THREE.Texture) => void) | null = null;
+  /**
+   * Participating medium over the finished composite: `(colour, rawDepth) => colour`,
+   * evaluated in linear HDR after the overlay and before AA. The depth is the nearest
+   * of the scene and overlay passes, so water is fogged at its own surface. Null = off,
+   * and nothing of it remains in the shader.
+   */
+  private atmosphere: ((beauty: TslNode, depth: TslNode) => TslNode) | null = null;
+  /**
+   * Veiling glare: a zero-threshold bloom of the whole HDR frame mixed in by a small
+   * fraction, after the fog and before AA. Not a "bright things glow" effect — it is the
+   * fraction of every pixel's light that a lens and an eye scatter over their
+   * neighbours, which is what takes the cut-out hardness off edges between differently
+   * lit surfaces. Energy conserving. Both knobs are uniforms; null drops the stage.
+   */
+  private glare: { strength: THREE.UniformNode<number>; radius: THREE.UniformNode<number> } | null = null;
 
   constructor(
     private readonly renderer: THREE.WebGPURenderer,
@@ -224,6 +242,31 @@ export class FrameGraph {
     this.needsComposite = true;
   }
 
+  /** Installs or removes the fog/atmosphere stage; the composite is rebuilt either way. */
+  setAtmosphere(apply: ((beauty: THREE.Node, depth: THREE.Node) => THREE.Node) | null): void {
+    if (apply === this.atmosphere) return;
+    this.atmosphere = apply;
+    this.needsComposite = true;
+  }
+
+  /**
+   * Installs or removes the veiling-glare stage. `strength` is the fraction of light
+   * moved into the spread (0.03–0.08 reads as a clean lens), `radius` the spread in [0, 1].
+   */
+  setGlare(settings: { strength: number; radius: number } | null): void {
+    if (settings === null) {
+      if (this.glare === null) return;
+      this.glare = null;
+    } else if (this.glare === null) {
+      this.glare = { strength: uniform(settings.strength), radius: uniform(settings.radius) };
+    } else {
+      this.glare.strength.value = settings.strength;
+      this.glare.radius.value = settings.radius;
+      return;
+    }
+    this.needsComposite = true;
+  }
+
   /** Rebuild on the next render — used when a baked-in constant like the divider moves. */
   forceRebuild(): void {
     this.needsComposite = true;
@@ -277,8 +320,33 @@ export class FrameGraph {
       // overlay object is the composite unchanged.
       const sceneColor = rtt(beauty as ReturnType<typeof vec4>);
       const over = this.overlayPass.getTextureNode('output');
-      beauty = mix(sceneColor, over, over.a) as unknown as TslNode;
+      // Premultiplied: the overlay's opaque water writes (rgb, 1), its droplets write
+      // (rgb·a, a); one formula composes both without squaring anyone's coverage.
+      beauty = sceneColor.mul(float(1.0).sub(over.a)).add(over.rgb) as unknown as TslNode;
       this.onScreenTextures?.(sceneColor.value as THREE.Texture, this.scenePass.getTexture('depth'), this.scenePass.getTexture('normal'));
+    }
+
+    if (this.atmosphere) {
+      // The overlay pass clears its depth to the far plane where it drew nothing, so
+      // the nearer of the two is the surface the pixel actually shows.
+      let depth: TslNode = this.scenePass.getTextureNode('depth');
+      if (this.overlayPass) {
+        depth = (depth as ReturnType<typeof texture>).min(this.overlayPass.getTextureNode('depth')) as unknown as TslNode;
+      }
+      beauty = this.atmosphere(beauty, depth).toInspector('Atmosphere / Fogged') as unknown as TslNode;
+    }
+
+    if (this.glare) {
+      // Threshold 0: every photon scatters a little, dim surfaces included. Energy
+      // conserving: the strength is the fraction of light *moved* into the spread, not
+      // added on top, so the frame does not get brighter. Linear HDR, before tone mapping.
+      // three's BloomNode sums five mips with weights that always total 3.0 (each is
+      // mix(f, 1.2 - f, radius) over f = 1.0..0.2), so a flat field comes back 3x; the
+      // division makes the spread a unit-gain blur before it is mixed in.
+      const spread = bloom(beauty as ReturnType<typeof vec4>, 1, 0, 0);
+      spread.radius = this.glare.radius;
+      const unitSpread = spread.div(3).toInspector('Post / Veiling glare');
+      beauty = mix(beauty as ReturnType<typeof vec4>, unitSpread, this.glare.strength) as unknown as TslNode;
     }
 
     const composed = this.applySplit(beauty, giRaw, indirect);

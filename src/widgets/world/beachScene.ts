@@ -12,6 +12,7 @@ import { createBackdrop } from '../../entities/backdrop/index.ts';
 import { createRock, createRockMaterial, type RockTextures } from '../../entities/rocks/index.ts';
 import { createPalm, type Palm } from '../../entities/palm/index.ts';
 import { createShrub, type Shrub } from '../../entities/shrub/index.ts';
+import type { VolumetricFogSettings } from '../../shared/render/index.ts';
 import { updateFoliageSun } from '../../entities/foliage/translucency.ts';
 
 export interface BeachScene {
@@ -27,6 +28,10 @@ export interface BeachScene {
   bindScreen: (color: THREE.Texture, depth: THREE.Texture, normal: THREE.Texture) => void;
   /** Water knobs (swell, wind) in the shared GUI. */
   bindGui: (gui: GUI) => void;
+  /** Fog preset: a low sea mist pooling in the lagoon, thinning over the palms. */
+  atmosphere: Partial<VolumetricFogSettings>;
+  /** Veiling glare preset: a clean lens on a bright day. */
+  glare: { strength: number; radius: number };
 }
 
 /**
@@ -59,6 +64,15 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
     // undergrowth against the sun.
     palm: [new THREE.Vector3(-0.2, 1.6, -1.3), new THREE.Vector3(1.0, 1.4, -3.3)],
     leaves: [new THREE.Vector3(-1.5, 3.2, -0.8), new THREE.Vector3(3.2, 3.6, -3.6)],
+    trunk: [new THREE.Vector3(2.85, 1.0, -1.85), new THREE.Vector3(3.9, 0.85, -2.9)],
+    trunkLit: [new THREE.Vector3(4.4, 1.3, -1.4), new THREE.Vector3(3.9, 0.9, -2.9)],
+    // Broadleaf shrub lit from behind the camera, and the same shrub against the
+    // sun. Ground under that shrub is at y ≈ 0.78.
+    shrub: [new THREE.Vector3(4.4, 1.6, -1.0), new THREE.Vector3(5.0, 1.05, -2.2)],
+    shrubBack: [new THREE.Vector3(5.0, 1.2, -3.5), new THREE.Vector3(5.0, 1.0, -2.2)],
+    // Into the sun through the palms, from the back-left corner: the fog's forward
+    // lobe and the shadow-carved shafts are only visible from here.
+    sunward: [new THREE.Vector3(-6.0, 1.5, -7.5), new THREE.Vector3(3.0, 4.0, 0.0)],
   };
   const preset = presets[new URLSearchParams(window.location.search).get('cam') ?? ''];
   if (preset) {
@@ -228,6 +242,29 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
     water,
     field,
     bindScreen: water.bindScreen,
+    // Mist sits on the water (density at the water line, e-folding every ~2.5 m up),
+    // stays inside the slab's footprint plus a soft margin, and carries a slow wind.
+    atmosphere: {
+      // Off by default: the user judged the mist as greying the frame; `?fog=1` or the
+      // GUI turns it on. The preset stays so the knobs start from something sensible.
+      enabled: false,
+      density: 0.03,
+      baseHeight: field.waterLevel,
+      heightFalloff: 0.4,
+      center: new THREE.Vector3(0.4, field.waterLevel + 1.5, 0),
+      halfExtents: new THREE.Vector3(field.half + 1.5, 4.5, field.half + 1.5),
+      softness: 5,
+      sunIntensity: 4,
+      anisotropy: 0.65,
+      ambientIntensity: 1.0,
+      noiseStrength: 0.55,
+      noiseScale: 0.2,
+      windSpeed: 0.5,
+      windDirection: 60,
+      near: 0.5,
+      far: 70,
+    },
+    glare: { strength: 0.04, radius: 0.7 },
     bindGui(gui) {
       const c = water.controls;
       const folder = gui.addFolder('Water');

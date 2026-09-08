@@ -1,0 +1,11 @@
+import fs from 'node:fs';
+import { HDRLoader } from 'three/examples/jsm/loaders/HDRLoader.js';
+import { DataUtils } from 'three';
+const buf = fs.readFileSync('public/exr/pizzo_pernice_puresky_2k.hdr');
+const tex = new HDRLoader().parse(buf.buffer.slice(buf.byteOffset, buf.byteOffset+buf.byteLength));
+const { data, width, height } = tex; const isHalf = data instanceof Uint16Array; const ch = data.length/(width*height);
+const rd = i => isHalf ? DataUtils.fromHalfFloat(data[i]) : data[i];
+const pass = cap => { let r=0,g=0,b=0,w=0; for (let y=0;y<height;y++){const wy=Math.sin(Math.PI*(y+0.5)/height); for(let x=0;x<width;x++){const i=(y*width+x)*ch; r+=Math.min(cap,rd(i))*wy; g+=Math.min(cap,rd(i+1))*wy; b+=Math.min(cap,rd(i+2))*wy; w+=wy;}} return [r/w,g/w,b/w]; };
+const rough = pass(Infinity); const lum = 0.2126*rough[0]+0.7152*rough[1]+0.0722*rough[2];
+let max=0; for(let i=0;i<data.length;i+=ch) max=Math.max(max,rd(i+1));
+console.log({type:isHalf?'half':'float', ch, width, height, rough: rough.map(v=>v.toFixed(3)), clamped: pass(lum*4).map(v=>v.toFixed(3)), maxG: max.toFixed(1)});

@@ -1,7 +1,8 @@
 import * as THREE from 'three/webgpu';
 import type GUI from 'lil-gui';
-import { FrameGraph, GiMode, SplitView } from '../../shared/render/index.ts';
+import { FrameGraph, GiMode, SplitView, VolumetricFog, type FogView, type VolumetricFogSettings } from '../../shared/render/index.ts';
 import { installReceiverPlaneShadows } from '../../shared/render/receiverPlaneShadow.ts';
+import { installSoftSunShadows, U_SUN_ANGULAR_DIAMETER_DEG } from '../../shared/render/softSunShadow.ts';
 import { CacheStats, WorldState, Layer, Mobility, applyMobility } from '../../shared/world/index.ts';
 import { Hud } from '../../shared/ui/hud.ts';
 import { SurfelGI } from '../../shared/gi/index.ts';
@@ -64,6 +65,16 @@ export interface PipelineUi {
   clearLoading(): void;
   showError(error: unknown): void;
   /** `?hud=0`: no HUD, no GUI, no inspector widget in a judged frame. */
+  /**
+   * Volumetric fog preset for this scene (density, height, the box it lives in). Absent
+   * = no fog unless `?fog=1`; present = on unless `?fog=0`. Runtime toggle in the GUI.
+   */
+  atmosphere?: Partial<VolumetricFogSettings>;
+  /**
+   * Veiling glare preset (see `FrameGraph.setGlare`). Absent = off unless `?glare=1`;
+   * present = on unless `?glare=0`. Runtime toggle in the GUI.
+   */
+  glare?: { strength: number; radius: number };
   showChrome: boolean;
 }
 
@@ -174,7 +185,14 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   updateLightFromAngles();
   configureSunShadow(sun, scene);
 
-  if (params.get('shadowFilter') !== 'legacy') installReceiverPlaneShadows(sun);
+  // Sun shadow filter: `soft` (default) is PCSS on the receiver-plane filter — the
+  // 0.533° disc's penumbra grows with blocker distance; `receiverPlane` is the hard
+  // filter it is built on (iteration 19); `legacy` is three's own PCF.
+  const shadowFilter = params.get('shadowFilter') ?? 'soft';
+  if (shadowFilter === 'receiverPlane') installReceiverPlaneShadows(sun);
+  else if (shadowFilter !== 'legacy') installSoftSunShadows(sun, gi.blueNoiseTexture);
+  const sunDisc = num('sunDisc');
+  if (sunDisc !== null) U_SUN_ANGULAR_DIAMETER_DEG.value = sunDisc;
 
   // --- bake a real lightmap --------------------------------------------------
   // UV atlas -> rasterise world position/normal into it -> seed one surfel per texel
@@ -294,6 +312,36 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   let cameraPageDemandEnabled = true;
 
   async function prepareLightmap(iterations: number, forceBake = false): Promise<void> {
+  // Volumetric fog (shared/render/atmosphere): the sun's own shadow map lights the air,
+  // so it needs nothing from the scene beyond the preset. `?fog=0|1` overrides it.
+  const fogParam = params.get('fog');
+  const fogEnabled = fogParam === null ? (host.atmosphere?.enabled ?? host.atmosphere !== undefined) : fogParam !== '0';
+  const fog = new VolumetricFog(renderer, camera, sun, gi.envTexture, {
+    settings: { ...host.atmosphere, enabled: fogEnabled },
+  });
+  // Tuning overrides and the two term views, for captures: `?fogDensity=&fogSun=&fogSky=
+  // &fogNoise=&fogView=inscatter|transmittance`.
+  const fogDensity = num('fogDensity'); if (fogDensity !== null) fog.settings.density = fogDensity;
+  const fogSun = num('fogSun'); if (fogSun !== null) fog.settings.sunIntensity = fogSun;
+  const fogSky = num('fogSky'); if (fogSky !== null) fog.settings.ambientIntensity = fogSky;
+  const fogNoise = num('fogNoise'); if (fogNoise !== null) fog.settings.noiseStrength = fogNoise;
+  const fogViewParam = params.get('fogView');
+  const fogView: FogView = fogViewParam === 'inscatter' || fogViewParam === 'transmittance' ? fogViewParam : 'fogged';
+  const applyFog = (beauty: THREE.Node, depth: THREE.Node) => fog.apply(beauty, depth, fogView) as THREE.Node;
+  const syncFog = () => frameGraph.setAtmosphere(fog.enabled ? applyFog : null);
+  syncFog();
+
+  // Veiling glare, the other half of "air": light spreading in the lens rather than in
+  // the scene. Off for the Cornell reference frame unless asked, on where a scene asks.
+  const glareParam = params.get('glare');
+  const glare = {
+    enabled: glareParam === null ? host.glare !== undefined : glareParam !== '0',
+    strength: num('glareStrength') ?? host.glare?.strength ?? 0.04,
+    radius: num('glareRadius') ?? host.glare?.radius ?? 0.7,
+  };
+  const syncGlare = () => frameGraph.setGlare(glare.enabled ? { strength: glare.strength, radius: glare.radius } : null);
+  syncGlare();
+
     const persistent = lightingMode === 'hybrid' && params.get('bakeCache') !== '0';
     let key = '';
     bakeCache.source = 'none'; bakeCache.storage = 'none'; bakeCache.saved = false; bakeCache.error = '';
@@ -603,6 +651,9 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   let refreshFrozenControl = () => {};
   onModeSettled = (mode) => {
     modeParams.mode = mode;
+  if (shadowFilter === 'soft') {
+    modeFolder.add(U_SUN_ANGULAR_DIAMETER_DEG, 'value', 0, 5, 0.01).name('sun disc (°)');
+  }
     modeCtrl.updateDisplay?.();
     if (mode !== 'surfel') intensityCtrl.enable?.();
     else intensityCtrl.disable?.();
@@ -627,6 +678,26 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   refreshFrozenControl = () => {
     const staticBaked = lightingMode !== 'surfel';
     bakeParams.frozen = staticBaked || gi.frozen;
+  const fogFolder = gui.addFolder('Atmosphere');
+  const fogSettings = fog.settings;
+  fogFolder.add(fogSettings, 'enabled').name('volumetric fog').onChange((v: boolean) => { fog.setEnabled(v); syncFog(); });
+  fogFolder.add(fogSettings, 'density', 0, 0.12, 0.001).name('density (1/m)');
+  fogFolder.add(fogSettings, 'heightFalloff', 0, 2, 0.01).name('height falloff (1/m)');
+  fogFolder.add(fogSettings, 'baseHeight', -5, 10, 0.05).name('base height (m)');
+  fogFolder.add(fogSettings, 'sunIntensity', 0, 12, 0.05).name('sun scatter');
+  fogFolder.add(fogSettings, 'anisotropy', -0.9, 0.9, 0.01).name('anisotropy g');
+  fogFolder.add(fogSettings, 'ambientIntensity', 0, 3, 0.01).name('sky scatter');
+  fogFolder.add(fogSettings, 'noiseStrength', 0, 1, 0.01).name('noise');
+  fogFolder.add(fogSettings, 'noiseScale', 0.02, 1, 0.01).name('noise scale (1/m)');
+  fogFolder.add(fogSettings, 'windSpeed', 0, 5, 0.05).name('wind (m/s)');
+  fogFolder.add(fogSettings, 'temporalBlend', 0, 0.97, 0.01).name('temporal blend');
+  fogFolder.close();
+  const glareFolder = gui.addFolder('Post');
+  glareFolder.add(renderer, 'toneMappingExposure', 0.1, 3, 0.01).name('exposure');
+  glareFolder.add(glare, 'enabled').name('veiling glare').onChange(syncGlare);
+  glareFolder.add(glare, 'strength', 0, 0.3, 0.005).name('glare strength').onChange(syncGlare);
+  glareFolder.add(glare, 'radius', 0, 1, 0.01).name('glare radius').onChange(syncGlare);
+  glareFolder.close();
     frozenCtrl?.name(staticBaked ? 'static frozen' : 'freeze all GI');
     if (staticBaked) frozenCtrl?.disable();
     else frozenCtrl?.enable();
@@ -768,6 +839,21 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   let auditPaused = false;
   let auditRecording = false;
   let auditIntervals: number[] = [];
+  // Fog audit: toggle at runtime (the same path the GUI checkbox takes), read or set
+  // the knobs, and report the froxel grid — so a check can prove "off" is the old frame.
+  (window as unknown as Record<string, unknown>).__fog = {
+    enabled(value?: boolean) {
+      if (typeof value === 'boolean') { fog.setEnabled(value); syncFog(); }
+      return fog.enabled;
+    },
+    settings: fog.settings,
+    grid: [fog.width, fog.height, fog.depth],
+    invalidate: () => fog.invalidateHistory(),
+    glare(value?: boolean) {
+      if (typeof value === 'boolean') { glare.enabled = value; syncGlare(); }
+      return glare.enabled;
+    },
+  };
   const originalStaticBvh = gi.getSceneBvh();
   let runtimeMoverSerial = 0;
   const runtimeMovers = new Map<string, THREE.Mesh>();
@@ -927,6 +1013,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
 
     // The sky lights every host; whether it is also the picture behind the scene is
     // the host's call (a diorama sits in front of its own backdrop).
+    fog.update(now);
     scene.background = host.skyIsBackground ? gi.envTexture : null;
     frameGraph.render();
 

@@ -169,6 +169,8 @@ export class SurfelGI {
   }
 
   static async create(
+  /** The 128x128 LDR blue-noise tile (nearest, repeat), shared with screen-space filters. */
+  get blueNoiseTexture(): THREE.Texture { return this.blueNoise; }
     renderer: THREE.WebGPURenderer,
     assets: SurfelGiAssets = {},
   ): Promise<SurfelGI> {
