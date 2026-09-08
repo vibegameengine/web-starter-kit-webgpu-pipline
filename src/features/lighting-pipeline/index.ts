@@ -18,16 +18,15 @@ import { createContactBVH, type ContactBVHBundle } from '../../shared/gi/contact
 import { ReflectionPass, type ReflectionSettings } from '../../shared/gi/reflect/reflectionPass.ts';
 import { meanEnvironmentRadiance } from '../../shared/render/atmosphere/volumetricFog.ts';
 import { AutoExposure } from '../../shared/render/exposure.ts';
-import { DEFAULT_MOTION_BLUR, MotionBlur, type MotionBlurSettings } from '../../shared/render/motionBlur.ts';
+import { DEFAULT_MOTION_BLUR, MotionBlur, type MotionBlurGaze, type MotionBlurSettings } from '../../shared/render/motionBlur.ts';
 import { readFloatTexture, readValidationTexture } from '../../shared/render/gpuReadback.ts';
 import { createLightmapPages, type LightmapPageSource } from '../../shared/render/virtualTexture/lightmapPages.ts';
 import { VirtualLightmap } from '../../shared/render/virtualTexture/virtualLightmap.ts';
 import { createLightmapDemand } from '../../shared/render/virtualTexture/lightmapDemand.ts';
-import { bakeKey, loadBake, saveBake } from '../../shared/gi/bake/persistedBake.ts';
+import { bakeKey, bakeStorageKind, loadBake, saveBake } from '../../shared/gi/bake/persistedBake.ts';
 import { loadStreamedBake } from '../../shared/gi/bake/streamedBake.ts';
 import { U_BAKED_LOD_OVERRIDE } from '../../shared/gi/bake/bakedHitLod.ts';
 import { padLightmapCharts } from '../../shared/gi/bake/chartPadding.ts';
-import { giKnobs } from '../../shared/gi/surfel/knobs.ts';
 import {
   createLightControls,
   findSunPositionWeighted,
@@ -36,7 +35,7 @@ import {
 } from '../../shared/gi/surfel/lighting.ts';
 import { applyOcclusionSettings } from '../../shared/gi/surfel/surfelRadialDepth.ts';
 import { MAX_TEMPORAL_M } from '../../shared/gi/surfel/constants.ts';
-import { U_GI_MEDIUM, giLightSummary } from '../../shared/gi/surfel/sceneLights.ts';
+import { giLightSummary } from '../../shared/gi/surfel/sceneLights.ts';
 import { addDynamicDemoObject, type DynamicObject } from '../../shared/gi/surfel/content.ts';
 
 /**
@@ -81,7 +80,7 @@ export interface SceneHost {
   contact?: Partial<ContactOcclusionSettings>;
   /** Traced reflections preset. On by default (`?reflections=0` turns it off). */
   reflections?: Partial<ReflectionSettings>;
-  /** Motion blur preset. Off by default (`?motionBlur=1` turns it on, `?shutter=` sets the shutter). */
+  /** Motion blur preset. Off by default (`?motionBlur=1` turns it on, `?gaze=centre|camera`, `?shutter=`, `?integration=` ms). */
   motionBlur?: Partial<MotionBlurSettings>;
 }
 
@@ -289,8 +288,6 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   const bakeCache = { source: 'none', storage: 'none', key: '', saved: false, error: '' };
   // The water medium the tracer attenuates sunlight through is bakeable state too,
   // and so are the art-directed sun angles.
-  const bakeMedium = () => (U_GI_MEDIUM.value as THREE.Vector4).toArray();
-  let readBakeControls = () => ({ envIntensity: envIntensityParam, envLod: 4, fromDirect: 1, fromIndirect: 1, albedoBoost: 1, medium: bakeMedium(), sun: [lightCfg.azimuthDeg, lightCfg.elevationDeg, lightCfg.intensity] });
 
   // Declared here rather than with the rest of the GUI because the mode switch reads
   // them: switching to lightmap means "bake with the current settings".
@@ -414,13 +411,11 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
     if (persistent) {
       setLoading('Checking saved static lighting');
       try {
-        key = await bakeKey(scene, gi.envTexture, gi.bakeNoiseTexture, {
-          size: lightmapSize, iterations, rays: lightmapRays, controls: readBakeControls(),
-          knobs: Object.fromEntries(Object.entries(giKnobs).map(([name, read]) => [name, read()])),
-          viewpoint: params.get('bakecam') === 'view' ? camera.position.toArray() : null,
-        });
+        key = await bakeKey(params.get('scene') ?? 'default');
         bakeCache.key = key;
-        if (!forceBake && params.get('vt') !== '0') {
+        // Inside cef-fsapp the bake is a file on disk: the bundle path reads it
+        // whole and the streamed (HTTP page) path is not consulted.
+        if (!forceBake && params.get('vt') !== '0' && bakeStorageKind() === 'http') {
           const usePagesForGi = bakedHitTransport && lightingMode === 'hybrid';
           const streamed = await loadStreamedBake(key, !usePagesForGi);
           if (streamed) {
@@ -650,7 +645,6 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
     fromIndirect: 1,
     albedoBoost: 1,
   };
-  readBakeControls = () => ({ envIntensity: giParams.envIntensity, envLod: giParams.envLod, fromDirect: giParams.fromDirect, fromIndirect: giParams.fromIndirect, albedoBoost: giParams.albedoBoost, medium: bakeMedium(), sun: [lightCfg.azimuthDeg, lightCfg.elevationDeg, lightCfg.intensity] });
   gi.setBaseSampleCount(giParams.baseSamples);
 
   const giFolder = gui.addFolder('GI (surfel)');
@@ -814,6 +808,9 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
     enabled: motionBlurParam === null ? (host.motionBlur?.enabled ?? DEFAULT_MOTION_BLUR.enabled) : motionBlurParam !== '0',
   });
   const shutterParam = num('shutter'); if (shutterParam !== null) motionBlur.settings.shutter = shutterParam;
+  const integrationParam = num('integration'); if (integrationParam !== null) motionBlur.settings.integrationMs = integrationParam;
+  const gazeParam = params.get('gaze') as MotionBlurGaze | null;
+  if (gazeParam === 'centre' || gazeParam === 'camera') motionBlur.settings.gaze = gazeParam;
   const syncMotionBlur = () => frameGraph.setMotionBlur(motionBlur.enabled ? motionBlur : null);
   syncMotionBlur();
   const contactFolder = gui.addFolder('Contact occlusion');
@@ -838,7 +835,11 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   glareFolder.add(glare, 'strength', 0, 0.5, 0.005).name('glare strength').onChange(syncGlare);
   glareFolder.add(glare, 'radius', 0, 1, 0.01).name('glare radius').onChange(syncGlare);
   glareFolder.add(motionBlur.settings, 'enabled').name('motion blur').onChange(syncMotionBlur);
-  glareFolder.add(motionBlur.settings, 'shutter', 0, 1, 0.01).name('shutter');
+  glareFolder.add(motionBlur.settings, 'gaze', ['centre', 'camera']).name('blur relative to');
+  glareFolder.add(motionBlur.settings, 'integrationMs', 5, 100, 1).name('eye integration (ms)');
+  glareFolder.add(motionBlur.settings, 'pursuitGain', 0, 1, 0.01).name('pursuit gain');
+  glareFolder.add(motionBlur.settings, 'pursuitLagMs', 20, 400, 5).name('pursuit lag (ms)');
+  glareFolder.add(motionBlur.settings, 'shutter', 0, 1, 0.01).name('camera shutter');
   glareFolder.add(motionBlur.settings, 'samples', 4, 24, 1).name('blur samples');
   glareFolder.add(motionBlur.settings, 'depthExtent', 0.01, 1, 0.01).name('blur depth extent (m)');
   glareFolder.close();
@@ -970,6 +971,51 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   // `?gputime=1` — without it the renderer never enabled timestamp queries and this
   // resolves to `undefined` for both, which is the honest answer to "how expensive is
   // this frame" when nobody asked the GPU to time itself.
+  // Per-pass GPU/CPU ms from three's RendererInspector, which records every render
+  // and compute of every frame with its timestamp query. `frames` animation frames
+  // are collected and the median per pass is returned, largest GPU first, with the
+  // median frame interval and the median summed GPU time. Audit only.
+  (window as unknown as Record<string, unknown>).__gpuPasses = async (frames = 60) => {
+    type Stats = { name: string; gpu: number; cpu: number; renderTarget?: { width: number; height: number; texture?: { name: string }; textures?: { name: string }[] }; isComputeStats?: boolean };
+    type Frame = { frameId: number; deltaTime: number; resolvedRender: boolean; resolvedCompute: boolean; renders: Stats[]; computes: Stats[] };
+    const inspector = renderer.inspector as unknown as { frames: Frame[]; resolveTimestamp(): Promise<void> };
+    const firstFrame = inspector.frames.length ? inspector.frames[inspector.frames.length - 1].frameId + 1 : 0;
+    for (let i = 0; i < frames; i++) { await new Promise((r) => requestAnimationFrame(r)); await inspector.resolveTimestamp(); }
+    await inspector.resolveTimestamp();
+    const label = (s: Stats) => {
+      if (s.isComputeStats) return `compute ${s.name || '(unnamed)'}`;
+      const rt = s.renderTarget;
+      if (!rt) return `${s.name} → screen`;
+      const tex = rt.texture?.name || rt.textures?.[0]?.name;
+      return `${s.name} → ${tex || 'rt'} ${rt.width}x${rt.height}`;
+    };
+    const per = new Map<string, { gpu: number[]; cpu: number[]; count: number[] }>();
+    const intervals: number[] = [];
+    const totals: number[] = [];
+    let used = 0;
+    for (const f of inspector.frames) {
+      if (f.frameId < firstFrame || !f.resolvedRender || !f.resolvedCompute) continue;
+      used++;
+      intervals.push(f.deltaTime);
+      const byLabel = new Map<string, { gpu: number; cpu: number; count: number }>();
+      let total = 0;
+      for (const s of [...f.renders, ...f.computes]) {
+        const key = label(s);
+        const e = byLabel.get(key) ?? { gpu: 0, cpu: 0, count: 0 };
+        e.gpu += s.gpu; e.cpu += s.cpu; e.count++; byLabel.set(key, e);
+        total += s.gpu;
+      }
+      totals.push(total);
+      for (const [key, e] of byLabel) {
+        const acc = per.get(key) ?? { gpu: [], cpu: [], count: [] };
+        acc.gpu.push(e.gpu); acc.cpu.push(e.cpu); acc.count.push(e.count); per.set(key, acc);
+      }
+    }
+    const median = (a: number[]) => { if (!a.length) return 0; const s = [...a].sort((x, y) => x - y); return s[Math.floor(s.length / 2)]; };
+    const passes = [...per].map(([name, a]) => ({ name, gpu: median(a.gpu), cpu: median(a.cpu), perFrame: median(a.count), frames: a.gpu.length }))
+      .sort((x, y) => y.gpu - x.gpu);
+    return { framesUsed: used, frameMs: median(intervals), gpuMs: median(totals), passes };
+  };
   (window as unknown as Record<string, unknown>).__gpuTime = async () => ({
     render: await renderer.resolveTimestampsAsync('render'),
     compute: await renderer.resolveTimestampsAsync('compute'),
@@ -1030,6 +1076,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
       return motionBlur.enabled;
     },
     motionBlurSettings: motionBlur.settings,
+    motionBlurGaze: () => motionBlur.readGaze(renderer),
     /** Holds or releases the scene's own animation (wind, water) at runtime. */
     still(value?: boolean) {
       if (typeof value === 'boolean') still = value;
@@ -1056,6 +1103,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   let previous = performance.now();
   let firstFrame = true;
   let auditPaused = false;
+  let auditStepOnce = false;
   let auditRecording = false;
   let auditIntervals: number[] = [];
   const originalStaticBvh = gi.getSceneBvh();
@@ -1172,6 +1220,8 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
     },
     hideOverlay() { (renderer.inspector as unknown as { domElement: HTMLElement }).domElement.style.display = 'none'; },
     pause(value = true) { auditPaused = value; previous = performance.now(); },
+    /** Renders exactly one frame while paused, so a check can re-render a held pose with a setting changed. */
+    stepFrame() { if (!auditPaused) throw new Error('Pause before stepping a frame'); auditStepOnce = true; },
     measure() { auditIntervals = []; auditRecording = true; },
     stopMeasure() { auditRecording = false; return auditIntervals.slice(); },
     async read() {
@@ -1188,7 +1238,8 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   };
 
   renderer.setAnimationLoop(() => {
-    if (fatal || auditPaused) return;
+    if (fatal || (auditPaused && !auditStepOnce)) return;
+    auditStepOnce = false;
 
     const now = performance.now();
     const dt = (now - previous) / 1000;

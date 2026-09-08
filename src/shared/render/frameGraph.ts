@@ -651,7 +651,7 @@ export class FrameGraph {
   render(): void {
     if (this.motionBlur) {
       this.renderer.getDrawingBufferSize(frameSize);
-      this.motionBlur.update(frameSize.width, frameSize.height, this.taa.cut);
+      this.motionBlur.update(this.renderer, this.scenePass.getTexture('velocity'), this.scenePass.getTexture('depth'), frameSize.width, frameSize.height, this.taa.cut);
     }
     if (this.needsComposite) this.rebuildComposite();
     this.frameIndex.value = (this.frameIndex.value + 1) % 4096;

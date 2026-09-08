@@ -1,16 +1,40 @@
 import * as THREE from 'three/webgpu';
 import {
-  Fn, If, Loop, clamp, dot, float, floor, fract, int, ivec2, length, max, min, mix, perspectiveDepthToViewZ,
-  rtt, smoothstep, textureLoad, uniform, uv, vec2, vec4,
+  Fn, If, Loop, clamp, dot, float, floor, fract, instancedArray, int, ivec2, length, max, min, mix,
+  perspectiveDepthToViewZ, rtt, smoothstep, texture, textureLoad, uniform, uv, vec2, vec4,
 } from 'three/tsl';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type N = any;
 
+/**
+ * Whose motion the blur is relative to. `camera`: the film camera — every pixel
+ * smears by its own screen velocity over the shutter. `centre`: the eye — the pixel
+ * smears by its velocity relative to the point the eye is assumed to pursue, the
+ * centre of the frame, over the visual system's integration window; the pursued
+ * region stays sharp on its own (docs/render-research-2026-09-07.md, motion blur
+ * as perception).
+ */
+export type MotionBlurGaze = 'camera' | 'centre';
+
 export interface MotionBlurSettings {
   enabled: boolean;
-  /** Fraction of the frame interval the shutter is open (film: 180° = 0.5). */
+  gaze: MotionBlurGaze;
+  /** `camera` only: fraction of the frame interval the shutter is open (film: 180° = 0.5). */
   shutter: number;
+  /**
+   * `centre` only: the visual system's effective integration window, ms. Early
+   * vision integrates ~100 ms (Burr 1980) but suppresses most of the smear it would
+   * cause, by a third and more during pursuit (Bedell & Lott 1996); 30 ms is the
+   * working estimate, not a measurement.
+   */
+  integrationMs: number;
+  /** `centre` only: smooth-pursuit gain — the eye tracks ~90% of the target's velocity. */
+  pursuitGain: number;
+  /** `centre` only: time constant of the pursuit catching up with a new target velocity, ms. */
+  pursuitLagMs: number;
+  /** `centre` only: radius of the central window the gaze velocity is averaged over, fraction of the width. */
+  gazeRadius: number;
   /** Samples along the blur line per pixel. */
   samples: number;
   /**
@@ -25,7 +49,12 @@ export interface MotionBlurSettings {
 /** Off by default: the user finds motion blur unnatural and turns it off in every game. */
 export const DEFAULT_MOTION_BLUR: Readonly<MotionBlurSettings> = {
   enabled: false,
+  gaze: 'centre',
   shutter: 0.5,
+  integrationMs: 30,
+  pursuitGain: 0.9,
+  pursuitLagMs: 120,
+  gazeRadius: 0.08,
   samples: 12,
   maxRadius: 20,
   depthExtent: 0.1,
@@ -55,7 +84,17 @@ export const DEFAULT_MOTION_BLUR: Readonly<MotionBlurSettings> = {
  */
 export class MotionBlur {
   readonly settings: MotionBlurSettings;
+  /** Blur length per unit of per-frame pixel velocity: the shutter fraction, or the integration window in frames. */
   readonly uShutter = uniform(0.5);
+  /** Pursuit gain applied to the gaze velocity; zero in `camera` mode. */
+  private readonly uGazeGain = uniform(0);
+  private readonly uGazeRadius = uniform(64);
+  private readonly uGazeBlend = uniform(1);
+  /** Storage, two floats: the smoothed gaze velocity in pixels per frame, written by the gaze kernel. */
+  private readonly gazeBuffer: N;
+  private gazeKernel: THREE.ComputeNode | null = null;
+  private gazeSource: THREE.Texture | null = null;
+  private lastTime = 0;
   readonly uSamples = uniform(12, 'int');
   readonly uDepthExtent = uniform(0.1);
   private readonly uSize = uniform(new THREE.Vector2(1, 1));
@@ -69,6 +108,13 @@ export class MotionBlur {
   constructor(settings: Partial<MotionBlurSettings> = {}) {
     this.settings = { ...DEFAULT_MOTION_BLUR, ...settings };
     this.k = Math.max(4, Math.round(this.settings.maxRadius));
+    this.gazeBuffer = instancedArray(new Float32Array(2), 'float').setName('motionBlurGaze');
+  }
+
+  /** The smoothed gaze velocity, pixels per frame (audit only; the frame never waits on it). */
+  async readGaze(renderer: THREE.WebGPURenderer): Promise<[number, number]> {
+    const data = new Float32Array(await renderer.getArrayBufferAsync(this.gazeBuffer.value));
+    return [data[0], data[1]];
   }
 
   get enabled(): boolean {
@@ -76,12 +122,27 @@ export class MotionBlur {
   }
 
   /**
-   * Per-frame uniforms; call before the composite renders. On a camera cut (`cut`)
-   * the shutter closes for the frame: the velocities are a teleport, not motion.
+   * Per-frame uniforms and the gaze kernel; call before the composite renders. On a
+   * camera cut (`cut`) the shutter closes for the frame — the velocities are a
+   * teleport, not motion — and the pursuit restarts on the new target (a saccade).
    */
-  update(width: number, height: number, cut = false): void {
+  update(renderer: THREE.WebGPURenderer, velocityTex: THREE.Texture, depthTex: THREE.Texture, width: number, height: number, cut = false): void {
     const s = this.settings;
-    this.uShutter.value = cut ? 0 : s.shutter;
+    const now = performance.now();
+    const dt = this.lastTime === 0 ? 1 / 60 : Math.min(0.1, Math.max(1e-3, (now - this.lastTime) / 1000));
+    this.lastTime = now;
+    const perception = s.gaze === 'centre';
+    this.uShutter.value = cut ? 0 : perception ? s.integrationMs / 1000 / dt : s.shutter;
+    this.uGazeGain.value = perception ? s.pursuitGain : 0;
+    this.uGazeRadius.value = Math.max(8, s.gazeRadius * width);
+    this.uGazeBlend.value = cut ? 1 : 1 - Math.exp(-dt / Math.max(1e-3, s.pursuitLagMs / 1000));
+    if (perception) {
+      if (velocityTex !== this.gazeSource || !this.gazeKernel) {
+        this.gazeSource = velocityTex;
+        this.gazeKernel = this.buildGazeKernel(velocityTex, depthTex);
+      }
+      renderer.compute(this.gazeKernel, [1, 1, 1]);
+    }
     this.uSamples.value = Math.max(1, Math.min(32, Math.round(s.samples)));
     this.uDepthExtent.value = Math.max(1e-3, s.depthExtent);
     if (width !== this.width || height !== this.height) {
@@ -95,11 +156,54 @@ export class MotionBlur {
     }
   }
 
-  /** Pixel-space velocity of the texel at `px` (integer coords), shutter-scaled and clamped. */
+  /** NDC delta (current − previous, y up) to pixels per frame (y down). */
+  private toPixels(ndc: N): N {
+    return vec2(ndc.x.mul(0.5).mul(this.uSize.x), ndc.y.mul(-0.5).mul(this.uSize.y));
+  }
+
+  /**
+   * The gaze velocity: the mean velocity of the surfaces under a 16x16 sample grid
+   * over the central window, smoothed toward the previous value with the pursuit
+   * lag. Samples with nothing drawn (depth at the far plane) do not count — the eye
+   * pursues a thing, not the empty background between things; when the window holds
+   * no surface at all the estimate stays where it was, the way pursuit coasts across
+   * a gap. One thread, no readback; the composite reads the buffer.
+   */
+  private buildGazeKernel(velocityTex: THREE.Texture, depthTex: THREE.Texture): THREE.ComputeNode {
+    const gaze = this.gazeBuffer;
+    const size = this.uSize;
+    const radius = this.uGazeRadius;
+    const blend = this.uGazeBlend;
+    return Fn(() => {
+      const sum = vec2(0).toVar();
+      const count = float(0).toVar();
+      const centre = size.mul(0.5);
+      Loop({ start: int(0), end: int(16), type: 'int', condition: '<' }, ({ i }: { i: N }) => {
+        Loop({ start: int(0), end: int(16), type: 'int', condition: '<' }, ({ i: j }: { i: N }) => {
+          const offset = vec2(float(j).add(0.5).div(16).sub(0.5), float(i).add(0.5).div(16).sub(0.5)).mul(radius.mul(2));
+          const at = clamp(centre.add(offset).div(size), 0, 1);
+          If(texture(depthTex, at).level(float(0)).r.lessThan(1), () => {
+            sum.addAssign(this.toPixels(texture(velocityTex, at).level(float(0)).xy));
+            count.addAssign(1);
+          });
+        });
+      });
+      const previous = vec2(gaze.element(0), gaze.element(1));
+      const mean = sum.div(max(count, 1));
+      const next = count.greaterThan(0).select(mix(previous, mean, blend), previous);
+      gaze.element(0).assign(next.x);
+      gaze.element(1).assign(next.y);
+    })().computeKernel([1, 1, 1]).setName('Motion blur gaze');
+  }
+
+  /**
+   * Blur-space velocity of the texel at `px` (integer coords): pixels per frame
+   * relative to the pursued point, scaled to a blur length and clamped.
+   */
   private pixelVelocity(velocityTex: THREE.Texture, px: N): N {
-    const ndc = textureLoad(velocityTex, px).xy;
-    // NDC delta (current − previous), y up; pixels, y down.
-    const v = vec2(ndc.x.mul(0.5).mul(this.uSize.x), ndc.y.mul(-0.5).mul(this.uSize.y)).mul(this.uShutter);
+    const own = this.toPixels(textureLoad(velocityTex, px).xy);
+    const pursued = vec2(this.gazeBuffer.element(0), this.gazeBuffer.element(1)).mul(this.uGazeGain);
+    const v = own.sub(pursued).mul(this.uShutter);
     const len = length(v);
     return v.mul(min(len, float(this.k)).div(max(len, 1e-4)));
   }
@@ -187,9 +291,17 @@ export class MotionBlur {
         // float32 precision.
         const jitter = fract(float(52.9829189).mul(fract(float(px.x).mul(0.06711056).add(float(px.y).mul(0.00583715))))).sub(0.5);
         const samples = this.uSamples;
+        // Two sample lines, alternating (Guertin, McKee, Nowrouzezahrai, "A Fast and
+        // Stable Feature-Aware Motion Blur Filter", HPG 2014): the tile's dominant
+        // velocity, so a fast neighbour can smear over this pixel, and the pixel's
+        // own, so a slow pixel inside a fast tile gathers its own short blur densely
+        // instead of catching one or two of the tile's samples at random — measured
+        // here as a striped 10 px smear on a coconut whose own motion was 3 px.
+        const ownLine = length(vX).greaterThan(0.5).select(vX, vN);
         Loop({ start: int(0), end: samples, type: 'int', condition: '<' }, ({ i }: { i: N }) => {
           const t = mix(float(-1), float(1), float(i).add(jitter).add(1).div(float(samples).add(1)));
-          const py = clamp(ivec2(floor(vec2(px).add(0.5).add(vN.mul(t)))), ivec2(0), maxPx);
+          const line = i.mod(2).equal(0).select(vN, ownLine);
+          const py = clamp(ivec2(floor(vec2(px).add(0.5).add(line.mul(t)))), ivec2(0), maxPx);
           If(py.x.notEqual(px.x).or(py.y.notEqual(px.y)), () => {
             const dist = length(vec2(py.sub(px)));
             const vY = this.pixelVelocity(velocityTex, py);
@@ -215,3 +327,5 @@ export class MotionBlur {
     this.neighborMax?.renderTarget.dispose();
   }
 }
+
+// bake-key probe: an edit outside the bake code

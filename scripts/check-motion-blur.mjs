@@ -20,8 +20,19 @@
 //      vertical detail must not drop by nearly as much (a directional blur, not a
 //      Gaussian), and the mean luminance must stay (an energy conserving filter). The
 //      measured velocity is read from the scene pass so the blur radius is on record.
-//   4. A teleport is a cut: the frame after `__camera` jumps a metre must not be blurred.
-//   5. No console error the pass adds; GPU ms on/off from per-frame timestamp resolves.
+//   4. Perception mode (`gaze=centre`, the default): the camera pans steadily (a yaw
+//      about the eye), the assumed gaze pursues the centre of the frame. The gaze
+//      estimate must converge on the centre's velocity, the centre region (the
+//      coconuts) must stay sharp with the blur on, and the edge of the frame, which a
+//      pan moves 1/cos²(25°) = 1.22x faster than the centre at this field of view,
+//      must smear more than the centre. (A sideways slide was tried first: the edge
+//      fronds sit at nearly the pursued depth, so parallax gave them no relative
+//      motion — the model was right and the test was wrong.) The pan runs twice from the same pose, blur on and
+//      blur off, and the 40th frame is held (`__audit.pause`) for the screenshot, so
+//      the two frames are the same pose in the same state of motion (re-rendering a
+//      held pose with the camera still changed the TAA more than the blur did).
+//   5. A teleport is a cut: the frame after `__camera` jumps a metre must not be blurred.
+//   6. No console error the pass adds; GPU ms on/off from per-frame timestamp resolves.
 //
 // After the loading overlay hides the page saves the bake and the main thread stalls
 // for seconds; every measurement waits for 30 consecutive frames under 100 ms first,
@@ -118,9 +129,10 @@ try {
   await page.evaluate(() => window.__fog.still(true));
   await setBlur(page, true);
 
-  // 3. The camera alternates between two poses 5 cm apart along x every frame, so the
-  // velocity has a constant magnitude and the picture never drifts away from where
-  // the blur-off frame is taken (at most one step apart).
+  // 3. Camera mode: the camera alternates between two poses 5 cm apart along x every
+  // frame, so the velocity has a constant magnitude and the picture never drifts away
+  // from where the blur-off frame is taken (at most one step apart).
+  await page.evaluate(() => { window.__fog.motionBlurSettings.gaze = 'camera'; });
   const slide = async () => page.evaluate(() => {
     const c = window.__probe();
     const p = c.camera, t = c.target;
@@ -144,7 +156,47 @@ try {
   await page.evaluate(() => { window.__slideOn = false; });
   await setBlur(page, true);
 
-  // 4. A cut: teleport the camera a metre and read the very next frame.
+  // 4. Perception mode: a steady pan, 0.3° of yaw a frame (~10 px at the centre), the
+  // gaze pursuing the centre. Measured after 24 frames, past the pursuit lag (120 ms)
+  // and before the palm leaves the middle of the frame.
+  const centre = [650, 250, 300, 300];
+  const edgeFronds = [0, 0, 300, 450];
+  await page.evaluate(() => { window.__fog.motionBlurSettings.gaze = 'centre'; });
+  const pose = await page.evaluate(() => window.__probe());
+  const steady = async (on) => {
+    await setBlur(page, on);
+    await page.evaluate((b) => window.__camera(...b.camera, ...b.target), pose);
+    await page.waitForTimeout(400);
+    await page.evaluate((b) => new Promise((resolve) => {
+      const p = b.camera, t = b.target;
+      const dx = t[0] - p[0], dz = t[2] - p[2];
+      let frame = 0;
+      const tick = () => {
+        frame += 1;
+        const a = frame * 0.3 * Math.PI / 180;
+        window.__camera(p[0], p[1], p[2], p[0] + dx * Math.cos(a) - dz * Math.sin(a), t[1], p[2] + dx * Math.sin(a) + dz * Math.cos(a));
+        if (frame === 24) { window.__audit.pause(true); resolve(); return; }
+        requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    }), pose);
+    await page.waitForTimeout(200);
+    const img = await shot(page, on ? 'steady-on' : 'steady-off');
+    const state = { gaze: await page.evaluate(() => window.__fog.motionBlurGaze()), centreVelocityPx: await meanVelocityPx(page, centre), edgeVelocityPx: await meanVelocityPx(page, edgeFronds) };
+    await page.evaluate(() => window.__audit.pause(false));
+    return { img, state };
+  };
+  const on = await steady(true);
+  const off = await steady(false);
+  const steadyOn = on.img, steadyOff = off.img;
+  report.perception = { ...on.state, offState: off.state };
+  await setBlur(page, true);
+  report.perception.centreRatio = gradient(steadyOn, centre, 1, 0) / gradient(steadyOff, centre, 1, 0);
+  report.perception.edgeRatio = gradient(steadyOn, edgeFronds, 1, 0) / gradient(steadyOff, edgeFronds, 1, 0);
+  await page.evaluate(() => { const c = window.__probe(); const p = c.camera, t = c.target; window.__camera(p[0] - 0.4, p[1], p[2], t[0] - 0.4, t[1], t[2]); });
+  await page.waitForTimeout(300);
+
+  // 5. A cut: teleport the camera a metre and read the very next frame.
   const cutOn = await page.evaluate(() => new Promise((resolve) => {
     const c = window.__probe(); const p = c.camera, t = c.target;
     window.__camera(p[0] + 1.5, p[1], p[2], t[0] + 1.5, t[1], t[2]);
@@ -173,6 +225,11 @@ try {
   assert.ok(report.wind.sand < 1, `a still pixel in an animating frame must not change: ${JSON.stringify(report.wind)}`);
   assert.ok(report.slideVelocityPx > 5, `the alternating camera must give the fronds a measurable velocity: ${report.slideVelocityPx} px`);
   assert.ok(report.cut.detected === true, 'a 1.5 m teleport must be detected as a cut');
+  const gazeSpeed = Math.hypot(...report.perception.gaze);
+  assert.ok(gazeSpeed > 1 && Math.abs(gazeSpeed - report.perception.centreVelocityPx) < report.perception.centreVelocityPx * 0.5,
+    `the gaze estimate must follow the centre's velocity: ${JSON.stringify(report.perception)}`);
+  assert.ok(report.perception.centreRatio > 0.93, `the pursued centre must stay sharp: ${JSON.stringify(report.perception)}`);
+  assert.ok(report.perception.edgeRatio < report.perception.centreRatio - 0.05, `the near edge must smear more than the pursued centre: ${JSON.stringify(report.perception)}`);
   assert.ok(report.slide.horizontalRatio < 0.8, `a sideways slide must smear horizontal detail: ${JSON.stringify(report.slide)}`);
   assert.ok(report.slide.verticalRatio > report.slide.horizontalRatio + 0.1, `the blur must be directional: ${JSON.stringify(report.slide)}`);
   assert.ok(Math.abs(report.slide.lumaOn - report.slide.lumaOff) < report.slide.lumaOff * 0.03, `the blur must conserve energy: ${JSON.stringify(report.slide)}`);
