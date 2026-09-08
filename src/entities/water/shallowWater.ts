@@ -103,7 +103,7 @@ export class ShallowWater {
   constructor(options: ShallowWaterOptions) {
     const {
       renderer, bathymetry, half, waterLevel, size = 384,
-      swellAmplitude = 0.06, swellPeriod = 3.2, swellDirection = Math.atan2(-1, 1),
+      swellAmplitude = 0.12, swellPeriod = 3.2, swellDirection = Math.atan2(-1, 1),
       faceDepth = { x: 1.2, z: 1.2 },
     } = options;
     this.renderer = renderer;

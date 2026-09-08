@@ -9,7 +9,7 @@ const min = Number(arg('--min', '300'));
 const browser = await chromium.launch({ channel: 'chrome', headless: true, args: ['--enable-unsafe-webgpu', '--ignore-gpu-blocklist', '--use-angle=d3d11'] });
 const page = await browser.newPage({ viewport: { width: 1600, height: 900 } });
 page.on('pageerror', e => console.log('pageerror', String(e).slice(0, 300)));
-await page.goto(`http://127.0.0.1:5188/?scene=beach&hud=0&mode=surfel&bake=0&cam=${cam}`);
+await page.goto(`http://127.0.0.1:5188/?scene=beach&hud=0&mode=surfel&bake=0&cam=${cam}&sprayTest=${arg('--test', '0')}`);
 await page.waitForFunction(() => !!window.__water && document.querySelector('#loading-overlay')?.hidden, null, { timeout: 240000 });
 await page.waitForTimeout(3000);
 let best = 0;

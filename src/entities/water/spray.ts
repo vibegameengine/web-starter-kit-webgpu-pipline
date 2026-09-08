@@ -71,7 +71,7 @@ export interface SprayOptions {
   sunDir: ReturnType<typeof uniform>;
   sunColor: ReturnType<typeof uniform>;
   count?: number;
-  /** `?sprayTest=1`: droplets spawn everywhere over the water; `2`: billboards on a fixed grid, no state at all. */
+  /** `?sprayTest=1`: droplets spawn everywhere over the water; `2`: billboards on a fixed grid, no state; `3`: no depth test. */
   test?: number;
 }
 
@@ -180,7 +180,7 @@ export class Spray {
         const v = simState.sample(u);
         const breaking = smoothstep(0.6, 1.0, v.a).mul(smoothstep(0.3, 1.0, length(v.gb))).mul(smoothstep(0.06, 0.15, v.r)).mul(0.4);
         const s = max(f.b, breaking);
-        return (test >= 1 ? v.r.greaterThan(0.05).select(float(0.3), float(0.0)) : s) as unknown as F;
+        return (test === 1 ? v.r.greaterThan(0.05).select(float(0.3), float(0.0)) : s) as unknown as F;
       };
       const tryA = vec2(r1, r2) as unknown as V2;
       const tryB = vec2(r4, r5) as unknown as V2;
@@ -193,20 +193,27 @@ export class Spray {
       const flowSpeed = length(flow.gb);
       // Emission ∝ energy flux: the source already carries the climb speed; the
       // flow speed squared scales the chance so a fast impact throws far more.
-      const spawn = source.mul(float(0.4).add(flowSpeed.mul(flowSpeed).mul(0.6))).mul(r3.add(0.5)).greaterThan(0.07);
+      const spawn = source.mul(float(0.4).add(flowSpeed.mul(flowSpeed).mul(0.6))).mul(r3.add(0.5)).greaterThan(0.04);
       const tryXz = tryUv.sub(0.5).mul(2.0).mul(slabHalf);
-      // Radius: skewed to small (r⁴ of a uniform), 0.3–4 mm.
-      const radiusNew = float(0.0003).add(pow(r6, 4.0).mul(0.0037)).mul(test >= 1 ? 3.0 : 1.0);
+      // Radius: skewed to small (r² of a uniform), 0.3–4 mm.
+      const radiusNew = float(0.0003).add(pow(r6, 2.0).mul(0.0037)).mul(test === 1 ? 3.0 : 1.0);
       // The jet: stagnation head u²/2g, amplified 1.5–3× for a wave front on a wall;
       // its speed is √(2 g H) = √amplification · u. The sheet leaves the wall a
       // little backward.
-      const uImpact = max(flowSpeed, source.mul(1.5));
+      // A bore of depth h meets the wall at about its own celerity √(g h) and
+      // reflects; the solver's cell velocity underestimates that at the wall face.
+      const bore = sqrt(float(GRAVITY).mul(max(flow.r, 0.05))).mul(1.2);
+      const uImpact = max(max(flowSpeed.mul(1.5), source.mul(1.5)), bore.mul(smoothstep(0.2, 0.6, source)));
       const amplification = float(1.5).add(r3.mul(1.5));
       const jetSpeed = sqrt(amplification).mul(uImpact);
       const flowDir = flow.gb.div(max(flowSpeed, 1e-3));
       const spread = vec2(hash(id.add(5.0), this.seed.add(11.0)).sub(0.5), hash(id.add(9.0), this.seed.add(13.0)).sub(0.5)).mul(jetSpeed.mul(0.5));
       const back = flowDir.mul(jetSpeed.negate().mul(0.25));
-      const spawnPos = vec3(tryXz.x, level.add(surface.sample(tryUv).r).add(0.02), tryXz.y);
+      // The jet leaves the face of the boulder, not its foot: the impact cell is under
+      // the stone's own overhang, so the droplet starts a hand back against the flow
+      // and above the surface, where the camera can see it.
+      const spawnXz = tryXz.sub(flowDir.mul(0.08));
+      const spawnPos = vec3(spawnXz.x, level.add(surface.sample(tryUv).r).add(0.05), spawnXz.y);
       const spawnVel = vec3(back.x.add(spread.x), jetSpeed.mul(float(0.8).add(r1.mul(0.4))), back.y.add(spread.y));
       const posOut = select(alive, vec4(pos, ageNext), select(spawn, vec4(spawnPos, 0.001), vec4(0.0, -10.0, 0.0, 0.0)));
       const velOut = select(alive, vec4(vel, velRad.w), select(spawn, vec4(spawnVel, radiusNew), vec4(0.0)));
@@ -243,8 +250,10 @@ export class Spray {
     // never smaller than a few millimetres; the smallest ones hang as mist and are
     // drawn as large faint puffs instead.
     const mist = smoothstep(0.0009, 0.0004, radius);
-    const bead = float(0.003).add(radius.mul(2.0));
-    const puff = float(0.03).add(age.mul(0.02));
+    // In sunlight a droplet reads as its glint: a bright speck a centimetre across
+    // whatever its true size; the mist plume is drawn as broad soft puffs.
+    const bead = float(0.012).add(radius.mul(2.5));
+    const puff = float(0.06).add(age.mul(0.08));
     const size = mix(bead, puff, mist);
     // Stretch along the velocity's screen direction (a shutter's worth of flight).
     const vView = cameraViewMatrix.mul(vec4(velocity.xyz, 0.0)).xyz;
@@ -269,18 +278,21 @@ export class Spray {
     const rim = pow(float(1.0).sub(sphereZ), 3.0);
     const behind = this.screenColor.sample(screenUV.add(centred.mul(0.004)) as unknown as V2).rgb;
     const sunLit = vec3(sunColor).mul(clamp(vec3(sunDir).y, 0.0, 1.0));
-    const beadColor = behind.mul(0.8).add(sunLit.mul(glint.mul(1.5).add(rim.mul(0.35)))).add(vec3(0.35, 0.38, 0.42).mul(rim));
-    const beadAlpha = disc.mul(float(0.55).add(rim.mul(0.35)));
-    const mistColor = sunLit.mul(0.25).add(vec3(0.55, 0.6, 0.65));
-    const mistAlpha = smoothstep(1.0, 0.0, rr).mul(0.06).mul(smoothstep(2.0, 0.6, age));
+    const beadColor = behind.mul(0.35).add(sunLit.mul(glint.mul(2.0).add(rim.mul(0.5)).add(0.35))).add(vec3(0.5, 0.55, 0.6).mul(rim.add(0.3)));
+    const beadAlpha = disc.mul(float(0.75).add(rim.mul(0.25)));
+    // The plume: aerated water, white in the sun, densest in the first half second.
+    const mistColor = sunLit.mul(0.5).add(vec3(0.75, 0.8, 0.85));
+    const mistAlpha = smoothstep(1.0, 0.0, rr).mul(0.3).mul(smoothstep(1.4, 0.3, age));
     const colorOut = mix(beadColor, mistColor, mist);
-    const alphaOut = mix(beadAlpha, mistAlpha, mist).mul(smoothstep(0.0, 0.05, age));
+    // Fresh from the jet the sheet has not broken up yet: brighter and fuller.
+    const fresh = smoothstep(0.25, 0.0, age).mul(0.5).add(1.0);
+    const alphaOut = clamp(mix(beadAlpha, mistAlpha, mist).mul(fresh).mul(smoothstep(0.0, 0.03, age)), 0.0, 1.0);
     sprite.colorNode = colorOut;
     sprite.opacityNode = alphaOut;
     const sceneZ = perspectiveDepthToViewZ(this.screenDepth.sample(screenUV).x, cameraNear, cameraFar);
     sprite.fragmentNode = Fn(() => {
       // Occluded by whatever the scene drew there; dead ones draw nothing.
-      Discard(positionView.z.lessThan(sceneZ.sub(0.005)).or(age.lessThan(0.0001)));
+      Discard((test === 3 ? age.lessThan(-1.0) : positionView.z.lessThan(sceneZ.sub(0.005))).or(age.lessThan(0.0001)));
       return vec4(colorOut.mul(alphaOut), alphaOut);
     })();
     this.mesh = new THREE.InstancedMesh(geometry, sprite, side * side);
@@ -289,20 +301,28 @@ export class Spray {
   }
 
   /** How many droplets are alive, and where the first few are (debugging). */
-  async readStats(): Promise<{ alive: number; sample: number[][] }> {
+  async readStats(): Promise<{ alive: number; sample: number[][]; mean: number[]; box: number[]; yMax: number }> {
     const side = this.side;
     const raw = await this.renderer.readRenderTargetPixelsAsync(this.posRead, 0, 0, side, side, 0);
     const decode = raw instanceof Uint16Array ? (x: number) => THREE.DataUtils.fromHalfFloat(x) : (x: number) => x;
     let alive = 0;
     const sample: number[][] = [];
+    const mean = [0, 0, 0];
+    const box = [Infinity, Infinity, -Infinity, -Infinity];
+    let yMax = -Infinity;
     for (let i = 0; i < side * side; i++) {
       const age = decode(raw[i * 4 + 3]);
       if (age > 0) {
         alive++;
-        if (sample.length < 4) sample.push([decode(raw[i * 4]), decode(raw[i * 4 + 1]), decode(raw[i * 4 + 2]), age].map((v) => Number(v.toFixed(3))));
+        const x = decode(raw[i * 4]), y = decode(raw[i * 4 + 1]), z = decode(raw[i * 4 + 2]);
+        mean[0] += x; mean[1] += y; mean[2] += z;
+        box[0] = Math.min(box[0], x); box[1] = Math.min(box[1], z); box[2] = Math.max(box[2], x); box[3] = Math.max(box[3], z);
+        yMax = Math.max(yMax, y);
+        if (sample.length < 4) sample.push([x, y, z, age].map((v) => Number(v.toFixed(3))));
       }
     }
-    return { alive, sample };
+    const n = Math.max(1, alive);
+    return { alive, sample, mean: mean.map((v) => Number((v / n).toFixed(2))), box: box.map((v) => Number(v.toFixed(2))), yMax: Number(yMax.toFixed(2)) };
   }
 
   /** The frame graph's composited colour and scene depth: refraction and occlusion. */

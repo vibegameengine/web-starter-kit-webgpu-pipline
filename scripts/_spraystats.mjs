@@ -6,7 +6,7 @@ page.on('console', m => { if (m.type() === 'error' || m.type() === 'warning') co
 const test = process.argv[2] ?? '1';
 await page.goto(`http://127.0.0.1:5188/?scene=beach&hud=0&mode=surfel&bake=0&sprayTest=${test}`);
 await page.waitForFunction(() => !!window.__water && document.querySelector('#loading-overlay')?.hidden, null, { timeout: 180000 });
-for (const wait of [1000, 1500, 1500]) {
+for (const wait of [1000, 800, 800, 800, 800, 800]) {
   await page.waitForTimeout(wait);
   console.log(JSON.stringify(await page.evaluate(() => window.__water.sprayStats())));
 }
