@@ -17,6 +17,7 @@ import { ContactOcclusionPass, type ContactOcclusionSettings } from '../../share
 import { createContactBVH, type ContactBVHBundle } from '../../shared/gi/contact/contactBvh.ts';
 import { ReflectionPass, type ReflectionSettings } from '../../shared/gi/reflect/reflectionPass.ts';
 import { meanEnvironmentRadiance } from '../../shared/render/atmosphere/volumetricFog.ts';
+import { AutoExposure } from '../../shared/render/exposure.ts';
 import { readFloatTexture, readValidationTexture } from '../../shared/render/gpuReadback.ts';
 import { createLightmapPages, type LightmapPageSource } from '../../shared/render/virtualTexture/lightmapPages.ts';
 import { VirtualLightmap } from '../../shared/render/virtualTexture/virtualLightmap.ts';
@@ -62,13 +63,6 @@ export interface SceneHost {
    * and the scene depth every time those textures are (re)created.
    */
   bindScreen?: (color: THREE.Texture, depth: THREE.Texture, normal: THREE.Texture) => void;
-}
-
-export interface PipelineUi {
-  setLoading(message: string): void;
-  clearLoading(): void;
-  showError(error: unknown): void;
-  /** `?hud=0`: no HUD, no GUI, no inspector widget in a judged frame. */
   /**
    * Volumetric fog preset for this scene (density, height, the box it lives in). Absent
    * = no fog unless `?fog=1`; present = on unless `?fog=0`. Runtime toggle in the GUI.
@@ -180,6 +174,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
     gui,
     sun,
   );
+  const envIntensityParam = num('env') ?? 1;
   // `?sun=0` puts the sun out without removing it, which is the only way to show that
   // an emissive surface is a *light source* rather than a surface that happens to look
   // bright when something else is lighting it. Pair with `?env=0`; the sky is the other
@@ -191,8 +186,8 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   const sunAz = num('sunAz');
   const sunEl = num('sunEl');
   if (sunAz !== null && sunEl !== null) setLightAngles(sunAz, sunEl);
+  // `?exposure=` fixes the exposure (auto metering off); otherwise the meter decides.
   const exposure = num('exposure');
-  if (exposure !== null) renderer.toneMappingExposure = exposure;
   applyOcclusionSettings({ shadowStrength: 0.5 });
 
   // AFTER the host populated its scene, deliberately: buildCornellScene ends by
@@ -272,7 +267,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   // Applied here, not with the rest of the GUI defaults further down: the bake runs
   // before those exist, and a knob that only takes effect after the cache has converged
   // is a knob that does nothing.
-  const envIntensityParam = num('env') ?? 1;
+  
   gi.setEnvControls(envIntensityParam, 4);
 
   const lightmapIntensity = uniform(0);
@@ -308,31 +303,15 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
     indirectIntensity: num('gi') ?? 1,
     splitView: (params.get('split') as SplitView) ?? SplitView.Off,
     overlay: host.bindScreen !== undefined,
+    // `?aa=taa|fxaa|none`; TAA is the default and the accumulation every later
+    // stochastic pass (soft shadows, occlusion, reflections) settles into.
+    antialiasing: (['taa', 'fxaa', 'none'] as Antialiasing[]).find((m) => m === params.get('aa')) ?? 'taa',
   });
   if (host.bindScreen) {
     frameGraph.onScreenTextures = host.bindScreen;
     frameGraph.forceRebuild();
   }
 
-  /**
-   * `surfel` resolves the cache on screen every frame; `lightmap` samples a texture
-   * and does no GI work at all.
-   *
-   * These are not two views of one state, they are two consumers of the *same* surfel
-   * pool, and the bake spends the whole pool on atlas texels. So a switch is not a
-   * toggle — each direction has to re-prepare the pool for its own occupant, which is
-   * why this is async and shows the loading overlay rather than flipping instantly.
-   */
-  type LightingMode = 'surfel' | 'lightmap' | 'hybrid';
-    // `?aa=taa|fxaa|none`; TAA is the default and the accumulation every later
-    // stochastic pass (soft shadows, occlusion, reflections) settles into.
-    antialiasing: (['taa', 'fxaa', 'none'] as Antialiasing[]).find((m) => m === params.get('aa')) ?? 'taa',
-  let lightingMode: LightingMode = requestedLightingMode === 'lightmap' || requestedLightingMode === 'surfel' ? requestedLightingMode : 'hybrid';
-  const bakedHitTransport = params.get('bakedHits') !== '0';
-  gi.bakedFeedbackEnabled = params.get('giPageFeedback') !== '0';
-  let cameraPageDemandEnabled = true;
-
-  async function prepareLightmap(iterations: number, forceBake = false): Promise<void> {
   // Volumetric fog (shared/render/atmosphere): the sun's own shadow map lights the air,
   // so it needs nothing from the scene beyond the preset. `?fog=0|1` overrides it.
   const fogParam = params.get('fog');
@@ -356,6 +335,13 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   // the scene. Off for the Cornell reference frame unless asked, on where a scene asks.
   const glareParam = params.get('glare');
   const glare = {
+    enabled: glareParam === null ? host.glare !== undefined : glareParam !== '0',
+    strength: num('glareStrength') ?? host.glare?.strength ?? 0.22,
+    radius: num('glareRadius') ?? host.glare?.radius ?? 0.5,
+  };
+  const syncGlare = () => frameGraph.setGlare(glare.enabled ? { strength: glare.strength, radius: glare.radius } : null);
+  syncGlare();
+
   // Contact occlusion: short rays against the GI's own BVHs from the GI G-buffer, an
   // occlusion of the indirect terms only. `?contact=0|1`, `?contactRadius=`.
   const contactParam = params.get('contact');
@@ -419,13 +405,6 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   let cameraPageDemandEnabled = true;
 
   async function prepareLightmap(iterations: number, forceBake = false): Promise<void> {
-    enabled: glareParam === null ? host.glare !== undefined : glareParam !== '0',
-    strength: num('glareStrength') ?? host.glare?.strength ?? 0.04,
-    radius: num('glareRadius') ?? host.glare?.radius ?? 0.7,
-  };
-  const syncGlare = () => frameGraph.setGlare(glare.enabled ? { strength: glare.strength, radius: glare.radius } : null);
-  syncGlare();
-
     const persistent = lightingMode === 'hybrid' && params.get('bakeCache') !== '0';
     let key = '';
     bakeCache.source = 'none'; bakeCache.storage = 'none'; bakeCache.saved = false; bakeCache.error = '';
@@ -719,6 +698,9 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   });
 
   const modeFolder = gui.addFolder('Lighting');
+  if (shadowFilter === 'soft') {
+    modeFolder.add(U_SUN_ANGULAR_DIAMETER_DEG, 'value', 0, 5, 0.01).name('sun disc (°)');
+  }
   const modeParams = { mode: lightingMode as LightingMode };
   const modeCtrl = modeFolder
     .add(modeParams, 'mode', ['surfel', 'lightmap', 'hybrid'])
@@ -735,9 +717,6 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   let refreshFrozenControl = () => {};
   onModeSettled = (mode) => {
     modeParams.mode = mode;
-  if (shadowFilter === 'soft') {
-    modeFolder.add(U_SUN_ANGULAR_DIAMETER_DEG, 'value', 0, 5, 0.01).name('sun disc (°)');
-  }
     modeCtrl.updateDisplay?.();
     if (mode !== 'surfel') intensityCtrl.enable?.();
     else intensityCtrl.disable?.();
@@ -746,13 +725,20 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   onModeSettled(lightingMode);
 
   host.bindGui?.(gui);
-  const bakeFolder = gui.addFolder('GI bake');
-  // Both budgets are always present: the mode is a runtime switch now, so hiding the
-  // other one only means the value it would use is invisible when it gets used.
-  bakeFolder.add(bakeParams, 'passes', 8, 256, 1).name('lightmap passes');
-  bakeFolder.add(bakeParams, 'seconds', 1, 30, 0.5).name('surfel budget s');
-  const frozenCtrl = bakeFolder
-    .add(bakeParams, 'frozen')
+  const fogFolder = gui.addFolder('Atmosphere');
+  const fogSettings = fog.settings;
+  fogFolder.add(fogSettings, 'enabled').name('volumetric fog').onChange((v: boolean) => { fog.setEnabled(v); syncFog(); });
+  fogFolder.add(fogSettings, 'density', 0, 0.12, 0.001).name('density (1/m)');
+  fogFolder.add(fogSettings, 'heightFalloff', 0, 2, 0.01).name('height falloff (1/m)');
+  fogFolder.add(fogSettings, 'baseHeight', -5, 10, 0.05).name('base height (m)');
+  fogFolder.add(fogSettings, 'sunIntensity', 0, 12, 0.05).name('sun scatter');
+  fogFolder.add(fogSettings, 'anisotropy', -0.9, 0.9, 0.01).name('anisotropy g');
+  fogFolder.add(fogSettings, 'ambientIntensity', 0, 3, 0.01).name('sky scatter');
+  fogFolder.add(fogSettings, 'noiseStrength', 0, 1, 0.01).name('noise');
+  fogFolder.add(fogSettings, 'noiseScale', 0.02, 1, 0.01).name('noise scale (1/m)');
+  fogFolder.add(fogSettings, 'windSpeed', 0, 5, 0.05).name('wind (m/s)');
+  fogFolder.add(fogSettings, 'temporalBlend', 0, 0.97, 0.01).name('temporal blend');
+  fogFolder.close();
   // Reflections: screen trace, then the contact tree + movers, then the environment.
   // `?reflections=0|1`, `?reflectionsRoughness=`.
   const reflectionsParam = params.get('reflections');
@@ -800,6 +786,24 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   reflectionsFolder.add(reflections.settings, 'screenSteps', 8, 96, 1).name('screen steps');
   reflectionsFolder.add(reflections.settings, 'intensity', 0, 2, 0.01).name('strength').onChange((v: number) => { reflectionsIntensity.value = v; });
   reflectionsFolder.close();
+  // Auto exposure (shared/render/exposure.ts) and film grain, both GPU-side.
+  const autoExposure = new AutoExposure(renderer, exposure !== null ? { auto: false, manual: exposure } : {});
+  frameGraph.setExposure(autoExposure.node);
+  const grainStrength = uniform(num('grain') ?? 0.015);
+  const grainState = { enabled: params.get('grain') !== '0' };
+  const syncGrain = () => frameGraph.setGrain(grainState.enabled ? grainStrength : null);
+  syncGrain();
+  const exposureFolder = gui.addFolder('Exposure');
+  exposureFolder.add(autoExposure.settings, 'auto').name('auto (meter)');
+  exposureFolder.add(autoExposure.settings, 'manual', 0.05, 8, 0.01).name('manual');
+  exposureFolder.add(autoExposure.settings, 'key', 0.05, 0.5, 0.01).name('middle grey');
+  exposureFolder.add(autoExposure.settings, 'minEV', -6, 0, 0.1).name('min EV');
+  exposureFolder.add(autoExposure.settings, 'maxEV', 0, 6, 0.1).name('max EV');
+  exposureFolder.add(autoExposure.settings, 'speedUp', 0.1, 10, 0.1).name('speed up (1/s)');
+  exposureFolder.add(autoExposure.settings, 'speedDown', 0.1, 10, 0.1).name('speed down (1/s)');
+  exposureFolder.add(grainState, 'enabled').name('film grain').onChange(syncGrain);
+  exposureFolder.add(grainStrength, 'value', 0, 0.15, 0.005).name('grain strength');
+  exposureFolder.close();
   const contactFolder = gui.addFolder('Contact occlusion');
   contactFolder.add(contact.settings, 'enabled').name('enabled').onChange((v: boolean) => { contact.setEnabled(v); syncContact(); });
   contactFolder.add(contact.settings, 'radius', 0.05, 2, 0.01).name('radius (m)');
@@ -809,15 +813,26 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   contactFolder.add(contact.settings, 'historyWeight', 0, 0.97, 0.01).name('history');
   contactFolder.add(contact.settings, 'intensity', 0, 1, 0.01).name('strength').onChange((v: number) => { contactIntensity.value = v; });
   contactFolder.close();
-  const contactFolder = gui.addFolder('Contact occlusion');
-  contactFolder.add(contact.settings, 'enabled').name('enabled').onChange((v: boolean) => { contact.setEnabled(v); syncContact(); });
-  contactFolder.add(contact.settings, 'radius', 0.05, 2, 0.01).name('radius (m)');
-  contactFolder.add(contact.settings, 'rays', 1, 8, 1).name('rays / frame');
-  // Grid scale is boot-time only (`?contactScale=`): reallocating the buffers at
-  // runtime left the frame in a broken, seconds-long state (2026-09-08, unexplained).
-  contactFolder.add(contact.settings, 'historyWeight', 0, 0.97, 0.01).name('history');
-  contactFolder.add(contact.settings, 'intensity', 0, 1, 0.01).name('strength').onChange((v: number) => { contactIntensity.value = v; });
-  contactFolder.close();
+  const glareFolder = gui.addFolder('Post');
+  const aaParams = { mode: frameGraph.antialiasingMode };
+  glareFolder.add(aaParams, 'mode', ['taa', 'fxaa', 'none']).name('anti-aliasing').onChange((m: Antialiasing) => frameGraph.setAntialiasing(m));
+  glareFolder.add(frameGraph.taa.historyWeight, 'value', 0, 0.97, 0.01).name('taa history');
+  const taaUnjitter = num('taaUnjitter'); if (taaUnjitter !== null) frameGraph.taa.unjitterSign.value = taaUnjitter;
+  const taaClip = num('taaClip'); if (taaClip !== null) frameGraph.taa.clipGamma.value = taaClip;
+  const taaCopy = num('taaCopy'); if (taaCopy !== null) frameGraph.taa.copyMode = taaCopy;
+  const taaHistory = num('taaHistory'); if (taaHistory !== null) frameGraph.taa.historyWeight.value = taaHistory;
+  glareFolder.add(frameGraph.taa.clipGamma, 'value', 0.5, 2, 0.05).name('taa clip gamma');
+  glareFolder.add(glare, 'enabled').name('veiling glare').onChange(syncGlare);
+  glareFolder.add(glare, 'strength', 0, 0.5, 0.005).name('glare strength').onChange(syncGlare);
+  glareFolder.add(glare, 'radius', 0, 1, 0.01).name('glare radius').onChange(syncGlare);
+  glareFolder.close();
+  const bakeFolder = gui.addFolder('GI bake');
+  // Both budgets are always present: the mode is a runtime switch now, so hiding the
+  // other one only means the value it would use is invisible when it gets used.
+  bakeFolder.add(bakeParams, 'passes', 8, 256, 1).name('lightmap passes');
+  bakeFolder.add(bakeParams, 'seconds', 1, 30, 0.5).name('surfel budget s');
+  const frozenCtrl = bakeFolder
+    .add(bakeParams, 'frozen')
     .name('frozen')
     .onChange((v: boolean) => {
       if (lightingMode === 'surfel') gi.setFrozen(v);
@@ -827,30 +842,6 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   refreshFrozenControl = () => {
     const staticBaked = lightingMode !== 'surfel';
     bakeParams.frozen = staticBaked || gi.frozen;
-  const fogFolder = gui.addFolder('Atmosphere');
-  const fogSettings = fog.settings;
-  fogFolder.add(fogSettings, 'enabled').name('volumetric fog').onChange((v: boolean) => { fog.setEnabled(v); syncFog(); });
-  fogFolder.add(fogSettings, 'density', 0, 0.12, 0.001).name('density (1/m)');
-  fogFolder.add(fogSettings, 'heightFalloff', 0, 2, 0.01).name('height falloff (1/m)');
-  fogFolder.add(fogSettings, 'baseHeight', -5, 10, 0.05).name('base height (m)');
-  fogFolder.add(fogSettings, 'sunIntensity', 0, 12, 0.05).name('sun scatter');
-  fogFolder.add(fogSettings, 'anisotropy', -0.9, 0.9, 0.01).name('anisotropy g');
-  fogFolder.add(fogSettings, 'ambientIntensity', 0, 3, 0.01).name('sky scatter');
-  fogFolder.add(fogSettings, 'noiseStrength', 0, 1, 0.01).name('noise');
-  fogFolder.add(fogSettings, 'noiseScale', 0.02, 1, 0.01).name('noise scale (1/m)');
-  fogFolder.add(fogSettings, 'windSpeed', 0, 5, 0.05).name('wind (m/s)');
-  fogFolder.add(fogSettings, 'temporalBlend', 0, 0.97, 0.01).name('temporal blend');
-  fogFolder.close();
-  const glareFolder = gui.addFolder('Post');
-  const aaParams = { mode: frameGraph.antialiasingMode };
-  glareFolder.add(aaParams, 'mode', ['taa', 'fxaa', 'none']).name('anti-aliasing').onChange((m: Antialiasing) => frameGraph.setAntialiasing(m));
-  glareFolder.add(frameGraph.taa.historyWeight, 'value', 0, 0.97, 0.01).name('taa history');
-  glareFolder.add(frameGraph.taa.clipGamma, 'value', 0.5, 2, 0.05).name('taa clip gamma');
-  glareFolder.add(renderer, 'toneMappingExposure', 0.1, 3, 0.01).name('exposure');
-  glareFolder.add(glare, 'enabled').name('veiling glare').onChange(syncGlare);
-  glareFolder.add(glare, 'strength', 0, 0.3, 0.005).name('glare strength').onChange(syncGlare);
-  glareFolder.add(glare, 'radius', 0, 1, 0.01).name('glare radius').onChange(syncGlare);
-  glareFolder.close();
     frozenCtrl?.name(staticBaked ? 'static frozen' : 'freeze all GI');
     if (staticBaked) frozenCtrl?.disable();
     else frozenCtrl?.enable();
@@ -887,7 +878,6 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
     .name('bounce n')
     .onChange(() => gi.setGiScales(giParams.fromDirect, giParams.fromIndirect));
   giFolder
-  const still = params.get('still') === '1';
     .add(giParams, 'albedoBoost', 1, 4, 0.05)
     .name('albedo boost')
     .onChange((v: number) => gi.setAlbedoBoost(v));
@@ -895,6 +885,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   // Freeze time-of-day by default: the sun is derived from the env map, and moving it
   // would put the analytic light out of step with the image-based ambient.
   lightCfg.animate = params.get('animate') === '1';
+  const still = params.get('still') === '1';
 
   window.addEventListener('resize', () => {
     camera.aspect = window.innerWidth / window.innerHeight;
@@ -977,19 +968,21 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   // Pins the sphere to a fixed pose so a diff against webgiya measures the renderer
   // rather than two animation clocks that were never in step.
   let frozen = false;
-  (window as unknown as Record<string, unknown>).__freeze = (t: number) => {
-    dynamic?.update(t);
-    frozen = true;
-    return true;
-  };
-  const freezeAt = num('freezeAt');
-  if (freezeAt !== null) {
-    split(view: SplitView, at = 0.5) {
-    reflections(value?: boolean) {
-      if (typeof value === 'boolean') { reflections.setEnabled(value); syncReflections(); }
-      return reflections.enabled;
+  // Fog audit: toggle at runtime (the same path the GUI checkbox takes), read or set
+  // the knobs, and report the froxel grid — so a check can prove "off" is the old frame.
+  (window as unknown as Record<string, unknown>).__fog = {
+    enabled(value?: boolean) {
+      if (typeof value === 'boolean') { fog.setEnabled(value); syncFog(); }
+      return fog.enabled;
     },
-    reflectionSettings: reflections.settings,
+    settings: fog.settings,
+    grid: [fog.width, fog.height, fog.depth],
+    invalidate: () => fog.invalidateHistory(),
+    glare(value?: boolean) {
+      if (typeof value === 'boolean') { glare.enabled = value; syncGlare(); }
+      return glare.enabled;
+    },
+    split(view: SplitView, at = 0.5) {
       frameGraph.splitPosition = at;
       frameGraph.setSplitView(view);
       frameGraph.forceRebuild();
@@ -999,8 +992,37 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
       return contact.enabled;
     },
     contactSettings: contact.settings,
+    reflections(value?: boolean) {
+      if (typeof value === 'boolean') { reflections.setEnabled(value); syncReflections(); }
+      return reflections.enabled;
+    },
+    reflectionSettings: reflections.settings,
+    exposureSettings: autoExposure.settings,
+    exposure: () => autoExposure.read(),
+    // Frame-synced readback of the TAA output for stability checks.
+    taaFrame: () => readFloatTexture(renderer, frameGraph.taa.resolvedTexture),
+    taaState: () => frameGraph.taa.state,
+    velocityFrame: () => readFloatTexture(renderer, frameGraph.scenePass.getTexture('velocity')),
+    sceneFrame: () => readFloatTexture(renderer, frameGraph.scenePass.getTexture('output')),
+    taaInputFrame: () => readFloatTexture(renderer, frameGraph.taa.inputTexture!),
+    grain(value?: boolean) {
+      if (typeof value === 'boolean') { grainState.enabled = value; syncGrain(); }
+      return grainState.enabled;
+    },
     computeCalls: () => renderer.info.compute.frameCalls,
     memory: () => ({ ...renderer.info.memory }),
+    aa(mode?: Antialiasing) {
+      if (mode) { aaParams.mode = mode; frameGraph.setAntialiasing(mode); }
+      return frameGraph.antialiasingMode;
+    },
+  };
+  (window as unknown as Record<string, unknown>).__freeze = (t: number) => {
+    dynamic?.update(t);
+    frozen = true;
+    return true;
+  };
+  const freezeAt = num('freezeAt');
+  if (freezeAt !== null) {
     dynamic?.update(freezeAt);
     frozen = true;
   }
@@ -1010,40 +1032,6 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   let auditPaused = false;
   let auditRecording = false;
   let auditIntervals: number[] = [];
-  // Fog audit: toggle at runtime (the same path the GUI checkbox takes), read or set
-  // the knobs, and report the froxel grid — so a check can prove "off" is the old frame.
-  (window as unknown as Record<string, unknown>).__fog = {
-    enabled(value?: boolean) {
-      if (typeof value === 'boolean') { fog.setEnabled(value); syncFog(); }
-      return fog.enabled;
-    },
-    settings: fog.settings,
-    grid: [fog.width, fog.height, fog.depth],
-    invalidate: () => fog.invalidateHistory(),
-    glare(value?: boolean) {
-      if (typeof value === 'boolean') { glare.enabled = value; syncGlare(); }
-      return glare.enabled;
-    },
-    aa(mode?: Antialiasing) {
-      if (mode) { aaParams.mode = mode; frameGraph.setAntialiasing(mode); }
-      return frameGraph.antialiasingMode;
-    },
-  };
-  // Fog audit: toggle at runtime (the same path the GUI checkbox takes), read or set
-  // the knobs, and report the froxel grid — so a check can prove "off" is the old frame.
-  (window as unknown as Record<string, unknown>).__fog = {
-    enabled(value?: boolean) {
-      if (typeof value === 'boolean') { fog.setEnabled(value); syncFog(); }
-      return fog.enabled;
-    },
-    settings: fog.settings,
-    grid: [fog.width, fog.height, fog.depth],
-    invalidate: () => fog.invalidateHistory(),
-    glare(value?: boolean) {
-      if (typeof value === 'boolean') { glare.enabled = value; syncGlare(); }
-      return glare.enabled;
-    },
-  };
   const originalStaticBvh = gi.getSceneBvh();
   let runtimeMoverSerial = 0;
   const runtimeMovers = new Map<string, THREE.Mesh>();
@@ -1150,6 +1138,12 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
     clearPages() { virtualLightmap?.clear(); },
     realtimeContribution(value: number) { frameGraph.indirectIntensity.value = value; },
     shadowContribution(value: number) { sun.shadow.intensity = Math.max(0, Math.min(1, value)); },
+    sun(azimuthDeg: number, elevationDeg: number, intensity?: number) {
+      lightCfg.azimuthDeg = azimuthDeg; lightCfg.elevationDeg = elevationDeg;
+      if (typeof intensity === 'number') lightCfg.intensity = intensity;
+      updateLightFromAngles();
+      return [lightCfg.azimuthDeg, lightCfg.elevationDeg, lightCfg.intensity];
+    },
     hideOverlay() { (renderer.inspector as unknown as { domElement: HTMLElement }).domElement.style.display = 'none'; },
     pause(value = true) { auditPaused = value; previous = performance.now(); },
     measure() { auditIntervals = []; auditRecording = true; },
@@ -1178,17 +1172,8 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
     world.beginFrame(dt);
     controls.update();
     updateAnimation();
-      // Same G-buffer, same jittered camera, this frame: trace the contact rays now.
-      contact.update(contactTree(), gi.dynamicBvhBundle, gi.gbufferDepthTexture, gi.receiverTexture,
-        renderer.domElement.width, renderer.domElement.height, true);
-      syncContact();
-      // Reflections read last frame's resolved colour: the TAA history. Without TAA the
-      // pass still runs, against whatever the history holds (stale after a switch).
-      if (reflections.enabled && !contactBvh && gi.staticBvh) contactBvh = createContactBVH(scene, gi.staticBvh.materialIdByUUID);
-      reflections.update(contactBvh, gi.dynamicBvhBundle, gi.diffuseArrayTexture, gi.gbufferDepthTexture, gi.receiverTexture,
-        gi.specularTexture, frameGraph.taa.historyTexture, renderer.domElement.width, renderer.domElement.height, 1);
-      syncReflections();
     camera.updateMatrixWorld();
+    frameGraph.beginFrame();
     if (!frozen) dynamic?.update(now * 0.001);
     // `?still=1` holds the scene's own animation (wind, water) so a check can compare
     // two frames of one session without motion between them.
@@ -1197,13 +1182,8 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
     if (!switching && lightingMode === 'hybrid' && virtualLightmap && lightmapDemand) {
       if (now >= nextPageDemandAt) {
         virtualLightmap.setDemand(cameraPageDemandEnabled
-      // Same G-buffer, same jittered camera, this frame: trace the contact rays now.
-      contact.update(contactTree(), gi.dynamicBvhBundle, gi.gbufferDepthTexture, gi.receiverTexture,
-        renderer.domElement.width, renderer.domElement.height, true);
-      syncContact();
           ? lightmapDemand(camera, renderer.domElement.width, renderer.domElement.height, virtualLightmap.anisotropy.value) : [], gi.getBakedPageDemand(now));
         nextPageDemandAt = now + 150;
-    frameGraph.beginFrame();
       }
       if (!pausePageStreaming) virtualLightmap.update(now);
     }
@@ -1217,13 +1197,26 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
       gi.updateDynamicScene();
       gi.update(renderer, scene, camera);
       frameGraph.setGiTextures(gi.outputTexture, gi.albedoTexture);
+      // Same G-buffer, same jittered camera, this frame: trace the contact rays now.
+      contact.update(contactTree(), gi.dynamicBvhBundle, gi.gbufferDepthTexture, gi.receiverTexture,
+        renderer.domElement.width, renderer.domElement.height, true);
+      syncContact();
+      // Reflections read last frame's resolved colour: the TAA history. Without TAA the
+      // pass still runs, against whatever the history holds (stale after a switch).
+      if (reflections.enabled && !contactBvh && gi.staticBvh) contactBvh = createContactBVH(scene, gi.staticBvh.materialIdByUUID);
+      reflections.update(contactBvh, gi.dynamicBvhBundle, gi.diffuseArrayTexture, gi.gbufferDepthTexture, gi.receiverTexture,
+        gi.specularTexture, frameGraph.taa.historyTexture, renderer.domElement.width, renderer.domElement.height, 1);
+      syncReflections();
     }
 
     // The sky lights every host; whether it is also the picture behind the scene is
     // the host's call (a diorama sits in front of its own backdrop).
-    fog.update(now);
     scene.background = host.skyIsBackground ? gi.envTexture : null;
+    // Meter last frame's resolved HDR (the TAA history) so the composite of this
+    // frame already carries the adapted exposure; nothing is read back.
+    autoExposure.update(frameGraph.taa.historyTexture, renderer.domElement.width, renderer.domElement.height, dt);
     frameGraph.render();
+    frameGraph.endFrame();
 
     stats.endFrame(world.dt);
     hud?.update(world.dt);
@@ -1231,7 +1224,6 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
     if (firstFrame) {
       firstFrame = false;
       clearLoading();
-    frameGraph.endFrame();
     }
   });
 }

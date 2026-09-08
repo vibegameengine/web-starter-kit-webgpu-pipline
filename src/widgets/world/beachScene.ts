@@ -264,7 +264,7 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
       near: 0.5,
       far: 70,
     },
-    glare: { strength: 0.04, radius: 0.7 },
+    glare: { strength: 0.22, radius: 0.5 },
     bindGui(gui) {
       const c = water.controls;
       const folder = gui.addFolder('Water');

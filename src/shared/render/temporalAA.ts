@@ -1,5 +1,6 @@
 import * as THREE from 'three/webgpu';
 import {
+  passTexture,
   Fn,
   If,
   abs,
@@ -8,7 +9,6 @@ import {
   ivec2,
   max,
   mix,
-  passTexture,
   sqrt,
   texture,
   textureLoad,
@@ -19,6 +19,7 @@ import {
   vec4,
   velocity,
 } from 'three/tsl';
+import { U_PREVIOUS_VIEW_PROJECTION, U_VIEW_PROJECTION } from './vertexMotion.ts';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type N = any;
@@ -77,15 +78,30 @@ const drawingSize = new THREE.Vector2();
 export class TemporalAANode extends THREE.TempNode {
   /** History weight for a still pixel; 0.9 = ten-frame convergence. */
   readonly historyWeight = uniform(0.9);
+  /**
+   * The current frame is sampled at the unjittered position (resampled by −jitter), so
+   * what the blend adds each frame is the same scene point, not the jitter's wobble.
+   * Sign of that offset; 0 (default) reads the raw texel: measured 2026-09-08 with
+   * `scripts/_taa_unjitter_probe.mjs`, neither sign beat the raw texel, so the resample
+   * stays available (`?taaUnjitter=1|-1`) but off.
+   */
+  readonly unjitterSign = uniform(0);
+  /** Control for the bisection: 1 = the old copy-to-history path (history one frame late). */
+  copyMode = 0;
+  private readonly uJitter = uniform(new THREE.Vector2());
   /** Variance-clip width in standard deviations. 1.0 tight, 1.5 loose. */
   readonly clipGamma = uniform(1.25);
   /** Pixel speed at which the history weight has fallen to `motionWeight`. */
   readonly motionPixels = uniform(24);
   readonly motionWeight = uniform(0.5);
 
-  private readonly historyTarget: THREE.RenderTarget;
-  private readonly resolveTarget: THREE.RenderTarget;
-  private readonly resolveMaterial: THREE.NodeMaterial;
+  /** Two targets, ping-pong: the frame resolves into one while reading the other. */
+  private readonly targets: [THREE.RenderTarget, THREE.RenderTarget];
+  /** One resolve material per parity, each bound to a fixed history texture: no per-frame rebinding. */
+  private readonly resolveMaterials: [THREE.NodeMaterial, THREE.NodeMaterial];
+  private parity = 0;
+  /** 0/1: which target holds this frame's resolve; the composite selects by it. */
+  private readonly uOutputParity = uniform(0);
   private readonly textureNode: THREE.Node;
   private readonly texelSize = uniform(new THREE.Vector2(1 / 1600, 1 / 900));
   private readonly historyValid = uniform(0);
@@ -112,22 +128,45 @@ export class TemporalAANode extends THREE.TempNode {
       rt.texture.magFilter = THREE.LinearFilter;
       return rt;
     };
-    this.historyTarget = make('TAA.history');
-    this.resolveTarget = make('TAA.resolve');
-    this.resolveMaterial = new THREE.NodeMaterial();
-    this.resolveMaterial.name = 'TAA.resolve';
-    this.textureNode = passTexture(this as unknown as THREE.PassNode, this.resolveTarget.texture);
+    this.targets = [make('TAA.a'), make('TAA.b')];
+    this.resolveMaterials = [new THREE.NodeMaterial(), new THREE.NodeMaterial()];
+    this.resolveMaterials[0].name = 'TAA.resolve.a';
+    this.resolveMaterials[1].name = 'TAA.resolve.b';
+    // Both targets stay bound in the composite; a uniform picks this frame's. Swapping
+    // a texture node's value each frame lagged a frame behind the bind group and the
+    // history was read from the target being written (bimodal: some boots resolved,
+    // most did not — measured 2026-09-08 with scripts/_taa_steps_probe.mjs).
+    // `passTexture(this, …)` is what makes the node part of the graph so `updateBefore`
+    // runs at all; without it the resolve never rendered and the frame was black.
+    this.textureNode = this.uOutputParity.lessThan(0.5).select(
+      passTexture(this as unknown as THREE.PassNode, this.targets[0].texture),
+      texture(this.targets[1].texture),
+    ) as unknown as THREE.Node;
   }
 
   /** Last frame's resolved colour — what a reflection ray reads when it lands on screen. */
   get historyTexture(): THREE.Texture {
-    return this.historyTarget.texture;
+    return this.targets[1 - this.parity].texture;
+  }
+
+  /**
+   * The most recent resolve. `updateBefore` flips the parity after writing, so between
+   * frames (where an audit reads this) the latest frame sits in `targets[1 - parity]`,
+   * the same texture `historyTexture` names for the next frame's readers.
+   */
+  get resolvedTexture(): THREE.Texture {
+    return this.targets[1 - this.parity].texture;
+  }
+
+  /** The frame being accumulated (the composed beauty the resolve reads), for audits. */
+  get inputTexture(): THREE.Texture | null {
+    return this.inputNode?.value ?? null;
   }
 
   /** Replaces the frame being accumulated (composite rebuilt); history is kept. */
   setInput(node: N): void {
     this.inputNode = node;
-    this.resolveMaterial.needsUpdate = true;
+    this.buildMaterials();
   }
 
   getTextureNode(): THREE.Node {
@@ -157,9 +196,32 @@ export class TemporalAANode extends THREE.TempNode {
     this.originalProjection.copy(cam.projectionMatrix);
     velocity.setProjectionMatrix(this.originalProjection);
     const [jx, jy] = JITTER[this.jitterIndex];
+    this.uJitter.value.set(jx - 0.5, jy - 0.5);
+    this.lastWidth = width;
+    this.lastHeight = height;
     cam.setViewOffset(width, height, jx - 0.5, jy - 0.5, width, height);
     this.jittered = true;
   }
+
+  /**
+   * Publishes the unjittered view-projection of this frame and keeps last frame's,
+   * for materials that compute their own motion vectors (vertexMotion.ts). Call every
+   * frame after the camera's matrices are current, whatever the AA mode.
+   */
+  trackCamera(): void {
+    const cam = this.camera;
+    U_PREVIOUS_VIEW_PROJECTION.value.copy(U_VIEW_PROJECTION.value);
+    const wasJittered = this.jittered;
+    if (wasJittered) cam.clearViewOffset();
+    cam.updateProjectionMatrix();
+    U_VIEW_PROJECTION.value.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
+    if (wasJittered) {
+      const [jx, jy] = JITTER[this.jitterIndex];
+      cam.setViewOffset(this.lastWidth, this.lastHeight, jx - 0.5, jy - 0.5, this.lastWidth, this.lastHeight);
+    }
+  }
+  private lastWidth = 1;
+  private lastHeight = 1;
 
   /** Restores the camera after the frame rendered. */
   endFrame(): void {
@@ -170,15 +232,20 @@ export class TemporalAANode extends THREE.TempNode {
     this.jittered = false;
   }
 
+  /** Audit: what the resolve was told this frame. */
+  get state(): { historyReady: boolean; historyValid: number; parity: number; jitter: number[]; weight: number } {
+    return { historyReady: this.historyReady, historyValid: this.historyValid.value, parity: this.parity, jitter: [this.uJitter.value.x, this.uJitter.value.y], weight: this.historyWeight.value };
+  }
+
   /** Drops the accumulated history (camera cut). */
   reset(): void {
     this.historyReady = false;
   }
 
   setSize(width: number, height: number): void {
-    if (this.historyTarget.width === width && this.historyTarget.height === height) return;
-    this.historyTarget.setSize(width, height);
-    this.resolveTarget.setSize(width, height);
+    if (this.targets[0].width === width && this.targets[0].height === height) return;
+    this.targets[0].setSize(width, height);
+    this.targets[1].setSize(width, height);
     this.texelSize.value.set(1 / width, 1 / height);
     this.historyReady = false;
   }
@@ -190,25 +257,47 @@ export class TemporalAANode extends THREE.TempNode {
 
     const previousTarget = renderer.getRenderTarget();
     this.historyValid.value = this.historyReady ? 1 : 0;
+    // Ping-pong instead of a copy: `copyTextureToTexture` submits its own command
+    // buffer at once, ahead of a render recorded inside another render, so the copy
+    // took last frame's resolve and the history ran a frame late — two solutions
+    // alternating, a wobble on every thin edge (bisected 2026-09-08).
+    // `copyMode` keeps the old behaviour reachable for the check's control: resolve
+    // into A, copy A into B, always read B.
+    const write = this.copyMode ? this.targets[0] : this.targets[this.parity];
+    const read = this.copyMode ? this.targets[1] : this.targets[1 - this.parity];
     if (!this.historyReady) {
-      // Fresh targets after a resize/reset are undefined memory on some backends;
-      // clear them so the first (fully weighted) current frame is all that shows.
-      renderer.setRenderTarget(this.historyTarget);
+      renderer.setRenderTarget(read);
       renderer.clear();
     }
-
-    renderer.setRenderTarget(this.resolveTarget);
-    quad.material = this.resolveMaterial;
+    renderer.setRenderTarget(write);
+    // Material `parity` reads targets[1 - parity] as history; in copy mode material 0
+    // reads targets[1], which the copy refreshes.
+    quad.material = this.resolveMaterials[this.copyMode ? 0 : this.parity];
     quad.name = 'TAA';
     quad.render(renderer);
     renderer.setRenderTarget(previousTarget);
-
-    renderer.copyTextureToTexture(this.resolveTarget.texture, this.historyTarget.texture);
+    this.uOutputParity.value = this.copyMode ? 0 : this.parity;
+    if (this.copyMode) renderer.copyTextureToTexture(write.texture, read.texture);
+    else this.parity = 1 - this.parity;
     this.historyReady = true;
   }
 
   override setup(): THREE.Node {
-    const current = this.inputNode;
+    this.buildMaterials();
+    return this.textureNode;
+  }
+
+  /** Builds the two resolve materials (history from target B for material A, and vice versa). */
+  private buildMaterials(): void {
+    if (!this.inputNode) return;
+    for (let p = 0; p < 2; p++) {
+      this.resolveMaterials[p].fragmentNode = this.buildResolve(this.inputNode, texture(this.targets[1 - p].texture));
+      this.resolveMaterials[p].needsUpdate = true;
+    }
+  }
+
+  private buildResolve(inputNode: N, historyNode: N): N {
+    const current = inputNode;
     const depth = this.depthNode;
     const motion = this.velocityNode;
     const texel = this.texelSize;
@@ -226,9 +315,12 @@ export class TemporalAANode extends THREE.TempNode {
     );
     const loadCurrent = (px: N) => vec3(textureLoad(current.value, px).rgb);
     const loadDepth = (px: N) => textureLoad(depth.value, px).r;
-    // The RTT node itself has to sit in this material's graph, or it is never rendered;
-    // its own sample is the exact centre texel on a same-size quad.
-    const centreSample = vec3(current.rgb);
+    // The RTT node itself has to sit in this material's graph, or it is never rendered.
+    // The centre sample is taken at the unjittered position: the camera drew this frame
+    // offset by `uJitter` texels, so resampling by the opposite offset lands the
+    // same scene point every frame and the blend stops carrying the jitter.
+    const unjitterUv = uv().add(this.uJitter.mul(texel).mul(this.unjitterSign));
+    const centreSample = vec3(current.sample(unjitterUv).rgb);
 
     // Catmull-Rom 9-tap history fetch on the bilinear sampler (Jimenez 2016, 5 taps
     // would drop the corners; the full 9 keeps the reconstruction symmetric).
@@ -245,7 +337,7 @@ export class TemporalAANode extends THREE.TempNode {
       const tc0 = centre.sub(1).mul(texel);
       const tc3 = centre.add(2).mul(texel);
       const tc12 = centre.add(offset12).mul(texel);
-      const tap = (x: N, y: N, w: N) => texture(this.historyTarget.texture, vec2(x, y)).rgb.mul(w);
+      const tap = (x: N, y: N, w: N) => historyNode.sample(vec2(x, y)).rgb.mul(w);
       const sum = vec3(0).toVar();
       sum.addAssign(tap(tc0.x, tc0.y, w0.x.mul(w0.y)));
       sum.addAssign(tap(tc12.x, tc0.y, w12.x.mul(w0.y)));
@@ -322,15 +414,14 @@ export class TemporalAANode extends THREE.TempNode {
       return vec4(max(fromYCoCg(resolved), vec3(0)), 1);
     });
 
-    this.resolveMaterial.fragmentNode = resolve();
-    this.resolveMaterial.needsUpdate = true;
-    return this.textureNode;
+    return resolve();
   }
 
   dispose(): void {
-    this.historyTarget.dispose();
-    this.resolveTarget.dispose();
-    this.resolveMaterial.dispose();
+    this.targets[0].dispose();
+    this.targets[1].dispose();
+    this.resolveMaterials[0].dispose();
+    this.resolveMaterials[1].dispose();
   }
 }
 

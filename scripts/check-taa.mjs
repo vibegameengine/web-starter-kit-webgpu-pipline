@@ -3,12 +3,20 @@
 //   node scripts/check-taa.mjs            # headed Chrome against http://127.0.0.1:5188
 //
 // One session at `?cam=leaves` (fronds against the sun: thin geometry, the worst
-// aliasing in the scene), frozen mover, wind still blowing. In order:
+// aliasing in the scene), frozen mover and wind (`still=1`, so the edge metric is about
+// resolving static edges; motion is covered by the camera cut), grain off. In order:
 //   1. TAA (default) settles for a second; a frame is captured and GPU ms measured.
-//   2. Switch to `none` through the audit hook (the GUI path), capture, measure. The
-//      TAA frame must carry less stair-step energy than the raw one: the count of
-//      pixels whose horizontal luminance step exceeds 48/255, over the frond region.
-//   3. Switch to `fxaa`, capture: TAA must be at least as smooth as FXAA.
+//   2. Ground truth: the eight jittered frames the resolve is fed (the composed
+//      beauty, before the resolve) of the still scene are read back and averaged — the image a converged resolve should output. The resolved
+//      frame must match that average (mean luma difference over the frond region) and
+//      carry no more stair steps than it (pixels whose horizontal luminance step
+//      exceeds 48/255). Eight sub-pixel samples of a thin frond against the sky still
+//      leave most of those steps: the ideal average removes ~17 % of them, so the raw
+//      count is only compared against the average, never against a fixed fraction
+//      (measured 2026-09-08 with `_taa_truth_probe.mjs`: single 11133, average 9198,
+//      resolved 8688).
+//   3. Switch to `none` and `fxaa` through the audit hook (the GUI path), capture,
+//      measure GPU ms; the TAA frame must have fewer steps than the raw one.
 //   4. Back to TAA; the camera jumps by a third of the frame. The first frame after the
 //      jump must not be black and must not be the *old* view (history rejected, not
 //      smeared): its difference to the settled post-jump frame must be small compared
@@ -24,7 +32,7 @@ import assert from 'node:assert/strict';
 
 const out = 'shots/taa';
 await mkdir(out, { recursive: true });
-const url = `http://127.0.0.1:5188/?scene=beach&hud=0&freezeAt=0&gputime=1&cam=leaves${process.env.GI_QUERY ?? ''}`;
+const url = `http://127.0.0.1:5188/?scene=beach&hud=0&freezeAt=0&still=1&grain=0&gputime=1&cam=leaves${process.env.GI_QUERY ?? ''}`;
 const browser = await chromium.launch({
   channel: 'chrome',
   headless: false,
@@ -104,6 +112,29 @@ try {
   assert.equal(await page.evaluate(() => window.__fog.aa()), 'taa', 'TAA must be the default');
   const taa = await shot(page, 'taa');
   report.gpuTaa = await gpuMs(page);
+  // 2. The resolve against the average of the eight jitter phases (linear domain,
+  // display-encoded for the metric the same way for both).
+  report.truth = await page.evaluate(async (region) => {
+    const phases = new Map();
+    let width = 0, height = 0;
+    for (let i = 0; i < 64 && phases.size < 8; i++) {
+      const j = window.__fog.taaState().jitter.join(',');
+      const f = await window.__fog.taaInputFrame();
+      width = f.width; height = f.height;
+      if (!phases.has(j)) phases.set(j, f.data);
+      await new Promise((res) => requestAnimationFrame(res));
+    }
+    const frames = [...phases.values()];
+    const avg = new Float32Array(frames[0].length);
+    for (const d of frames) for (let k = 0; k < d.length; k++) avg[k] += d[k] / frames.length;
+    const resolved = (await window.__fog.taaFrame()).data;
+    const srgb = (v) => Math.pow(Math.min(1, Math.max(0, v)), 1 / 2.2) * 255;
+    const luma = (d, x, y) => { const p = (y * width + x) * 4; return 0.2126 * srgb(d[p]) + 0.7152 * srgb(d[p + 1]) + 0.0722 * srgb(d[p + 2]); };
+    const [rx, ry, rw, rh] = region;
+    const steps = (d) => { let n = 0; for (let y = ry; y < ry + rh; y++) for (let x = rx + 1; x < rx + rw; x++) if (Math.abs(luma(d, x, y) - luma(d, x - 1, y)) > 48) n++; return n; };
+    const diff = (a, b) => { let s = 0, n = 0; for (let y = ry; y < ry + rh; y++) for (let x = rx; x < rx + rw; x++) { s += Math.abs(luma(a, x, y) - luma(b, x, y)); n++; } return s / n; };
+    return { phases: phases.size, steps: { single: steps(frames[0]), average: steps(avg), resolved: steps(resolved) }, resolvedVsAverage: diff(resolved, avg), singleVsAverage: diff(frames[0], avg) };
+  }, fronds);
 
   await setAA(page, 'none');
   const none = await shot(page, 'none');
@@ -142,14 +173,16 @@ try {
   console.log(JSON.stringify(report, null, 2));
 
   assert.deepEqual(errors, [], 'no browser errors');
-  assert.ok(report.steps.taa < report.steps.none * 0.7, `TAA must remove stair steps: ${JSON.stringify(report.steps)}`);
-  assert.ok(report.steps.taa <= report.steps.fxaa * 1.05, `TAA must be at least as smooth as FXAA: ${JSON.stringify(report.steps)}`);
+  assert.equal(report.truth.phases, 8, 'all eight jitter phases must be observed');
+  assert.ok(report.truth.resolvedVsAverage < 2 && report.truth.resolvedVsAverage < report.truth.singleVsAverage * 0.5, `the resolve must converge to the average of the jittered frames: ${JSON.stringify(report.truth)}`);
+  assert.ok(report.truth.steps.resolved <= report.truth.steps.average * 1.05, `the resolve must be as smooth as the converged average: ${JSON.stringify(report.truth)}`);
+  assert.ok(report.steps.taa < report.steps.none, `TAA must remove stair steps: ${JSON.stringify(report.steps)}`);
   assert.ok(report.jump.firstLuma > 20, 'no black frame after the jump');
   // A ghost of the old view would keep `first` close to `before`; a rejected history
   // puts it as far from `before` as the new view is.
   assert.ok(report.jump.firstVsBefore > report.jump.beforeVsSettled * 0.7, `history must be rejected on a cut, not smeared: ${JSON.stringify(report.jump)}`);
   assert.ok(report.settledVsNone.sand < 4, `no drift on the static backdrop: ${JSON.stringify(report.settledVsNone)}`);
-  assert.ok(report.stepsAfter.taa < report.stepsAfter.none * 0.7, `still anti-aliased after settling: ${JSON.stringify(report.stepsAfter)}`);
+  assert.ok(report.stepsAfter.taa < report.stepsAfter.none, `still anti-aliased after settling: ${JSON.stringify(report.stepsAfter)}`);
   console.log('check-taa: PASS');
 } catch (error) {
   console.error(error);

@@ -11,13 +11,13 @@ import {
   screenUV,
   texture,
   vec2,
+  vec3,
   uniform,
   vec4,
   velocity,
 } from 'three/tsl';
-import { fxaa } from 'three/addons/tsl/display/FXAANode.js';
 import { bakedIndirect } from '../gi/bake/applyLightmap.ts';
-import { DFGLUT, getViewPosition, cameraProjectionMatrixInverse, normalize } from 'three/tsl';
+import { DFGLUT, getViewPosition, cameraProjectionMatrixInverse, normalize, renderOutput, hash, screenCoordinate, luminance } from 'three/tsl';
 import { fxaa } from 'three/addons/tsl/display/FXAANode.js';
 import { bloom } from 'three/addons/tsl/display/BloomNode.js';
 import { TemporalAANode } from './temporalAA.ts';
@@ -33,7 +33,6 @@ type TslNode = THREE.Node;
 
 const frameSize = new THREE.Vector2();
 
-export const GiMode = {
 /** Inverse of the contact pass's octahedral encoding (see contactOcclusionPass.ts). */
 const octDecode = (p: ReturnType<typeof vec2>) => {
   const z = float(1).sub(p.x.abs()).sub(p.y.abs());
@@ -43,6 +42,7 @@ const octDecode = (p: ReturnType<typeof vec2>) => {
   return vec3(x, y, z).normalize();
 };
 
+export const GiMode = {
   Direct: 'direct',
   Indirect: 'indirect',
   Combined: 'combined',
@@ -67,14 +67,13 @@ export const SplitView = {
   Cache: 'cache',
   /** The baked lightmap texture, shown flat. */
   Lightmap: 'lightmap',
-} as const;
   /** Contact occlusion: visible fraction of the near hemisphere, white = open. */
   Contact: 'contact',
   /** Contact bent normal, world space, 0.5 + 0.5. */
+  BentNormal: 'bentNormal',
   /** Traced specular radiance before the BRDF weight. */
   Reflections: 'reflections',
 } as const;
-  BentNormal: 'bentNormal',
 export type SplitView = (typeof SplitView)[keyof typeof SplitView];
 
 export interface FrameGraphOptions {
@@ -169,11 +168,18 @@ export class FrameGraph {
    */
   private glare: { strength: THREE.UniformNode<number>; radius: THREE.UniformNode<number> } | null = null;
   private antialiasing: Antialiasing;
-  /** Owns the jitter and the history; idle unless the mode is `taa`. */
+  /** Scene-referred exposure multiplier (a GPU value from the meter), applied after AA, before tone mapping. Null = 1. */
+  private exposureNode: TslNode | null = null;
+  /** Film grain strength in display space, after tone mapping; null = none. */
+  private grain: THREE.UniformNode<number> | null = null;
+  /** Frame counter for the grain's per-frame noise. */
+  private readonly frameIndex = uniform(0);
   /**
    * Contact occlusion reader: `(screenUV) => vec4(oct.xy, visibility, viewDepth)` from
    * the pass's storage buffers, plus its strength. Multiplies the indirect terms only;
    * direct light is already shadowed. Null = off.
+   */
+  private contact: { sample: (uv: TslNode) => TslNode; intensity: THREE.UniformNode<number> } | null = null;
   /**
    * Reflection reader: `(screenUV) => vec4(radiance, confidence)`, the G-buffer's
    * (F0, roughness) texture it is weighted with, and the strength. The specular term is
@@ -182,8 +188,6 @@ export class FrameGraph {
    */
   private reflections: { sample: (uv: TslNode) => TslNode; specular: THREE.Texture; intensity: THREE.UniformNode<number> } | null = null;
   /** Owns the jitter and the history; idle unless the mode is `taa`. */
-   */
-  private contact: { sample: (uv: TslNode) => TslNode; intensity: THREE.UniformNode<number> } | null = null;
   readonly taa: TemporalAANode;
 
   constructor(
@@ -315,11 +319,13 @@ export class FrameGraph {
     this.needsComposite = true;
   }
 
-  setAntialiasing(mode: Antialiasing): void {
   /** Installs or removes the contact-occlusion reader; the composite is rebuilt. */
   setContactOcclusion(reader: { sample: (uv: TslNode) => TslNode; intensity: THREE.UniformNode<number> } | null): void {
     if (reader === this.contact) return;
     this.contact = reader;
+    this.needsComposite = true;
+  }
+
   /** Installs or removes the traced-reflection reader; the composite is rebuilt. */
   setReflections(reader: { sample: (uv: TslNode) => TslNode; specular: THREE.Texture; intensity: THREE.UniformNode<number> } | null): void {
     if (reader === this.reflections) return;
@@ -327,10 +333,25 @@ export class FrameGraph {
     this.needsComposite = true;
   }
 
-  setAntialiasing(mode: Antialiasing): void {
+  /** Installs the exposure multiplier node (see shared/render/exposure.ts). */
+  setExposure(node: TslNode | null): void {
+    if (node === this.exposureNode) return;
+    this.exposureNode = node;
     this.needsComposite = true;
   }
 
+  /**
+   * Film grain: display-referred noise after tone mapping, weighted toward the shadows
+   * where film and sensors are noisiest. `strength` is a uniform; null removes the stage
+   * and hands the output transform back to three.
+   */
+  setGrain(strength: THREE.UniformNode<number> | null): void {
+    if (strength === this.grain) return;
+    this.grain = strength;
+    this.needsComposite = true;
+  }
+
+  setAntialiasing(mode: Antialiasing): void {
     if (mode === this.antialiasing) return;
     this.antialiasing = mode;
     this.taa.reset();
@@ -367,7 +388,6 @@ export class FrameGraph {
     let giRaw: TslNode | null = null;
     let indirect: TslNode | null = null;
 
-    if (this.giTexture && this.albedoTexture) {
     // Contact occlusion of everything indirect: the live surfel term below and, through
     // the G-buffer's baked-indirect channels, the lightmap term inside the scene colour.
     let occlusion: TslNode | null = null;
@@ -379,12 +399,14 @@ export class FrameGraph {
       occlusion = mix(float(1), c.z.toInspector('Contact / Visibility'), this.contact.intensity) as unknown as TslNode;
     }
 
+    if (this.giTexture && this.albedoTexture) {
       const albedo = texture(this.albedoTexture, screenUV);
       giRaw = texture(this.giTexture, screenUV).toInspector('GI / Surfel');
       indirect = (giRaw as ReturnType<typeof texture>)
         .mul(albedo)
         .mul(this.indirectIntensity)
         .mul(this.scenePass.getTextureNode('albedo').a.mul(this.hybridReceivers).oneMinus());
+      if (occlusion) indirect = (indirect as ReturnType<typeof vec4>).mul(occlusion) as unknown as TslNode;
 
       switch (this.giMode) {
         case GiMode.Direct:
@@ -396,6 +418,8 @@ export class FrameGraph {
         default:
           beauty = (this.color as ReturnType<typeof vec4>).add(indirect);
           break;
+      }
+    }
     if (this.reflections) {
       // Split-sum specular: traced radiance x (F0*A + F90*B) from three's DFG LUT, then
       // the contact bent-cone occlusion (Lagarde's form, as three applies it to
@@ -429,8 +453,6 @@ export class FrameGraph {
         this.scenePass.getTextureNode('velocity').a,
       );
       beauty = vec4(vec3(beauty).sub(baked.mul(float(1).sub(occlusion))), vec4(beauty).a) as unknown as TslNode;
-    }
-      }
     }
 
     if (this.overlayPass) {
@@ -479,6 +501,19 @@ export class FrameGraph {
     } else {
       resolved = composed;
     }
+    // Exposure after AA (the history stays scene-referred), then the output transform
+    // (tone map + colour space), then grain on the display-referred result.
+    if (this.exposureNode) resolved = (resolved as ReturnType<typeof vec4>).mul(this.exposureNode) as unknown as TslNode;
+    if (this.grain) {
+      this.post.outputColorTransform = false;
+      const display = renderOutput(resolved as ReturnType<typeof vec4>);
+      const pixel = screenCoordinate.x.floor().add(screenCoordinate.y.floor().mul(7919)).add(this.frameIndex.mul(104729));
+      const noise = hash(pixel).sub(0.5);
+      const shadowWeight = float(1).sub(luminance(display.rgb).clamp(0, 1).mul(0.6));
+      resolved = vec4(display.rgb.add(noise.mul(this.grain).mul(shadowWeight)), display.a) as unknown as TslNode;
+    } else {
+      this.post.outputColorTransform = true;
+    }
     this.post.outputNode = this.foldTaps(resolved);
     this.post.needsUpdate = true;
     this.needsComposite = false;
@@ -514,6 +549,8 @@ export class FrameGraph {
         right = vec4(
           this.scenePass.getTextureNode('normal').rgb.mul(0.5).add(0.5),
           1,
+        );
+        break;
       case SplitView.Contact:
         if (this.contact) right = vec4(vec3((this.contact.sample(screenUV as unknown as TslNode) as ReturnType<typeof vec4>).z), 1);
         break;
@@ -525,8 +562,6 @@ export class FrameGraph {
         break;
       case SplitView.Reflections:
         if (this.reflections) right = vec4((this.reflections.sample(screenUV as unknown as TslNode) as ReturnType<typeof vec4>).rgb, 1);
-        break;
-        );
         break;
       case SplitView.Lightmap:
         if (this.lightmapTexture) {
@@ -541,15 +576,6 @@ export class FrameGraph {
       case SplitView.Cache:
         if (this.cacheAtlasNode) {
           // Remap the right pane back to a full 0..1 square so the atlas is shown
-      case SplitView.Contact:
-        if (this.contact) right = vec4(vec3((this.contact.sample(screenUV as unknown as TslNode) as ReturnType<typeof vec4>).z), 1);
-        break;
-      case SplitView.BentNormal:
-        if (this.contact) {
-          const c = this.contact.sample(screenUV as unknown as TslNode) as ReturnType<typeof vec4>;
-          right = vec4(octDecode(c.xy as ReturnType<typeof vec2>).mul(0.5).add(0.5), 1);
-        }
-        break;
           // whole rather than cropped to whatever aspect the pane happens to be.
           const local = vec2(
             screenUV.x.sub(this.splitPosition).div(1 - this.splitPosition),
@@ -588,9 +614,12 @@ export class FrameGraph {
    * G-buffer and the fog read the same projection — and pair with `endFrame()`.
    */
   beginFrame(): void {
-    if (this.antialiasing !== 'taa') return;
-    this.renderer.getDrawingBufferSize(frameSize);
-    this.taa.beginFrame(frameSize.width, frameSize.height);
+    if (this.antialiasing === 'taa') {
+      this.renderer.getDrawingBufferSize(frameSize);
+      this.taa.beginFrame(frameSize.width, frameSize.height);
+    }
+    // Motion-vector matrices for vertex-animated materials, in every AA mode.
+    this.taa.trackCamera();
   }
 
   endFrame(): void {
@@ -599,6 +628,7 @@ export class FrameGraph {
 
   render(): void {
     if (this.needsComposite) this.rebuildComposite();
+    this.frameIndex.value = (this.frameIndex.value + 1) % 4096;
     if (this.overlayCamera) {
       // Same eye, same lens, one layer: `copy` takes the layers with it, so reset them.
       this.overlayCamera.copy(this.camera, false);
