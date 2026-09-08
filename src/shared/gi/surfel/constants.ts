@@ -40,6 +40,14 @@ export const SURFEL_POOL_BASE = isMobileDevice ? 8192 : 16384;
 
 /** Occupancy at which the pool grows. Below 1 because growth is not instantaneous. */
 export const SURFEL_POOL_GROW_AT = 0.85;
+
+/**
+ * Slots kept past a restored static cache, for movable geometry to allocate from.
+ * 4096 is the size the runtime pool was given after a bake when the authoring pool
+ * was thrown away; it is the same budget, now reached by not over-allocating rather
+ * than by rebuilding.
+ */
+export const RUNTIME_POOL_TAIL = 4096;
 export const MAX_SURFELS_PER_CELL = 64;
 
 /**

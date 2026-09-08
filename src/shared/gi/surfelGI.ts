@@ -19,6 +19,7 @@ import {
   MAX_TEMPORAL_M,
   RESOLVE_FETCH_CAP,
   SURFEL_CS,
+  RUNTIME_POOL_TAIL,
   SURFEL_POOL_BASE,
   SURFEL_POOL_GROW_AT,
   SURFEL_TTL,
@@ -136,6 +137,7 @@ export class SurfelGI {
   private integrationSchedule = createIntegrationSchedule();
   runtimeRayBudget = 4096;
   private lightingControls = { envIntensity: 1, envLod: 4, fromDirect: 1, fromIndirect: 1, albedoBoost: 1 };
+  private leafTransmitEnabled = true;
   private immortaliser = createSurfelImmortaliser();
   private cacheAtlas: ReturnType<typeof createCacheAtlas> | null = null;
   private lightmapSurfels: ReturnType<typeof createLightmapSurfels> | null = null;
@@ -258,7 +260,7 @@ export class SurfelGI {
    * deliberate, rare event — a safety net for a world bigger than the base guess, not a
    * per-frame policy — and it says so out loud when it fires.
    */
-  ensurePoolCapacity(renderer: THREE.WebGPURenderer, wanted: number): boolean {
+  ensurePoolCapacity(renderer: THREE.WebGPURenderer, wanted: number, restoring = false): boolean {
     const from = this.pool.getCapacity();
     if (wanted <= from) return false;
 
@@ -278,11 +280,12 @@ export class SurfelGI {
     }
 
     const target = Math.min(MAX_SURFELS, Math.max(wanted, from * 2));
-    console.warn(
-      `[gi] growing the surfel pool ${from} → ${target} slots ` +
-        `(${((target * BYTES_PER_SURFEL) / 1048576).toFixed(1)} MiB GPU). The cached ` +
-        'radiance does not survive this and the cache will re-converge from empty.',
-    );
+    const size = `${from} → ${target} slots (${((target * BYTES_PER_SURFEL) / 1048576).toFixed(1)} MiB GPU)`;
+    // Growing to make room for a cache that is about to be written into it loses
+    // nothing; saying it does sent a reader hunting a bake that never happened.
+    if (restoring) console.log(`[gi] sizing the surfel pool for the restored cache: ${size}`);
+    else console.warn(`[gi] growing the surfel pool ${size}. The cached radiance does not ` +
+      'survive this and the cache will re-converge from empty.');
 
     this.pool.ensureCapacity(target);
     this.pool.releaseRetired(renderer);
@@ -322,6 +325,7 @@ export class SurfelGI {
       this.integrate.setBaseSampleCount(this.runtimeSampleCount);
       const c = this.lightingControls;
       this.integrate.setEnvControls(c.envIntensity, c.envLod);
+      this.integrate.setLeafTransmit(this.leafTransmitEnabled);
       this.integrate.setGiScales(c.fromDirect, c.fromIndirect);
       this.integrate.setAlbedoBoost(c.albedoBoost);
     }
@@ -534,7 +538,14 @@ export class SurfelGI {
 
   restoreStaticBake(renderer: THREE.WebGPURenderer, data: FrozenSurfelData): void {
     if (data.capacity > MAX_SURFELS) throw new Error('Saved bake exceeds supported pool capacity');
-    this.ensurePoolCapacity(renderer, data.capacity);
+    // Room for what was actually saved plus a runtime tail, not for the authoring pool
+    // the bake happened to run in. A lightmap bake sizes its pool to the atlas — one
+    // slot per texel, 262144 at 512 square — and saves that number as the capacity,
+    // while the surfels it actually placed cover the lit texels only: 186880 on Cornell
+    // (2026-09-08), the other 75264 slots dead weight at 748 bytes each, 54 MiB of GPU.
+    // The tail is what movable geometry allocates from; 4096 is the size the runtime
+    // pool used to be given after a bake.
+    this.ensurePoolCapacity(renderer, Math.min(MAX_SURFELS, data.count + RUNTIME_POOL_TAIL), true);
     this.resetCache(renderer);
     restoreFrozenSurfels(this.pool, data);
     if (this.rigidSurfels) this.pool.setAnchorStart(renderer, data.count);
@@ -1432,6 +1443,12 @@ export class SurfelGI {
   setRuntimeSampleCount(count: number): void {
     this.runtimeSampleCount = count;
     if (!this._frozen) this.setBaseSampleCount(count);
+  }
+
+  /** Bounce rays that stop on foliage also collect the light coming through the leaf. */
+  setLeafTransmit(enabled: boolean): void {
+    this.leafTransmitEnabled = enabled;
+    this.integrate?.setLeafTransmit(enabled);
   }
 
   setEnvControls(intensity: number, lod: number): void {
