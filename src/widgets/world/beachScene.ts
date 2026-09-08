@@ -16,9 +16,7 @@ import type { VolumetricFogSettings } from '../../shared/render/index.ts';
 import { updateFoliageSun } from '../../entities/foliage/translucency.ts';
 
 export interface BeachScene {
-  /** Lighting this scene asks the pipeline for (SceneHost.lighting). */
-  lighting: 'surfel' | 'lightmap' | 'hybrid';
-  /** Nothing in the diorama moves: the surfel lifecycle stops once the cache is in. */
+  /** Nothing in the diorama moves: the live surfel chain stops once the atlas is in. */
   staticLighting: boolean;
   scene: THREE.Scene;
   camera: THREE.PerspectiveCamera;
@@ -257,13 +255,8 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
     sun,
     water,
     field,
-    // The cached surfel radiance IS this scene's static lighting: warmed once, saved,
-    // restored on every later launch, then only sampled. The virtual lightmap over it
-    // (`?mode=hybrid`) adds a per-frame CPU demand pass over every static triangle —
-    // measured at 4K on 2026-09-08: 250 ms a frame against 23.8 ms here, for a mean
-    // difference of 1.6/255 in the picture. Nothing in the diorama moves, so the
-    // whole surfel lifecycle stops once the cache is in.
-    lighting: 'surfel',
+    // Nothing in this diorama moves, so the live half has nothing to serve: the
+    // atlas is the whole answer and the surfel chain can stop once it is in.
     staticLighting: true,
     bindScreen: water.bindScreen,
     // Mist sits on the water (density at the water line, e-folding every ~2.5 m up),

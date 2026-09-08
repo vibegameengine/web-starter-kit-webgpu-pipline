@@ -17,7 +17,8 @@ const cam = flag('--cam', '');
 const query = flag('--query', '');
 const frames = Number(flag('--frames', '90'));
 const hd = args.includes('--1080');
-const url = `http://127.0.0.1:5188/?scene=beach&hud=0&freezeAt=0&gputime=1${cam ? `&cam=${cam}` : ''}${query}`;
+const scene = flag('--scene', 'beach');
+const url = `http://127.0.0.1:5188/?scene=${scene}&hud=0&freezeAt=0&gputime=1${cam ? `&cam=${cam}` : ''}${query}`;
 
 // Hard gate: a measurement that has not finished in 3 minutes is a hung measurement,
 // not a slow one (user rule 2026-09-08). Kill it and say so.

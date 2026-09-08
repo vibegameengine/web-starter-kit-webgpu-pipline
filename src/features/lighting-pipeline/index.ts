@@ -20,7 +20,7 @@ import { meanEnvironmentRadiance } from '../../shared/render/atmosphere/volumetr
 import { AutoExposure } from '../../shared/render/exposure.ts';
 import { DEFAULT_MOTION_BLUR, MotionBlur, type MotionBlurGaze, type MotionBlurSettings } from '../../shared/render/motionBlur.ts';
 import { readFloatTexture, readValidationTexture } from '../../shared/render/gpuReadback.ts';
-import { bakeKey, bakeStorageKind, loadBake, saveBake, surfelKey } from '../../shared/gi/bake/persistedBake.ts';
+import { bakeKey, loadBake, saveBake } from '../../shared/gi/bake/persistedBake.ts';
 import { padLightmapCharts } from '../../shared/gi/bake/chartPadding.ts';
 import {
   createLightControls,
@@ -73,11 +73,6 @@ export interface SceneHost {
    * turns it off); idle in `lightmap` mode, which has no BVH.
    */
   contact?: Partial<ContactOcclusionSettings>;
-  /**
-   * Lighting mode this scene wants. `surfel` is the cached radiance cache alone;
-   * `hybrid` adds the virtual lightmap over it. `?mode=` overrides. Absent = hybrid.
-   */
-  lighting?: 'surfel' | 'lightmap' | 'hybrid';
   /**
    * The scene has no movable GI receiver: once the cache is warmed or restored the
    * whole surfel lifecycle can stop — no spawning, ageing, allocation or ray
@@ -173,6 +168,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   const stats = new CacheStats();
   const { scene, camera, controls, sun } = host;
   gi.rigidSurfels = params.get('rigidSurfels') !== '0';
+  gi.setLeafTransmit(params.get('giLeafTransmit') !== '0');
 
   // Sun direction comes from the brightest region of the environment map, not from
   // authored angles — that is what keeps the analytic sun and the image-based
@@ -233,7 +229,6 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   const lightmapIterations = num('iters') ?? MAX_TEMPORAL_M;
   const lightmapRays = num('rays') ?? 32;
   // Default: frozen static atlas plus live GI for unbaked receivers.
-  const requestedLightingMode = params.get('mode');
   gi.freezeCompletely = params.get('freezeAll') === null ? host.staticLighting === true : params.get('freezeAll') === '1';
 
   // Unconditionally, and before the BVH. Unconditionally because the mode is a
@@ -402,12 +397,16 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
    * toggle — each direction has to re-prepare the pool for its own occupant, which is
    * why this is async and shows the loading overlay rather than flipping instantly.
    */
-  type LightingMode = 'surfel' | 'lightmap' | 'hybrid';
-  let lightingMode: LightingMode = requestedLightingMode === 'lightmap' || requestedLightingMode === 'surfel' || requestedLightingMode === 'hybrid'
-    ? requestedLightingMode : host.lighting ?? 'hybrid';
+  // One pipeline: static light baked once into the atlas, dynamics from live
+  // surfels, the frame adds them. There used to be three modes — `surfel` ran the
+  // live chain alone, `lightmap` switched the whole dynamic half off, `hybrid` was
+  // the two together — kept "for comparison" since the first iteration and never
+  // collapsed. Each mode had grown its own wiring: the freeze flag was set in three
+  // places, one per mode, and none knew about the others, so the GUI's "freeze all
+  // GI" silently did nothing in two of the three.
 
   async function prepareLightmap(iterations: number, forceBake = false): Promise<void> {
-    const persistent = lightingMode === 'hybrid' && params.get('bakeCache') !== '0';
+    const persistent = params.get('bakeCache') !== '0';
     let key = '';
     bakeCache.source = 'none'; bakeCache.storage = 'none'; bakeCache.saved = false; bakeCache.error = '';
     if (persistent) {
@@ -460,7 +459,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
         iterations,
         raysPerSurfel: lightmapRays,
         dilate: 0, // Pad once below, constrained to the chart that owns each texel.
-        dynamicReceivers: lightingMode === 'hybrid',
+        dynamicReceivers: true,
         viewpoint:
           params.get('bakecam') === 'view' ? camera.position.clone() : undefined,
         onProgress: (fraction, iteration) => {
@@ -528,106 +527,37 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
     frameGraph.setLightmapTexture(lightmapTexture);
   }
 
-  /**
-   * The surfel cache: warmed once, saved, and read back on every later launch.
-   *
-   * Warming IS the bake — seconds of orbiting integration — and it used to run on
-   * every start because this path never consulted a cache. The cache is a property
-   * of the level, not of the run: `npm run bake:clear` is what invalidates it.
-   */
-  async function prepareSurfel(durationMs: number, forceBake = false): Promise<void> {
-    const persistent = params.get('bakeCache') !== '0';
-    let key = '';
-    bakeCache.source = 'none'; bakeCache.storage = 'none'; bakeCache.saved = false; bakeCache.error = '';
-    if (persistent) {
-      setLoading('Checking saved surfel cache');
-      try {
-        key = await surfelKey(params.get('scene') ?? 'default');
-        bakeCache.key = key;
-        const saved = forceBake ? null : await loadBake(key);
-        if (saved?.surfels.count) {
-          setLoading('Restoring saved surfel cache');
-          gi.resetCache(renderer);
-          gi.restoreStaticBake(renderer, saved.surfels);
-          bakeCache.source = 'saved'; bakeCache.storage = bakeStorageKind() === 'fs' ? 'file' : 'bundle'; bakeCache.saved = true;
-          gi.setFrozen(gi.freezeCompletely);
-          console.log(`[surfel-cache] restored ${saved.surfels.count} surfels; no warming` + (gi.frozen ? ', lifecycle frozen' : ''));
-          return;
-        }
-      } catch (error) {
-        bakeCache.error = String(error);
-        console.warn(`[surfel-cache] cannot reuse saved data: ${error}`);
-      }
-    }
-    gi.resetCache(renderer);
-    if (durationMs <= 0) return;
-    setLoading(`Warming surfel cache (${(durationMs / 1000).toFixed(0)}s)`);
-    await gi.bake(renderer, scene, {
-      durationMs,
-      onProgress: (fraction, frames) => {
-        setLoading(`Warming ${(fraction * 100).toFixed(0)}% · ${frames} views`);
-      },
-    });
-    bakeCache.source = 'baked'; bakeCache.storage = 'computed';
-    if (!key) return;
-    setLoading('Saving surfel cache');
-    try {
-      const count = await gi.readAllocatedCount(renderer);
-      const surfels = await gi.captureStaticBake(renderer, count);
-      // No lightmap beside it: size 0, no pixels, nothing to pack into pages.
-      await saveBake(key, { size: 0, pixels: new Float32Array(0), surfels });
-      bakeCache.saved = true;
-      console.log(`[surfel-cache] saved ${count} surfels as ${key}`);
-    } catch (error) {
-      bakeCache.error = String(error);
-      console.warn(`[surfel-cache] cache is usable but could not be saved: ${error}`);
-    }
-  }
-
+  let refreshFrozenControl = () => {};
   let switching = false;
   /** Set by the GUI so a failed or refused switch can put the control back. */
-  let onModeSettled: ((mode: LightingMode) => void) | null = null;
-
-  async function setLightingMode(next: LightingMode, forceBake = false): Promise<void> {
-    // Refusing silently would leave the dropdown showing a mode the app is not in,
-    // and every later action would target the wrong one. Refuse loudly instead.
+  /**
+   * Produces the static half: the atlas, restored from disk or baked once.
+   *
+   * `forceBake` ignores the saved cache and integrates again — the GUI's re-bake
+   * button and the only thing that ever invalidates the atlas, since the sun is
+   * bakeable state the GUI can move.
+   */
+  async function bakeStatic(forceBake = false): Promise<void> {
     if (switching) {
-      console.warn('[lighting] switch ignored: a bake is already running');
-      onModeSettled?.(lightingMode);
+      console.warn('[lighting] bake ignored: one is already running');
       return;
     }
-
-    const previous = lightingMode;
     switching = true;
     baked = false;
     try {
-      lightingMode = next;
-      frameGraph.hybridReceivers.value = next === 'hybrid' ? 1 : 0;
-      if (next !== 'surfel') {
-        // The composite still holds the last resolve output; without dropping it the
-        // scene would be lit by a frozen screen-space GI texture *and* the lightmap.
-        frameGraph.setGiTextures(null, null);
-        await prepareLightmap(bakeParams.passes, forceBake);
-        lightmapIntensity.value = lightmapParams.intensity;
-        // Hybrid pins the baked entries while webgiya continues spawning and
-        // integrating live surfels for objects without a baked chart.
-        gi.setFrozen(next === 'lightmap');
-      } else {
-        lightmapIntensity.value = 0;
-        await prepareSurfel(bakeParams.seconds * 1000, forceBake);
-      }
+      // The composite still holds the last resolve output; without dropping it the
+      // scene would be lit by a stale screen-space GI texture *and* the atlas.
+      frameGraph.setGiTextures(null, null);
+      await prepareLightmap(bakeParams.passes, forceBake);
+      lightmapIntensity.value = lightmapParams.intensity;
+      // The atlas is the static half and never re-integrates; the live chain stays
+      // running for everything that is not in it.
+      gi.setFrozen(false);
       bakedSunVersion = world.sunVersion;
       baked = true;
-    } catch (error) {
-      // A half-applied mode is worse than the old one: the scene would render with
-      // neither GI chain running and nothing on screen would say so.
-      lightingMode = previous;
-      lightmapIntensity.value = previous !== 'surfel' ? lightmapParams.intensity : 0;
-      frameGraph.hybridReceivers.value = previous === 'hybrid' ? 1 : 0;
-      throw error;
     } finally {
       switching = false;
-      onModeSettled?.(lightingMode);
+      refreshFrozenControl();
       clearLoading();
     }
   }
@@ -636,20 +566,16 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
     ? new Hud(world, stats, () =>
         !baked
           ? 'converging'
-          : lightingMode !== 'surfel'
-            ? // The sun is bakeable state. Moving it does not invalidate anything
-              // automatically -- re-baking on every slider tick would be unusable --
-              // so the only honest thing is to say the texture is now out of date.
-              world.sunVersion !== bakedSunVersion
-              ? `lightmap ${lightmapSize}px · STALE (sun moved, re-bake)`
-              : `lightmap ${lightmapSize}px · static frozen${lightingMode === 'hybrid' ? ' · dynamics live' : ''}`
-            : gi.frozen
-              ? 'surfel · fully frozen'
-              : 'surfel · movers live',
+          : // The sun is bakeable state. Moving it does not invalidate anything
+            // automatically -- re-baking on every slider tick would be unusable --
+            // so the only honest thing is to say the texture is now out of date.
+            world.sunVersion !== bakedSunVersion
+            ? `atlas ${lightmapSize}px · STALE (sun moved, re-bake)`
+            : `atlas ${lightmapSize}px · static${gi.frozen ? '' : ' + dynamics live'}`,
       )
     : null;
 
-  await setLightingMode(lightingMode);
+  await bakeStatic();
 
   const giParams = {
     mode: frameGraph.giMode,
@@ -715,28 +641,10 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   if (shadowFilter === 'soft') {
     modeFolder.add(U_SUN_ANGULAR_DIAMETER_DEG, 'value', 0, 5, 0.01).name('sun disc (°)');
   }
-  const modeParams = { mode: lightingMode as LightingMode };
-  const modeCtrl = modeFolder
-    .add(modeParams, 'mode', ['surfel', 'lightmap', 'hybrid'])
-    .name('mode')
-    .onChange((v: LightingMode) => void setLightingMode(v).catch(showError));
-  const intensityCtrl = modeFolder
+  modeFolder
     .add(lightmapParams, 'intensity', 0, 8, 0.05)
-    .name('lightmap mul')
-    .onChange((v: number) => {
-      if (lightingMode !== 'surfel') lightmapIntensity.value = v;
-    });
-
-  // The control is the app's state, so it has to follow the app rather than lead it.
-  let refreshFrozenControl = () => {};
-  onModeSettled = (mode) => {
-    modeParams.mode = mode;
-    modeCtrl.updateDisplay?.();
-    if (mode !== 'surfel') intensityCtrl.enable?.();
-    else intensityCtrl.disable?.();
-    refreshFrozenControl();
-  };
-  onModeSettled(lightingMode);
+    .name('atlas mul')
+    .onChange((v: number) => { lightmapIntensity.value = v; });
 
   host.bindGui?.(gui);
   const fogFolder = gui.addFolder('Atmosphere');
@@ -871,16 +779,15 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
     .add(bakeParams, 'frozen')
     .name('frozen')
     .onChange((v: boolean) => {
-      if (lightingMode === 'surfel') gi.setFrozen(v);
+      gi.setFrozen(v);
       refreshFrozenControl();
     })
     .listen?.();
   refreshFrozenControl = () => {
-    const staticBaked = lightingMode !== 'surfel';
-    bakeParams.frozen = staticBaked || gi.frozen;
-    frozenCtrl?.name(staticBaked ? 'static frozen' : 'freeze all GI');
-    if (staticBaked) frozenCtrl?.disable();
-    else frozenCtrl?.enable();
+    // One switch that means one thing everywhere: stop the live chain. The atlas is
+    // frozen by construction — it is a texture — so this only ever concerns dynamics.
+    bakeParams.frozen = gi.frozen;
+    frozenCtrl?.name('freeze live GI');
     frozenCtrl?.updateDisplay();
   };
   refreshFrozenControl();
@@ -890,9 +797,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
         // The sun is the one thing that invalidates a bake, and the GUI can move it.
         // Re-baking means whatever the *current* mode needs -- more integration
         // passes into the atlas, or another warm-up of the runtime cache.
-        rebake: () => {
-          void setLightingMode(lightingMode, true).catch(showError);
-        },
+        rebake: () => { void bakeStatic(true).catch(showError); },
       },
       'rebake',
     )
@@ -1133,7 +1038,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   let auditGiFrame = 10000;
   (window as unknown as Record<string, unknown>).__audit = {
     bakeCache: () => ({ ...bakeCache }),
-    lighting: () => ({ mode: lightingMode, baked, staticFrozen: baked && lightingMode !== 'surfel', runtimeFrozen: gi.frozen }),
+    lighting: () => ({ baked, staticFrozen: baked, runtimeFrozen: gi.frozen }),
     bakedTransport: () => gi.bakedTransportStats,
     rayBudget(value: number) {
       if (!Number.isFinite(value)) throw new Error('Finite GI ray budget required');
@@ -1222,6 +1127,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
     },
     realtimeContribution(value: number) { frameGraph.indirectIntensity.value = value; },
     shadowContribution(value: number) { sun.shadow.intensity = Math.max(0, Math.min(1, value)); },
+    giLeafTransmit(enabled: boolean) { gi.setLeafTransmit(enabled); },
     sun(azimuthDeg: number, elevationDeg: number, intensity?: number) {
       lightCfg.azimuthDeg = azimuthDeg; lightCfg.elevationDeg = elevationDeg;
       if (typeof intensity === 'number') lightCfg.intensity = intensity;
@@ -1242,7 +1148,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
         gi: gi.outputTexture ? await readValidationTexture(renderer, gi.outputTexture) : null,
         albedo: gi.outputTexture ? await readValidationTexture(renderer, gi.albedoTexture) : null,
         receivers: await readValidationTexture(renderer, frameGraph.scenePass.getTexture('albedo')),
-        composite: { mode: lightingMode, giMode: frameGraph.giMode, indirectIntensity: frameGraph.indirectIntensity.value, hybridReceivers: frameGraph.hybridReceivers.value },
+        composite: { giMode: frameGraph.giMode, indirectIntensity: frameGraph.indirectIntensity.value, hybridReceivers: frameGraph.hybridReceivers.value },
       };
     },
   };
@@ -1268,7 +1174,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
     fog.update(now);
     // Hybrid retains the atlas for static receivers and runs the existing surfel
     // chain for unbaked receivers. Skip during an asynchronous pool rebuild.
-    if (!switching && lightingMode !== 'lightmap') {
+    if (!switching) {
       // Immediately after the sphere moved and before anything traces: the dynamic BVH
       // is what makes it visible to a ray at all. It self-gates on the world matrix, so
       // a still scene pays a matrix compare and nothing else.

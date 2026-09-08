@@ -5,7 +5,7 @@ setTimeout(() => { console.error('gate: 3 minutes, abort'); process.exit(2); }, 
 const browser = await chromium.launch({ channel: 'chrome', headless: false, args: ['--enable-unsafe-webgpu','--ignore-gpu-blocklist','--use-angle=d3d11'] });
 const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
 const lines = [];
-page.on('console', (m) => { const t = m.text(); if (/\[gi\]|\[lightmap\]|\[bake-cache\]|\[surfel-cache\]/.test(t)) lines.push(`${m.type() === 'warning' ? 'WARN ' : m.type() === 'error' ? 'ERR  ' : '     '}${t.slice(0, 150)}`); });
+page.on('console', (m) => { const t = m.text(); if (/\[gi\]|\[lightmap\]|\[bake-cache\]|\[surfel-cache\]|\[palm\]|\[shrub\]|BVH|triangles/.test(t)) lines.push(`${m.type() === 'warning' ? 'WARN ' : m.type() === 'error' ? 'ERR  ' : '     '}${t.slice(0, 150)}`); });
 await page.goto(`http://127.0.0.1:5188/?hud=0${process.argv[2] ?? ''}`);
 await page.waitForFunction(() => window.__audit && document.querySelector('#loading-overlay')?.hidden, null, { timeout: 150000 });
 await page.evaluate(() => new Promise((r) => { let n = 0; const f = () => { n += 1; if (n >= 60) r(); else requestAnimationFrame(f); }; requestAnimationFrame(f); }));

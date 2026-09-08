@@ -24,16 +24,6 @@ export async function bakeKey(sceneName: string): Promise<string> {
   return hex(await digest(new TextEncoder().encode(`bake:${sceneName}`)));
 }
 
-/**
- * The name of the surfel-only cache: the warmed radiance cache with no lightmap
- * beside it (`size: 0`, empty `pixels`). `mode=surfel` used to warm the cache from
- * scratch on every launch — several seconds of orbiting integration for a result
- * that is a property of the level, not of the run.
- */
-export async function surfelKey(sceneName: string): Promise<string> {
-  return hex(await digest(new TextEncoder().encode(`surfels:${sceneName}`)));
-}
-
 export async function encodeBake(bake: PersistedBake): Promise<ArrayBuffer> {
   const { surfels: s } = bake;
   const chunks = [bake.pixels, s.spatial, s.moments, s.depth, s.guiding];
