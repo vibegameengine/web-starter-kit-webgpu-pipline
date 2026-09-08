@@ -13,7 +13,7 @@ import {
   rasteriseLightmapGBuffer,
 } from '../../shared/gi/bake/index.ts';
 import { uniform, float, uint, vec4, mix } from 'three/tsl';
-import { ContactOcclusionPass, type ContactOcclusionSettings } from '../../shared/gi/contact/contactOcclusionPass.ts';
+import { ContactOcclusionPass, DEFAULT_CONTACT_SETTINGS, type ContactOcclusionSettings } from '../../shared/gi/contact/contactOcclusionPass.ts';
 import { createContactBVH, type ContactBVHBundle } from '../../shared/gi/contact/contactBvh.ts';
 import { ReflectionPass, type ReflectionSettings } from '../../shared/gi/reflect/reflectionPass.ts';
 import { meanEnvironmentRadiance } from '../../shared/render/atmosphere/volumetricFog.ts';
@@ -346,7 +346,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   const contactParam = params.get('contact');
   const contact = new ContactOcclusionPass(renderer, camera, gi.blueNoiseTexture, {
     ...host.contact,
-    enabled: contactParam === null ? (host.contact?.enabled ?? true) : contactParam !== '0',
+    enabled: contactParam === null ? (host.contact?.enabled ?? DEFAULT_CONTACT_SETTINGS.enabled) : contactParam !== '0',
   });
   const contactRadius = num('contactRadius'); if (contactRadius !== null) contact.settings.radius = contactRadius;
   const contactScale = num('contactScale'); if (contactScale !== null) contact.settings.resolutionScale = contactScale;
@@ -417,7 +417,10 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
         const saved = forceBake ? null : await loadBake(key);
         if (saved) {
           setLoading('Restoring saved static lighting');
-          gi.restoreStaticBake(renderer, saved.surfels);
+          // `?atlasSurfels=0` keeps the receiver ownership and drops only the surfel
+          // data: the experiment for whether anything still reads it now that rays
+          // take unwrapped static hits from the atlas.
+          gi.restoreStaticBake(renderer, saved.surfels, params.get('atlasSurfels') !== '0');
           const texture = new THREE.DataTexture(Uint16Array.from(saved.pixels, THREE.DataUtils.toHalfFloat), saved.size, saved.size, THREE.RGBAFormat, THREE.HalfFloatType);
           texture.magFilter = texture.minFilter = THREE.LinearFilter; texture.needsUpdate = true;
           renderer.initTexture(texture);

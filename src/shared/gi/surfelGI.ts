@@ -552,7 +552,15 @@ export class SurfelGI {
       livePool: this.poolStats, uvBytes: this.bvh?.lightmapUvTexture.image.data?.byteLength ?? 0 };
   }
 
-  restoreStaticBake(renderer: THREE.WebGPURenderer, data: FrozenSurfelData): void {
+  /**
+   * @param withSurfels false restores the receiver ownership without the surfel data
+   *   — the experiment for what still reads the baked surfels now that rays take
+   *   unwrapped static hits from the atlas. Dropping the whole call instead also
+   *   drops `atlasPinned`, and then live GI is added on top of the atlas: measured
+   *   2026-09-09 on Cornell as 11.7/255 of double lighting, which answers a
+   *   different question than the one being asked.
+   */
+  restoreStaticBake(renderer: THREE.WebGPURenderer, data: FrozenSurfelData, withSurfels = true): void {
     if (data.capacity > MAX_SURFELS) throw new Error('Saved bake exceeds supported pool capacity');
     // Room for what was actually saved plus a runtime tail, not for the authoring pool
     // the bake happened to run in. A lightmap bake sizes its pool to the atlas — one
@@ -561,10 +569,10 @@ export class SurfelGI {
     // (2026-09-08), the other 75264 slots dead weight at 748 bytes each, 54 MiB of GPU.
     // The tail is what movable geometry allocates from; 4096 is the size the runtime
     // pool used to be given after a bake.
-    this.ensurePoolCapacity(renderer, Math.min(MAX_SURFELS, data.count + RUNTIME_POOL_TAIL), true);
+    this.ensurePoolCapacity(renderer, Math.min(MAX_SURFELS, (withSurfels ? data.count : 0) + RUNTIME_POOL_TAIL), true);
     this.resetCache(renderer);
-    restoreFrozenSurfels(this.pool, data);
-    if (this.rigidSurfels) this.pool.setAnchorStart(renderer, data.count);
+    if (withSurfels) restoreFrozenSurfels(this.pool, data);
+    if (this.rigidSurfels) this.pool.setAnchorStart(renderer, withSurfels ? data.count : 0);
     this.atlasPinned = true;
     this._frozen = false;
     console.log(`[lightmap] restored ${data.count} pinned surfels; no integration`);

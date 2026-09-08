@@ -27,7 +27,10 @@ export const DEFAULT_CONTACT_SETTINGS: Readonly<ContactOcclusionSettings> = {
   // timestamps resolved every frame, headed; quarter grid +0.8 ms). Earlier figures of
   // tens of ms were the composite being rebuilt every frame by a reader object that
   // changed identity each call — a leak, not tracing cost.
-  enabled: true,
+  // Off by default (2026-09-09, the owner's call): on this content it reads as dark
+  // speckle along every seam and around every object base, and no visible contact
+  // darkening to pay for it. `?contact=1` turns it back on.
+  enabled: false,
   // Traced every other frame: the pass keeps its result in a storage buffer the
   // composite reads by parity and carries its own reprojected, depth-tested history,
   // so a skipped frame shows the last trace rather than nothing.
