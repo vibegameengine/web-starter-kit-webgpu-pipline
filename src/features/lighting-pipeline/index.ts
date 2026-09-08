@@ -15,6 +15,8 @@ import {
 import { uniform, float, uint, vec4, mix } from 'three/tsl';
 import { ContactOcclusionPass, type ContactOcclusionSettings } from '../../shared/gi/contact/contactOcclusionPass.ts';
 import { createContactBVH, type ContactBVHBundle } from '../../shared/gi/contact/contactBvh.ts';
+import { ReflectionPass, type ReflectionSettings } from '../../shared/gi/reflect/reflectionPass.ts';
+import { meanEnvironmentRadiance } from '../../shared/render/atmosphere/volumetricFog.ts';
 import { readFloatTexture, readValidationTexture } from '../../shared/render/gpuReadback.ts';
 import { createLightmapPages, type LightmapPageSource } from '../../shared/render/virtualTexture/lightmapPages.ts';
 import { VirtualLightmap } from '../../shared/render/virtualTexture/virtualLightmap.ts';
@@ -82,6 +84,8 @@ export interface PipelineUi {
    * turns it off); idle in `lightmap` mode, which has no BVH.
    */
   contact?: Partial<ContactOcclusionSettings>;
+  /** Traced reflections preset. On by default (`?reflections=0` turns it off). */
+  reflections?: Partial<ReflectionSettings>;
 }
 
 export interface PipelineUi {
@@ -749,6 +753,62 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   bakeFolder.add(bakeParams, 'seconds', 1, 30, 0.5).name('surfel budget s');
   const frozenCtrl = bakeFolder
     .add(bakeParams, 'frozen')
+  // Reflections: screen trace, then the contact tree + movers, then the environment.
+  // `?reflections=0|1`, `?reflectionsRoughness=`.
+  const reflectionsParam = params.get('reflections');
+  const reflections = new ReflectionPass(renderer, camera, gi.blueNoiseTexture, gi.envTexture, meanEnvironmentRadiance(gi.envTexture).multiplyScalar(0.5), {
+    ...host.reflections,
+    enabled: reflectionsParam === null ? (host.reflections?.enabled ?? true) : reflectionsParam !== '0',
+  });
+  const reflectionsRoughness = num('reflectionsRoughness'); if (reflectionsRoughness !== null) reflections.settings.maxRoughness = reflectionsRoughness;
+  const reflectionsIntensity = uniform(reflections.settings.intensity);
+  let reflectionsReaderBound: unknown = null;
+  const syncReflections = () => {
+    const reader = reflections.enabled ? reflections.reader : null;
+    if (reader === reflectionsReaderBound) return;
+    reflectionsReaderBound = reader;
+    if (!reader) { frameGraph.setReflections(null); return; }
+    const width = reader.width;
+    const height = reader.height;
+    frameGraph.setReflections({
+      intensity: reflectionsIntensity,
+      specular: gi.specularTexture,
+      sample: (uv) => {
+        // 3x3 box over the half grid: the cheap half of Stachowiak's neighbour ray
+        // reuse. One ray a frame on a moving leaf has no history to lean on, and nine
+        // neighbours cut that noise by three before the TAA sees it.
+        const cx = uint(float(uv.x).mul(width).clamp(0, width - 1));
+        const cy = uint(float(uv.y).mul(height).clamp(0, height - 1));
+        const at = (x: ReturnType<typeof uint>, y: ReturnType<typeof uint>) => {
+          const index = y.mul(uint(width)).add(x);
+          return reader.parity.lessThan(0.5).select(vec4(reader.current.element(index)), vec4(reader.previous.element(index)));
+        };
+        let sum: THREE.Node = vec4(0);
+        for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+          const x = uint(float(cx).add(dx).clamp(0, width - 1));
+          const y = uint(float(cy).add(dy).clamp(0, height - 1));
+          sum = (sum as ReturnType<typeof vec4>).add(at(x, y));
+        }
+        return (sum as ReturnType<typeof vec4>).div(9);
+      },
+    });
+  };
+  const reflectionsFolder = gui.addFolder('Reflections');
+  reflectionsFolder.add(reflections.settings, 'enabled').name('enabled').onChange((v: boolean) => { reflections.setEnabled(v); syncReflections(); });
+  reflectionsFolder.add(reflections.settings, 'maxRoughness', 0.05, 1, 0.01).name('max roughness');
+  reflectionsFolder.add(reflections.settings, 'historyWeight', 0, 0.97, 0.01).name('history');
+  reflectionsFolder.add(reflections.settings, 'screenSteps', 8, 96, 1).name('screen steps');
+  reflectionsFolder.add(reflections.settings, 'intensity', 0, 2, 0.01).name('strength').onChange((v: number) => { reflectionsIntensity.value = v; });
+  reflectionsFolder.close();
+  const contactFolder = gui.addFolder('Contact occlusion');
+  contactFolder.add(contact.settings, 'enabled').name('enabled').onChange((v: boolean) => { contact.setEnabled(v); syncContact(); });
+  contactFolder.add(contact.settings, 'radius', 0.05, 2, 0.01).name('radius (m)');
+  contactFolder.add(contact.settings, 'rays', 1, 8, 1).name('rays / frame');
+  // Grid scale is boot-time only (`?contactScale=`): reallocating the buffers at
+  // runtime left the frame in a broken, seconds-long state (2026-09-08, unexplained).
+  contactFolder.add(contact.settings, 'historyWeight', 0, 0.97, 0.01).name('history');
+  contactFolder.add(contact.settings, 'intensity', 0, 1, 0.01).name('strength').onChange((v: number) => { contactIntensity.value = v; });
+  contactFolder.close();
   const contactFolder = gui.addFolder('Contact occlusion');
   contactFolder.add(contact.settings, 'enabled').name('enabled').onChange((v: boolean) => { contact.setEnabled(v); syncContact(); });
   contactFolder.add(contact.settings, 'radius', 0.05, 2, 0.01).name('radius (m)');
@@ -925,6 +985,11 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   const freezeAt = num('freezeAt');
   if (freezeAt !== null) {
     split(view: SplitView, at = 0.5) {
+    reflections(value?: boolean) {
+      if (typeof value === 'boolean') { reflections.setEnabled(value); syncReflections(); }
+      return reflections.enabled;
+    },
+    reflectionSettings: reflections.settings,
       frameGraph.splitPosition = at;
       frameGraph.setSplitView(view);
       frameGraph.forceRebuild();
@@ -1113,6 +1178,16 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
     world.beginFrame(dt);
     controls.update();
     updateAnimation();
+      // Same G-buffer, same jittered camera, this frame: trace the contact rays now.
+      contact.update(contactTree(), gi.dynamicBvhBundle, gi.gbufferDepthTexture, gi.receiverTexture,
+        renderer.domElement.width, renderer.domElement.height, true);
+      syncContact();
+      // Reflections read last frame's resolved colour: the TAA history. Without TAA the
+      // pass still runs, against whatever the history holds (stale after a switch).
+      if (reflections.enabled && !contactBvh && gi.staticBvh) contactBvh = createContactBVH(scene, gi.staticBvh.materialIdByUUID);
+      reflections.update(contactBvh, gi.dynamicBvhBundle, gi.diffuseArrayTexture, gi.gbufferDepthTexture, gi.receiverTexture,
+        gi.specularTexture, frameGraph.taa.historyTexture, renderer.domElement.width, renderer.domElement.height, 1);
+      syncReflections();
     camera.updateMatrixWorld();
     if (!frozen) dynamic?.update(now * 0.001);
     // `?still=1` holds the scene's own animation (wind, water) so a check can compare

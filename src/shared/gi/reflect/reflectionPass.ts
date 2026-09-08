@@ -32,7 +32,9 @@ export interface ReflectionSettings {
 
 export const DEFAULT_REFLECTION_SETTINGS: Readonly<ReflectionSettings> = {
   enabled: true,
-  maxRoughness: 0.55,
+  // 0.45: the waxy leaves (0.30) still reflect the sky, but the lobe of anything
+  // rougher is too wide for one ray a frame to converge on a moving surface.
+  maxRoughness: 0.45,
   historyWeight: 0.85,
   intensity: 1,
   resolutionScale: 0.5,
@@ -204,6 +206,12 @@ const KERNEL = /* wgsl */ `
         let hit = traceScene( ray, dynTrace, dynBounds );
         radiance = shadeReflectionHit( hit, ray, lightsTex, lightCount, lightSamples, medium, diffuseTex, diffuseSampler, envTex, envSampler, envIntensity, dynTrace, dynBounds, ambient, bn.y );
       }
+
+      // Firefly clamp: the environment holds the sun at ~65000 and a single sample
+      // of it would flash for frames. Radiance is limited to a luminance of 4 (the
+      // brightest lit sand is ~1), which keeps sky and lit surfaces intact.
+      let lum = dot( radiance, vec3f( 0.2126, 0.7152, 0.0722 ) );
+      if ( lum > 4.0 ) { radiance = radiance * ( 4.0 / lum ); }
 
       // --- history ----------------------------------------------------------------
       var conf = 1.0;

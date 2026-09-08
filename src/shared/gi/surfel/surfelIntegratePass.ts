@@ -101,7 +101,7 @@ export type SurfelIntegratePass = {
 export { consts } from './wgslConsts';
 import { consts } from './wgslConsts';
 
-const envEquirectUV = wgslFn(/* wgsl */ `
+export const envEquirectUV = wgslFn(/* wgsl */ `
   fn envEquirectUV(dirW: vec3f) -> vec2f {
     let d = normalize(dirW);
     // u: [-pi..pi] -> [0..1]
@@ -210,7 +210,7 @@ const diffuseLodForHit = wgslFn(/* wgsl */ `
   }
 `);
 
-const sampleDiffuseArray = wgslFn(/* wgsl */ `
+export const sampleDiffuseArray = wgslFn(/* wgsl */ `
   fn sampleDiffuseArray(
     tex: texture_2d_array<f32>,
     texSampler: sampler,

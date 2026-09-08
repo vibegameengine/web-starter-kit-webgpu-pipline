@@ -1,7 +1,8 @@
 // @ts-nocheck -- vendored from jure/webgiya; kept byte-compatible so upstream fixes can be re-applied.
 // gbuffer.ts
 import * as THREE from 'three/webgpu';
-import { mrt, diffuseColor, vec4, normalWorldGeometry, normalWorld } from 'three/tsl';
+import { mrt, diffuseColor, vec4, normalWorld, uniform, specularColor, roughness } from 'three/tsl';
+import { prepareReceiverMaterials, receiverOwnership } from './receiverOwnership';
 
 export type GBufferBundle = {
   target: THREE.RenderTarget;
@@ -17,7 +18,7 @@ export function createGBuffer(renderer: THREE.WebGPURenderer): GBufferBundle {
   const rawH = Math.max(1, Math.floor(window.innerHeight * dpr));
 
   const target = new THREE.RenderTarget(rawW, rawH, {
-    count: 2, // 0: Normal, 1: Diffuse
+    count: 3, // 0: Normal, 1: Diffuse, 2: Specular (F0 rgb, roughness a) — reflections read it
     type: THREE.HalfFloatType,
     format: THREE.RGBAFormat,
     depthBuffer: true,
@@ -27,7 +28,8 @@ export function createGBuffer(renderer: THREE.WebGPURenderer): GBufferBundle {
   target.textures[0].name = 'normal';
   target.textures[1].name = 'diffuseColor';
 
-  for (let i = 0; i < 2; i++) {
+  target.textures[2].name = 'specular';
+  for (let i = 0; i < 3; i++) {
     target.textures[i].generateMipmaps = false;
     target.textures[i].magFilter = THREE.NearestFilter;
     target.textures[i].minFilter = THREE.NearestFilter;
@@ -40,6 +42,7 @@ export function createGBuffer(renderer: THREE.WebGPURenderer): GBufferBundle {
     diffuseColor: vec4(diffuseColor.rgb, 1.0),
   });
 
+    specular: vec4(specularColor.rgb, roughness),
   function resize(renderer: THREE.WebGPURenderer) {
     const dpr = renderer.getPixelRatio
       ? renderer.getPixelRatio()

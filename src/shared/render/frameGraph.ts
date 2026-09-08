@@ -17,6 +17,8 @@ import {
 } from 'three/tsl';
 import { fxaa } from 'three/addons/tsl/display/FXAANode.js';
 import { bakedIndirect } from '../gi/bake/applyLightmap.ts';
+import { DFGLUT, getViewPosition, cameraProjectionMatrixInverse, normalize } from 'three/tsl';
+import { fxaa } from 'three/addons/tsl/display/FXAANode.js';
 import { bloom } from 'three/addons/tsl/display/BloomNode.js';
 import { TemporalAANode } from './temporalAA.ts';
 
@@ -69,6 +71,9 @@ export const SplitView = {
   /** Contact occlusion: visible fraction of the near hemisphere, white = open. */
   Contact: 'contact',
   /** Contact bent normal, world space, 0.5 + 0.5. */
+  /** Traced specular radiance before the BRDF weight. */
+  Reflections: 'reflections',
+} as const;
   BentNormal: 'bentNormal',
 export type SplitView = (typeof SplitView)[keyof typeof SplitView];
 
@@ -169,6 +174,14 @@ export class FrameGraph {
    * Contact occlusion reader: `(screenUV) => vec4(oct.xy, visibility, viewDepth)` from
    * the pass's storage buffers, plus its strength. Multiplies the indirect terms only;
    * direct light is already shadowed. Null = off.
+  /**
+   * Reflection reader: `(screenUV) => vec4(radiance, confidence)`, the G-buffer's
+   * (F0, roughness) texture it is weighted with, and the strength. The specular term is
+   * added on top of the composite: materials here carry no environment specular of
+   * their own, so nothing is counted twice.
+   */
+  private reflections: { sample: (uv: TslNode) => TslNode; specular: THREE.Texture; intensity: THREE.UniformNode<number> } | null = null;
+  /** Owns the jitter and the history; idle unless the mode is `taa`. */
    */
   private contact: { sample: (uv: TslNode) => TslNode; intensity: THREE.UniformNode<number> } | null = null;
   readonly taa: TemporalAANode;
@@ -307,6 +320,14 @@ export class FrameGraph {
   setContactOcclusion(reader: { sample: (uv: TslNode) => TslNode; intensity: THREE.UniformNode<number> } | null): void {
     if (reader === this.contact) return;
     this.contact = reader;
+  /** Installs or removes the traced-reflection reader; the composite is rebuilt. */
+  setReflections(reader: { sample: (uv: TslNode) => TslNode; specular: THREE.Texture; intensity: THREE.UniformNode<number> } | null): void {
+    if (reader === this.reflections) return;
+    this.reflections = reader;
+    this.needsComposite = true;
+  }
+
+  setAntialiasing(mode: Antialiasing): void {
     this.needsComposite = true;
   }
 
@@ -375,6 +396,40 @@ export class FrameGraph {
         default:
           beauty = (this.color as ReturnType<typeof vec4>).add(indirect);
           break;
+    if (this.reflections) {
+      // Split-sum specular: traced radiance x (F0*A + F90*B) from three's DFG LUT, then
+      // the contact bent-cone occlusion (Lagarde's form, as three applies it to
+      // environment specular) so reflections do not leak into crevices.
+      const r = this.reflections.sample(screenUV as unknown as TslNode) as ReturnType<typeof vec4>;
+      const spec = texture(this.reflections.specular, screenUV);
+      const f0 = spec.rgb;
+      const rough = spec.a.clamp(0.02, 1);
+      const depthNode = this.scenePass.getTextureNode('depth');
+      const viewPos = getViewPosition(screenUV, depthNode, cameraProjectionMatrixInverse);
+      const nView = normalize(this.scenePass.getTextureNode('normal').rgb);
+      const dotNV = nView.dot(normalize(viewPos.negate())).clamp(0, 1);
+      const fab = DFGLUT({ dotNV, roughness: rough });
+      const brdf = f0.mul(fab.x).add(fab.y);
+      let so: TslNode = float(1);
+      if (occlusion) {
+        const aoNV = dotNV.add(occlusion as ReturnType<typeof float>);
+        const aoExp = rough.mul(-16).sub(1).exp2();
+        so = (occlusion as ReturnType<typeof float>).sub(aoNV.pow(aoExp).oneMinus()).clamp() as unknown as TslNode;
+      }
+      const specularLight = r.rgb.mul(brdf).mul(so).mul(r.a).mul(this.reflections.intensity).toInspector('Reflections / Specular');
+      beauty = vec4(vec3(beauty).add(specularLight), vec4(beauty).a) as unknown as TslNode;
+    }
+    if (occlusion) {
+      // The lightmap's contribution rides inside the scene colour; the G-buffer carries
+      // it again in the spare channels (normal.a, velocity.ba) so it can be occluded here
+      // without touching the direct term: colour − baked · (1 − visibility).
+      const baked = vec3(
+        this.scenePass.getTextureNode('normal').a,
+        this.scenePass.getTextureNode('velocity').b,
+        this.scenePass.getTextureNode('velocity').a,
+      );
+      beauty = vec4(vec3(beauty).sub(baked.mul(float(1).sub(occlusion))), vec4(beauty).a) as unknown as TslNode;
+    }
       }
     }
 
@@ -459,6 +514,18 @@ export class FrameGraph {
         right = vec4(
           this.scenePass.getTextureNode('normal').rgb.mul(0.5).add(0.5),
           1,
+      case SplitView.Contact:
+        if (this.contact) right = vec4(vec3((this.contact.sample(screenUV as unknown as TslNode) as ReturnType<typeof vec4>).z), 1);
+        break;
+      case SplitView.BentNormal:
+        if (this.contact) {
+          const c = this.contact.sample(screenUV as unknown as TslNode) as ReturnType<typeof vec4>;
+          right = vec4(octDecode(c.xy as ReturnType<typeof vec2>).mul(0.5).add(0.5), 1);
+        }
+        break;
+      case SplitView.Reflections:
+        if (this.reflections) right = vec4((this.reflections.sample(screenUV as unknown as TslNode) as ReturnType<typeof vec4>).rgb, 1);
+        break;
         );
         break;
       case SplitView.Lightmap:

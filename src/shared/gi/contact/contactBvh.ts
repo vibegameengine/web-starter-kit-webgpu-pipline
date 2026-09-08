@@ -10,6 +10,8 @@ export type ContactBVHBundle = {
   bvhNode: THREE.StorageBufferNode;
   positionNode: THREE.StorageBufferNode;
   indexNode: THREE.StorageBufferNode;
+  /** Per-vertex (u, v, materialId), the same layout as the GI tree's `bvh_attribute`. */
+  attributeNode: THREE.StorageBufferNode;
   triangles: number;
   buildMs: number;
   dispose: () => void;
@@ -49,10 +51,12 @@ export function createContactBVH(scene: THREE.Scene, materialIdByUUID: Map<strin
   const bvhAttr = new THREE.StorageBufferAttribute(new Float32Array(rootBuffer), 8);
   const posAttr = new THREE.StorageBufferAttribute(merged.attributes.position.array, 3);
   const idxAttr = new THREE.StorageBufferAttribute(merged.index.array, 3);
+  const colAttr = new THREE.StorageBufferAttribute(merged.attributes.color.array, 3);
   const bundle: ContactBVHBundle = {
     bvhNode: storage(bvhAttr, 'BVHNode', 0).toReadOnly().setName('bvh'),
     positionNode: storage(posAttr, 'vec3', 0).toReadOnly().setName('bvh_position'),
     indexNode: storage(idxAttr, 'uvec3', 0).toReadOnly().setName('bvh_index'),
+    attributeNode: storage(colAttr, 'vec3', 0).toReadOnly().setName('bvh_attribute'),
     triangles: gathered.triangles,
     buildMs,
     dispose: () => { merged.dispose(); for (const g of geometries) g.dispose(); },

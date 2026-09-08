@@ -119,6 +119,11 @@ export class TemporalAANode extends THREE.TempNode {
     this.textureNode = passTexture(this as unknown as THREE.PassNode, this.resolveTarget.texture);
   }
 
+  /** Last frame's resolved colour — what a reflection ray reads when it lands on screen. */
+  get historyTexture(): THREE.Texture {
+    return this.historyTarget.texture;
+  }
+
   /** Replaces the frame being accumulated (composite rebuilt); history is kept. */
   setInput(node: N): void {
     this.inputNode = node;
