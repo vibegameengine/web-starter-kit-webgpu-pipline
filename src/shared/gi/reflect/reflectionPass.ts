@@ -292,7 +292,14 @@ export class ReflectionPass {
   private kernel: THREE.ComputeNode | null = null;
   private boundStatic: ContactBVHBundle | null = null;
   private boundDynamic: DynamicBVHBundle | null = null;
-  private boundColor: THREE.Texture | null = null;
+  /**
+   * The screen colour the trace reads (the TAA history), as one node whose texture
+   * is swapped per frame. Rebinding it by rebuilding the kernel cost a full node
+   * build every frame: the TAA hands over a ping-pong target, so the identity
+   * alternates. Same defect as the exposure meter, measured the same day.
+   */
+  private colorNode: N | null = null;
+  private colorSamplerNode: N | null = null;
   private frame = 0;
   private historyValid = false;
   private readonly prevViewProjection = new THREE.Matrix4();
@@ -362,13 +369,14 @@ export class ReflectionPass {
     width = Math.max(1, Math.round(width * scale));
     height = Math.max(1, Math.round(height * scale));
     if (width !== this.width || height !== this.height) this.allocate(width, height);
-    if (staticBvh !== this.boundStatic || dynamicBvh !== this.boundDynamic || color !== this.boundColor || !this.kernel) {
+    if (staticBvh !== this.boundStatic || dynamicBvh !== this.boundDynamic || !this.kernel) {
       this.boundStatic = staticBvh;
       this.boundDynamic = dynamicBvh;
-      this.boundColor = color;
       this.buildKernel(staticBvh, dynamicBvh, diffuseArray, depth, normal, spec, color);
       this.historyValid = false;
     }
+    this.colorNode!.value = color;
+    this.colorSamplerNode!.value = color;
     const cam = this.camera;
     this.uCamWorld.value.copy(cam.matrixWorld);
     this.uView.value.copy(cam.matrixWorldInverse);
@@ -459,8 +467,8 @@ export class ReflectionPass {
       depthTex: texture(depth),
       normalTex: texture(normal),
       specTex: texture(spec),
-      colorTex: texture(color),
-      colorSampler: sampler(color),
+      colorTex: (this.colorNode = texture(color)),
+      colorSampler: (this.colorSamplerNode = sampler(color)),
       blueNoiseTex: texture(this.blueNoise),
       envTex: texture(this.environment),
       envSampler: sampler(this.environment),

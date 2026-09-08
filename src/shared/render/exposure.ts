@@ -67,7 +67,15 @@ export class AutoExposure {
   private readonly uAuto = uniform(1);
   private meter: THREE.ComputeNode | null = null;
   private adapt: THREE.ComputeNode | null = null;
-  private boundSource: THREE.Texture | null = null;
+  /**
+   * The frame being metered, as one node whose texture is swapped per frame.
+   *
+   * Rebinding by rebuilding the kernel cost the whole compute program every frame:
+   * the TAA hands over a ping-pong target, so the texture identity alternates, and
+   * `renderer.compute` then re-ran the node builder. Measured 2026-09-08 at 4K:
+   * 55% of the main thread inside `getForCompute` -> `build`, 25 ms frames.
+   */
+  private readonly sourceNode: N = texture(new THREE.Texture());
 
   constructor(private readonly renderer: THREE.WebGPURenderer, settings: Partial<ExposureSettings> = {}) {
     this.settings = { ...DEFAULT_EXPOSURE, ...settings };
@@ -89,10 +97,8 @@ export class AutoExposure {
   /** Runs the meter on `source` (the resolved HDR frame) for this frame. */
   update(source: THREE.Texture, width: number, height: number, dt: number): void {
     const s = this.settings;
-    if (source !== this.boundSource || !this.meter) {
-      this.boundSource = source;
-      this.build(source);
-    }
+    this.sourceNode.value = source;
+    if (!this.meter) this.build();
     this.uAuto.value = s.auto ? 1 : 0;
     this.uManual.value = s.manual;
     this.uSize.value.set(width, height);
@@ -108,7 +114,7 @@ export class AutoExposure {
     this.renderer.compute(this.adapt!, [1, 1, 1]);
   }
 
-  private build(source: THREE.Texture): void {
+  private build(): void {
     const hist = this.histogram;
     const size = this.uSize;
     // One thread per 4x4 block of the frame: ~90k samples at 1600x900.
@@ -116,7 +122,7 @@ export class AutoExposure {
       const px = globalId.xy.mul(4).add(2);
       If(px.x.lessThan(uint(size.x)).and(px.y.lessThan(uint(size.y))), () => {
         const uv = vec2(px).add(0.5).div(size);
-        const rgb = texture(source, uv).level(float(0)).rgb;
+        const rgb = this.sourceNode.sample(uv).level(float(0)).rgb;
         const lum = max(luminance(rgb), 1e-6);
         const bin = clamp(log2(lum).sub(LOG_MIN).div(LOG_RANGE).mul(BINS), 0, BINS - 1);
         atomicAdd(hist.element(uint(bin)), uint(1));

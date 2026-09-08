@@ -24,9 +24,29 @@ for (let i = 0; i < profile.samples.length; i++) {
   byFn.set(`${cf.functionName || '(anon)'} ${file}:${cf.lineNumber}`, (byFn.get(`${cf.functionName || '(anon)'} ${file}:${cf.lineNumber}`) ?? 0) + ms);
   byFile.set(file, (byFile.get(file) ?? 0) + ms);
 }
+// The hot path: total time per node (self + descendants) down the heaviest chain,
+// so a cost inside three's node system says which of OUR calls pays for it.
+const parent = new Map();
+for (const n of profile.nodes) for (const c of n.children ?? []) parent.set(c, n.id);
+const selfById = new Map();
+for (let i = 0; i < profile.samples.length; i++) selfById.set(profile.samples[i], (selfById.get(profile.samples[i]) ?? 0) + (profile.timeDeltas[i] ?? 0) / 1000);
+const totalById = new Map();
+for (const [id, ms] of selfById) { let cur = id; const seen = new Set(); while (cur !== undefined && !seen.has(cur)) { seen.add(cur); totalById.set(cur, (totalById.get(cur) ?? 0) + ms); cur = parent.get(cur); } }
+const label = (id) => { const cf = nodes.get(id).callFrame; return `${cf.functionName || '(anon)'} ${(cf.url.split('?')[0].split('/').slice(-2).join('/')) || 'native'}:${cf.lineNumber}`; };
+const root = profile.nodes.find((n) => n.callFrame.functionName === '(root)')?.id ?? profile.nodes[0].id;
+const path = [];
+let cur = root;
+for (let depth = 0; depth < 24; depth++) {
+  const kids = (nodes.get(cur).children ?? []).map((id) => [id, totalById.get(id) ?? 0]).sort((a, b) => b[1] - a[1]);
+  if (!kids.length || kids[0][1] < total * 0.05) break;
+  path.push(`${(100 * kids[0][1] / total).toFixed(1).padStart(5)}%  ${'  '.repeat(depth)}${label(kids[0][0])}`);
+  cur = kids[0][0];
+}
 const top = (m, n) => [...m].sort((a, b) => b[1] - a[1]).slice(0, n).map(([k, v]) => `${(100 * v / total).toFixed(1).padStart(5)}%  ${k}`).join('\n');
 const sorted = [...intervals].sort((a, b) => a - b);
 console.log(`rAF interval median ${sorted[8].toFixed(0)} ms (min ${sorted[0].toFixed(0)}, max ${sorted[15].toFixed(0)}); profiled ${(total / 1000).toFixed(1)} s`);
+console.log('--- hot path (total time)');
+console.log(path.join(String.fromCharCode(10)));
 console.log('--- self time by file'); console.log(top(byFile, 12));
 console.log('--- self time by function'); console.log(top(byFn, 25));
 await browser.close();
