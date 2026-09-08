@@ -72,6 +72,15 @@ const MAX_SURFELS_PER_CELL_LOOKUP = 32;
 export type SurfelIntegratePass = {
   invalidate: () => void;
   /**
+   * The baked irradiance atlas, or null to read every hit from the surfel cache.
+   *
+   * A ray landing on unwrapped static geometry reads its light straight from the
+   * atlas instead of gathering the cache at that point: the same light, one texture
+   * fetch against a hash-grid walk of up to 32 entries. Changing the texture rebuilds
+   * the kernel, so hand it a stable object.
+   */
+  setBakedAtlas: (texture: THREE.Texture | null) => void;
+  /**
    * `scene` rather than a light: the tracer reads every analytic light in the graph out
    * of the storage buffer `sceneLights.ts` refreshes here. It used to take one
    * `THREE.DirectionalLight`, which made "sun" and "light source" the same concept all
@@ -93,6 +102,7 @@ export type SurfelIntegratePass = {
   setAlbedoBoost: (boost: number) => void;
   setGiScales: (fromDirect: number, fromIndirect: number) => void;
   setEnvControls: (intensity: number, lod: number) => void;
+  setLeafTransmit: (enabled: boolean) => void;
   setDynamicTracing: (enabled: boolean) => void;
 };
 
@@ -608,6 +618,7 @@ export function createSurfelIntegratePass(
   envTex: THREE.Texture,
 ): SurfelIntegratePass {
   let computeNode: THREE.ComputeNode | null = null;
+  let bakedAtlas: THREE.Texture | null = null;
   let lastSchedule = null;
 
   // Uniforms
@@ -651,6 +662,8 @@ export function createSurfelIntegratePass(
 
   const U_ENV_INTENSITY = uniform(1.0);
   const U_ENV_LOD = uniform(4.0);
+  /** 1 = a bounce ray that stops on foliage also collects light through the leaf; 0 = ablation. */
+  const U_LEAF_TRANSMIT = uniform(1.0);
 
   function run(
     renderer: THREE.WebGPURenderer,
@@ -928,6 +941,7 @@ export function createSurfelIntegratePass(
           envSampler: sampler,
           envIntensity: f32,
           envLod: f32,
+          leafTransmit: f32,
           frame: u32,
           lightsTex: texture_2d<f32>,
           lightCount: u32,
@@ -1189,12 +1203,40 @@ export function createSurfelIntegratePass(
                 // "which light it asked about" — a bias that shows up as one lamp being
                 // systematically brighter on surfaces facing a particular way.
                 let lightU = blueNoise4(index, frame * BLUE_NOISE_STRIDE + i, 2u, blueNoiseTex).x;
-                bounceLi += giShadeHit(
-                  lightsTex, hitPoint, hitNormal, hitAlbedo, eps,
-                  dynTrace, dynBounds,
-                  lightCount, lightSamples, lightU, medium,
-                  diffuseTex, diffuseTexSampler
-                ) * giFromDirect;
+                // Foliage is a thin sheet with two lit faces. hitNormal is the
+                // geometric normal, whichever face the ray struck; a ray that comes at
+                // a leaf from behind (a surfel under the crown looking up) sees the
+                // face turned toward it lit by whatever is on its own side, plus what
+                // comes *through* from the far side: T · E_far · cos / π, the same
+                // Lambert transmission the raster's leaf BSDF uses, with the shadow
+                // ray leaving from the far face. Opaque hits keep the plain path.
+                let hitOpacity = textureSampleLevel(diffuseTex, diffuseTexSampler, hitUv, matId, 0.0).a;
+                if (leafTransmit > 0.5 && hitOpacity < 0.995) {
+                  let facing = select(-hitNormal, hitNormal, dot(hitNormal, ray.direction) < 0.0);
+                  // Transmitted colour: the leaf's hue at the photometric transmittance
+                  // the material declared (1 - opacity).
+                  let hitLum = max(1e-3, dot(hitAlbedo, vec3f(0.2126, 0.7152, 0.0722)));
+                  let through = clamp(hitAlbedo * ((1.0 - hitOpacity) / hitLum), vec3f(0.0), vec3f(1.0));
+                  bounceLi += giShadeHit(
+                    lightsTex, hitPoint, facing, hitAlbedo, eps,
+                    dynTrace, dynBounds,
+                    lightCount, lightSamples, lightU, medium,
+                    diffuseTex, diffuseTexSampler
+                  ) * giFromDirect;
+                  bounceLi += giShadeHit(
+                    lightsTex, hitPoint, -facing, through, eps,
+                    dynTrace, dynBounds,
+                    lightCount, lightSamples, lightU, medium,
+                    diffuseTex, diffuseTexSampler
+                  ) * giFromDirect;
+                } else {
+                  bounceLi += giShadeHit(
+                    lightsTex, hitPoint, hitNormal, hitAlbedo, eps,
+                    dynTrace, dynBounds,
+                    lightCount, lightSamples, lightU, medium,
+                    diffuseTex, diffuseTexSampler
+                  ) * giFromDirect;
+                }
 
                 // Emission is added raw. It is not multiplied by the hit's albedo (a
                 // light does not reflect itself) and not scaled by giFromDirect (that
@@ -1377,6 +1419,7 @@ export function createSurfelIntegratePass(
         envSampler,
         envIntensity: U_ENV_INTENSITY,
         envLod: U_ENV_LOD,
+        leafTransmit: U_LEAF_TRANSMIT,
 
         frame: U_FRAME,
         lightsTex: giLightsTexture,
@@ -1411,6 +1454,12 @@ export function createSurfelIntegratePass(
   return {
     run,
     invalidate: () => { computeNode?.dispose(); computeNode = null; },
+    setBakedAtlas: (value: THREE.Texture | null) => {
+      if (value === bakedAtlas) return;
+      bakedAtlas = value;
+      computeNode?.dispose();
+      computeNode = null;
+    },
     setBaseSampleCount: (count: number) => {
       U_BASE_SAMPLE_COUNT.value = Math.max(1, Math.floor(count));
     },
@@ -1424,6 +1473,9 @@ export function createSurfelIntegratePass(
     setEnvControls: (intensity: number, lod: number) => {
       U_ENV_INTENSITY.value = Math.max(0, intensity);
       U_ENV_LOD.value = Math.max(0, lod);
+    },
+    setLeafTransmit: (enabled: boolean) => {
+      U_LEAF_TRANSMIT.value = enabled ? 1 : 0;
     },
     setDynamicTracing: (enabled: boolean) => {
       dynamicTracing = enabled;

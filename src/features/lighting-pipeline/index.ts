@@ -525,6 +525,9 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
     lightmapTexture = texture;
     applyLightmap(scene, lightmapTexture, lightmapIntensity);
     frameGraph.setLightmapTexture(lightmapTexture);
+    // The tracer reads the same atlas at static hits (`?atlasHits=0` keeps every hit
+    // on the surfel cache, which is the A/B control for what that read changes).
+    if (params.get('atlasHits') !== '0') gi.useBakedAtlas(lightmapTexture);
   }
 
   let refreshFrozenControl = () => {};

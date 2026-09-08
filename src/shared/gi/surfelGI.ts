@@ -147,6 +147,7 @@ export class SurfelGI {
   private growthCheckedAtFrame = 0;
   private poolSaturationReported = false;
   private releasedBakePoolBytes = 0;
+  private bakedAtlas: THREE.Texture | null = null;
   private dynamicMembershipChanged = false;
   private dynamicRevision = 0;
   bakedFeedbackEnabled = true;
@@ -326,6 +327,7 @@ export class SurfelGI {
       const c = this.lightingControls;
       this.integrate.setEnvControls(c.envIntensity, c.envLod);
       this.integrate.setLeafTransmit(this.leafTransmitEnabled);
+      this.integrate.setBakedAtlas(this.bakedAtlas);
       this.integrate.setGiScales(c.fromDirect, c.fromIndirect);
       this.integrate.setAlbedoBoost(c.albedoBoost);
     }
@@ -530,6 +532,20 @@ export class SurfelGI {
   }
 
   get bakeNoiseTexture(): THREE.Texture { return this.blueNoise; }
+
+  /**
+   * Hands the tracer the baked atlas, so a ray landing on unwrapped static geometry
+   * reads its light from there instead of gathering the surfel cache at that point.
+   * Survives a pool rebuild through `rebuildPoolBoundPasses`.
+   */
+  useBakedAtlas(texture: THREE.Texture | null): void {
+    if (texture === this.bakedAtlas) return;
+    this.bakedAtlas = texture;
+    this.integrate?.setBakedAtlas(texture);
+    console.log(texture
+      ? '[gi] rays read the baked atlas at unwrapped static hits'
+      : '[gi] rays read the surfel cache at every hit');
+  }
 
   get bakedTransportStats() {
     return { enabled: false, releasedBakePoolBytes: this.releasedBakePoolBytes,
