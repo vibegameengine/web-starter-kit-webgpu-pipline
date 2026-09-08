@@ -195,8 +195,8 @@ export class Spray {
       // flow speed squared scales the chance so a fast impact throws far more.
       const spawn = source.mul(float(0.4).add(flowSpeed.mul(flowSpeed).mul(0.6))).mul(r3.add(0.5)).greaterThan(0.04);
       const tryXz = tryUv.sub(0.5).mul(2.0).mul(slabHalf);
-      // Radius: skewed to small (r² of a uniform), 0.3–4 mm.
-      const radiusNew = float(0.0003).add(pow(r6, 2.0).mul(0.0037)).mul(test === 1 ? 3.0 : 1.0);
+      // Radius: skewed to small (r³ of a uniform), 0.3–4 mm.
+      const radiusNew = float(0.0003).add(pow(r6, 3.0).mul(0.0037)).mul(test === 1 ? 3.0 : 1.0);
       // The jet: stagnation head u²/2g, amplified 1.5–3× for a wave front on a wall;
       // its speed is √(2 g H) = √amplification · u. The sheet leaves the wall a
       // little backward.
@@ -204,17 +204,22 @@ export class Spray {
       // reflects; the solver's cell velocity underestimates that at the wall face.
       const bore = sqrt(float(GRAVITY).mul(max(flow.r, 0.05))).mul(1.2);
       const uImpact = max(max(flowSpeed.mul(1.5), source.mul(1.5)), bore.mul(smoothstep(0.2, 0.6, source)));
-      const amplification = float(1.5).add(r3.mul(1.5));
+      const amplification = float(0.8).add(r3.mul(1.2));
       const jetSpeed = sqrt(amplification).mul(uImpact);
       const flowDir = flow.gb.div(max(flowSpeed, 1e-3));
-      const spread = vec2(hash(id.add(5.0), this.seed.add(11.0)).sub(0.5), hash(id.add(9.0), this.seed.add(13.0)).sub(0.5)).mul(jetSpeed.mul(0.5));
-      const back = flowDir.mul(jetSpeed.negate().mul(0.25));
+      // A fan, not a column: the sheet leaves the wall over a cone of ±35° with a
+      // spread of speeds, from a patch a few centimetres wide, thrown a little back.
+      const r7 = hash(id.add(61.0), this.seed.add(37.0));
+      const r8 = hash(id.add(67.0), this.seed.add(41.0));
+      const spread = vec2(hash(id.add(5.0), this.seed.add(11.0)).sub(0.5), hash(id.add(9.0), this.seed.add(13.0)).sub(0.5)).mul(jetSpeed.mul(1.4));
+      const back = flowDir.mul(jetSpeed.negate().mul(float(0.2).add(r7.mul(0.4))));
+      const patch = vec2(r7.sub(0.5), r8.sub(0.5)).mul(0.08);
       // The jet leaves the face of the boulder, not its foot: the impact cell is under
       // the stone's own overhang, so the droplet starts a hand back against the flow
       // and above the surface, where the camera can see it.
-      const spawnXz = tryXz.sub(flowDir.mul(0.08));
+      const spawnXz = tryXz.sub(flowDir.mul(0.08)).add(patch);
       const spawnPos = vec3(spawnXz.x, level.add(surface.sample(tryUv).r).add(0.05), spawnXz.y);
-      const spawnVel = vec3(back.x.add(spread.x), jetSpeed.mul(float(0.8).add(r1.mul(0.4))), back.y.add(spread.y));
+      const spawnVel = vec3(back.x.add(spread.x), jetSpeed.mul(float(0.5).add(r1.mul(0.7))), back.y.add(spread.y));
       const posOut = select(alive, vec4(pos, ageNext), select(spawn, vec4(spawnPos, 0.001), vec4(0.0, -10.0, 0.0, 0.0)));
       const velOut = select(alive, vec4(vel, velRad.w), select(spawn, vec4(spawnVel, radiusNew), vec4(0.0)));
       // MRT entries other than `output` are written raw (no colour chain, no clamp).
@@ -252,7 +257,7 @@ export class Spray {
     const mist = smoothstep(0.0009, 0.0004, radius);
     // In sunlight a droplet reads as its glint: a bright speck a centimetre across
     // whatever its true size; the mist plume is drawn as broad soft puffs.
-    const bead = float(0.012).add(radius.mul(2.5));
+    const bead = float(0.008).add(radius.mul(2.0));
     const puff = float(0.06).add(age.mul(0.08));
     const size = mix(bead, puff, mist);
     // Stretch along the velocity's screen direction (a shutter's worth of flight).
@@ -278,11 +283,15 @@ export class Spray {
     const rim = pow(float(1.0).sub(sphereZ), 3.0);
     const behind = this.screenColor.sample(screenUV.add(centred.mul(0.004)) as unknown as V2).rgb;
     const sunLit = vec3(sunColor).mul(clamp(vec3(sunDir).y, 0.0, 1.0));
-    const beadColor = behind.mul(0.35).add(sunLit.mul(glint.mul(2.0).add(rim.mul(0.5)).add(0.35))).add(vec3(0.5, 0.55, 0.6).mul(rim.add(0.3)));
-    const beadAlpha = disc.mul(float(0.75).add(rim.mul(0.25)));
+    // Spray is white: a droplet scatters the sun and the sky in every direction; the
+    // background shows only faintly through it, and the glint sits on top.
+    const skyLit = vec3(0.9, 0.93, 0.97);
+    const white = sunLit.mul(0.45).add(skyLit.mul(0.5));
+    const beadColor = white.add(sunLit.mul(glint.mul(1.5))).add(behind.mul(0.15));
+    const beadAlpha = disc.mul(float(0.7).add(rim.mul(0.3)));
     // The plume: aerated water, white in the sun, densest in the first half second.
-    const mistColor = sunLit.mul(0.5).add(vec3(0.75, 0.8, 0.85));
-    const mistAlpha = smoothstep(1.0, 0.0, rr).mul(0.3).mul(smoothstep(1.4, 0.3, age));
+    const mistColor = sunLit.mul(0.45).add(skyLit.mul(0.55));
+    const mistAlpha = smoothstep(1.0, 0.0, rr).mul(0.35).mul(smoothstep(1.4, 0.3, age));
     const colorOut = mix(beadColor, mistColor, mist);
     // Fresh from the jet the sheet has not broken up yet: brighter and fuller.
     const fresh = smoothstep(0.25, 0.0, age).mul(0.5).add(1.0);

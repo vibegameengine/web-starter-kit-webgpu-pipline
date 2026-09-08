@@ -334,7 +334,12 @@ export function createWater(options: WaterOptions): Water {
     const gradB = vec2(bR.sub(bL), bF.sub(bB)).div(float(2 * (2 * half) / 512));
     const climb = state.g.mul(gradB.x).add(state.b.mul(gradB.y));
     const steep = smoothstep(0.6, 1.4, gradB.length());
-    const impact = smoothstep(0.3, 1.2, climb).mul(steep).mul(smoothstep(0.01, 0.05, state.r));
+    // Only a boulder that breaks the surface throws spray: the bed a few cells ahead
+    // along the flow must stand above the water line. A submerged rock is passed over.
+    const flowStep = vec2(state.g, state.b).div(max(vec2(state.g, state.b).length(), 1e-3)).mul(tb);
+    const bedAhead = max(max(texture(heightTexture, q.add(flowStep.mul(3.0))).r, texture(heightTexture, q.add(flowStep.mul(7.0))).r), texture(heightTexture, q.add(flowStep.mul(12.0))).r);
+    const emergent = smoothstep(-0.06, 0.0, bedAhead.sub(waterLevel));
+    const impact = smoothstep(0.3, 1.2, climb).mul(steep).mul(smoothstep(0.01, 0.05, state.r)).mul(emergent);
     // The foot of the impact is aerated white: the burst goes into the foam too.
     return vec4(max(foam, impact.mul(0.9)), wetness, impact, 1.0);
   })();

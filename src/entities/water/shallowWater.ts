@@ -387,7 +387,10 @@ export class ShallowWater {
       // not a run-up front, and it painted a jagged collar around every rock.
       const bedSlope = length(vec2(bedOf(1, 0).sub(bedOf(-1, 0)), bedOf(0, 1).sub(bedOf(0, -1)))).div(dx.mul(2.0));
       const gentleBed = smoothstep(0.6, 0.25, bedSlope);
-      const front = smoothstep(0.25, 0.7, speedHere).mul(smoothstep(0.004, 0.012, h)).mul(smoothstep(0.08, 0.03, h)).mul(wet).mul(gentleBed);
+      // ...and on a bed at the water line: a thin fast sheet over the top of a
+      // submerged rock is not a run-up front either.
+      const atLine = smoothstep(-0.08, -0.02, bedCell);
+      const front = smoothstep(0.25, 0.7, speedHere).mul(smoothstep(0.004, 0.012, h)).mul(smoothstep(0.08, 0.03, h)).mul(wet).mul(gentleBed).mul(atLine);
       const foam = clamp(max(bore, front), 0.0, 1.0);
       return vec4(depth, clamp(u, -6.0, 6.0).mul(wet), clamp(v, -6.0, 6.0).mul(wet), foam);
     })();
