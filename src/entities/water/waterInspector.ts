@@ -1,5 +1,5 @@
 import * as THREE from 'three/webgpu';
-import type { ShallowWater } from './shallowWater.ts';
+import type { WaterSim } from './waterSim.ts';
 import type { IslandField } from '../island/heightField.ts';
 
 /**
@@ -31,7 +31,7 @@ export class WaterInspector {
 
   constructor(
     renderer: THREE.WebGPURenderer,
-    private readonly sim: ShallowWater,
+    private readonly sim: WaterSim,
     private readonly field: IslandField,
     options: { sectionZ?: number; readFoam?: () => Promise<{ size: number; foam: Float32Array; wetness: Float32Array }>; bathymetry?: THREE.Texture } = {},
   ) {

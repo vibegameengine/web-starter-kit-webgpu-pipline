@@ -435,6 +435,11 @@ export class ShallowWater {
     return DT;
   }
 
+  /** The (depth, u, v, foam) target itself — what the off-thread host reads back. */
+  get viewTarget(): THREE.RenderTarget {
+    return this.view;
+  }
+
   private substep(): void {
     const renderer = this.renderer;
     this._simTime += DT;

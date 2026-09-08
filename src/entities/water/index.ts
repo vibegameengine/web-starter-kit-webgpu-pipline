@@ -50,6 +50,8 @@ import { WATER_ABSORB } from './medium.ts';
 import { SurfaceField } from './surfaceField.ts';
 import { Spray } from './spray.ts';
 import { ShallowWater } from './shallowWater.ts';
+import { WorkerWaterSim } from './simHost.ts';
+import type { WaterSim } from './waterSim.ts';
 import { WaterInspector } from './waterInspector.ts';
 import { WindWaves } from './windWaves.ts';
 
@@ -63,6 +65,22 @@ export interface WaterOptions {
   cutDepth?: number;
   /** The bed as a height texture over the slab (see bathymetry.ts); the field's stamps otherwise. */
   bathymetry?: THREE.Texture;
+  /**
+   * Frames of shallow-water solver, foam and spray to run before the water holds
+   * still. `Infinity` (the default) is live simulation. A finite count settles the
+   * lagoon into its rest shape at boot and then freezes every field, so the surface
+   * still refracts, reflects, absorbs and casts caustics — only its motion stops.
+   * Only meaningful with `offThread: false`: the off-thread solver costs the frame
+   * nothing to run, so there is nothing to freeze for.
+   */
+  simulationFrames?: number;
+  /**
+   * Run the solver on its own thread and its own WebGPU device (simWorker.ts).
+   * Default. `false` keeps it in the frame, which is the A/B baseline: measured
+   * 2026-09-08 at 4K, in-frame it is 25 quad renders of 384x384 per frame for
+   * 0.37 ms GPU and 1.2 ms main-thread CPU.
+   */
+  offThread?: boolean;
 }
 
 export interface Water {
@@ -98,6 +116,8 @@ export interface Water {
   };
   /** Advances the foam field by the elapsed time and refreshes the sun uniforms. */
   update(elapsedSeconds: number): void;
+  /** Resolves once the solver has a field to draw (the off-thread preroll). */
+  ready: Promise<void>;
   /** Called with the live foam/wetness field texture after every step. */
   onField?: (field: THREE.Texture) => void;
   /** Foam (R) and wetness (G) fields read back from the GPU, for the inspector. */
@@ -119,7 +139,8 @@ export interface Water {
  * Only the pipeline's overlay pass draws it (`Layer.Overlay`); the GI never sees it.
  */
 export function createWater(options: WaterOptions): Water {
-  const { renderer, field, environment, sun, cutDepth = 3.0, bathymetry } = options;
+  const { renderer, field, environment, sun, cutDepth = 3.0, bathymetry, simulationFrames = Infinity, offThread = true } = options;
+  let stepsLeft = simulationFrames;
   const half = field.half;
 
   const heightTexture = bathymetry ?? field.toTexture(512);
@@ -152,12 +173,16 @@ export function createWater(options: WaterOptions): Water {
     faceDepth.x += Math.max(0, field.waterLevel - field.obstacleHeight(-half + 0.05, s)) / 64;
     faceDepth.z += Math.max(0, field.waterLevel - field.obstacleHeight(s, half - 0.05)) / 64;
   }
-  const sim = new ShallowWater({ renderer, bathymetry: heightTexture, half, waterLevel: field.waterLevel, size: 384, faceDepth });
+  const SIM_SIZE = 384;
+  const PREROLL_SECONDS = 6.0;
+  const simSetup = { renderer, bathymetry: heightTexture, half, waterLevel: field.waterLevel, size: SIM_SIZE, faceDepth };
+  const workerSim = offThread ? new WorkerWaterSim({ ...simSetup, swellAmplitude: 0.06, swellPeriod: 3.2, swellDirection: Math.atan2(-1, 1), prerollSeconds: PREROLL_SECONDS }) : null;
+  const sim: WaterSim = workerSim ?? new ShallowWater(simSetup);
   // Wind waves from the spectrum ride on the simulated surface (see windWaves.ts).
   const wind = new WindWaves({ windSpeed: 4.5, fetch: 800, components: 48, gain: 1.0 });
   const windCap = Math.min(0.12, wind.amplitudeSum);
 
-  sim.preroll(6.0);
+  if (!workerSim) (sim as ShallowWater).preroll(PREROLL_SECONDS);
 
   /** Sand height (with boulders stamped in) under (x, z); +z is row-down in the texture. */
   const sandHeight = Fn(([xz]: [ReturnType<typeof vec2>]) => {
@@ -812,8 +837,22 @@ export function createWater(options: WaterOptions): Water {
       wind.setWind(controls.windSpeed, (controls.windDirection * Math.PI) / 180);
     },
   };
+  // Audit only: the solver's own clock and where it runs. `scripts/check-water-sim.mjs`
+  // reads it to prove the water advanced in a frame that encoded none of its passes,
+  // and stops the off-thread solver mid-session to measure what its device costs the
+  // main one — the two cannot be separated by comparing two browser launches.
+  (window as unknown as Record<string, unknown>).__water = () => ({
+    simTime: sim.simTime, offThread: workerSim !== null, size: sim.size, stepsLeft, cost: workerSim?.cost ?? null,
+  });
+  (window as unknown as Record<string, unknown>).__waterRun = (running: boolean) => sim.setRunning?.(running);
+
+  // `?still=1` holds the scene's animation for a check; the worker must stop too,
+  // or it keeps a second device busy on a frame nobody looks at.
+  if (workerSim && params.get('still') === '1') void workerSim.ready.then(() => workerSim.setRunning(false));
+
   const water: Water = {
     group,
+    ready: workerSim ? workerSim.ready : Promise.resolve(),
     async readFoamField() {
       const raw = await renderer.readRenderTargetPixelsAsync(foamRead, 0, 0, FOAM_SIZE, FOAM_SIZE);
       const n = FOAM_SIZE * FOAM_SIZE;
@@ -829,6 +868,16 @@ export function createWater(options: WaterOptions): Water {
     update(elapsedSeconds) {
       const dt = previousTime < 0 ? 1 / 60 : elapsedSeconds - previousTime;
       previousTime = elapsedSeconds;
+      // The sun still follows the time of day when the water is frozen: it is the
+      // simulation that stops, not the shading.
+      if (stepsLeft <= 0) {
+        if (stepsLeft === 0) { sim.setRunning?.(false); stepsLeft = -1; }
+        sunDirection.copy(sun.position).sub(sun.target.position).normalize();
+        (uniforms.sunDir.value as THREE.Vector3).copy(sunDirection);
+        (uniforms.sunColor.value as THREE.Color).copy(sun.color).multiplyScalar(Math.min(1.5, sun.intensity * 0.5));
+        return;
+      }
+      stepsLeft--;
       const simBefore = sim.simTime;
       sim.step(Math.min(0.05, Math.max(0.001, dt)));
       // Everything downstream of the solver runs on the solver's clock: when the

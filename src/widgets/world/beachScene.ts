@@ -185,7 +185,7 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
     { x: 1.0, z: -3.3, h: 3.7, lean: -0.3, seed: 44 },
   ];
   for (const spec of palmSpecs) {
-    const palm = createPalm({ seed: spec.seed, height: spec.h, lean: spec.lean });
+    const palm = createPalm({ seed: spec.seed, height: spec.h, lean: spec.lean, environment });
     palm.group.position.set(spec.x, field.height(spec.x, spec.z) - 0.05, spec.z);
     // Lean toward the water (−x), which is where the light and the camera are.
     palm.group.rotation.y = Math.PI + (random() - 0.5) * 0.6;
@@ -207,7 +207,7 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
     { x: 5.2, z: 1.3, r: 0.45, kind: 'fan', seed: 58 },
   ];
   for (const spec of shrubSpecs) {
-    const shrub = createShrub({ seed: spec.seed, radius: spec.r, kind: spec.kind });
+    const shrub = createShrub({ seed: spec.seed, radius: spec.r, kind: spec.kind, environment });
     shrub.group.position.set(spec.x, field.height(spec.x, spec.z) - 0.03, spec.z);
     shrub.group.rotation.y = random() * Math.PI * 2;
     scene.add(shrub.group);
@@ -217,10 +217,22 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
 
   // --- water and backdrop (outside the GI) -------------------------------------
   // The bed the water runs over is the geometry itself, rendered from above once.
-  const bathymetry = bakeBathymetry({ renderer, objects: [island.group, rocks], half: field.half, size: 512 });
-  const water = createWater({ renderer, field, environment, sun, bathymetry });
+  const bathymetry = bakeBathymetry({ renderer, objects: [rocks], base: field.toTexture(512, true), half: field.half, size: 512 });
+  // The shallow-water solver runs live on its own thread and its own WebGPU device
+  // (simWorker.ts): off the frame it costs, it no longer has to be frozen to stay
+  // inside the budget. `?waterSim=main` or `=1` puts it back in the frame live — the
+  // A/B baseline; `?waterSim=<frames>` settles that many frames in the frame and
+  // freezes, `?waterSim=0` the 180 frames that used to be the default.
+  const waterSimParam = new URLSearchParams(window.location.search).get('waterSim');
+  const offThread = waterSimParam === null;
+  const inFrameLive = waterSimParam === 'main' || waterSimParam === '1';
+  const simulationFrames = offThread || inFrameLive ? Infinity : Number(waterSimParam) > 1 ? Number(waterSimParam) : 180;
+  const water = createWater({ renderer, field, environment, sun, bathymetry, simulationFrames, offThread });
   // The sand darkens where the simulated swash has been.
   water.onField = (fieldTexture) => island.setWetness(fieldTexture);
+  // The worker's device has to come up and run its 6 s preroll before the first
+  // frame, or the lagoon is drawn as a dry bed for the first second of the session.
+  await water.ready;
   // `?water=0` leaves the water out: what is left is the diorama the water is drawn over.
   if (new URLSearchParams(window.location.search).get('water') !== '0') scene.add(water.group);
   const backdrop = createBackdrop({ islandBottom: field.bottom, islandHalf: field.half });
@@ -248,7 +260,7 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
     // The cached surfel radiance IS this scene's static lighting: warmed once, saved,
     // restored on every later launch, then only sampled. The virtual lightmap over it
     // (`?mode=hybrid`) adds a per-frame CPU demand pass over every static triangle —
-    // measured at 4K on 2026-09-08: 250.8 ms a frame against 21.7 ms here, for a mean
+    // measured at 4K on 2026-09-08: 250 ms a frame against 23.8 ms here, for a mean
     // difference of 1.6/255 in the picture. Nothing in the diorama moves, so the
     // whole surfel lifecycle stops once the cache is in.
     lighting: 'surfel',
