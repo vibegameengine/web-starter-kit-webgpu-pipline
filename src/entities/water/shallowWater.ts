@@ -370,7 +370,9 @@ export class ShallowWater {
         const converge = step(0.1, max(na.add(ca).sub(nb.add(cb)), na.sub(ca).sub(nb.sub(cb))));
         // A jump is a step in the *surface* between two wet cells; a step in the bed
         // (a boulder's face) with still water on both sides is not one.
-        const bothWet = step(DRY * 2.0, ha).mul(step(DRY * 2.0, hb));
+        // A bore has a body behind its face: two cells of millimetre film with a
+        // numerical step between them are not one (that painted the whole tongue).
+        const bothWet = step(0.02, max(ha, hb)).mul(step(DRY * 2.0, min(ha, hb)));
         const bedStep = smoothstep(0.12, 0.04, abs(ba.sub(bb)));
         const dh = abs(hb.add(bb).sub(ha.add(ba)));
         const hMean = ha.add(hb).mul(0.5);
@@ -390,7 +392,14 @@ export class ShallowWater {
       // ...and on a bed at the water line: a thin fast sheet over the top of a
       // submerged rock is not a run-up front either.
       const atLine = smoothstep(-0.08, -0.02, bedCell);
-      const front = smoothstep(0.25, 0.7, speedHere).mul(smoothstep(0.004, 0.012, h)).mul(smoothstep(0.08, 0.03, h)).mul(wet).mul(gentleBed).mul(atLine);
+      // ...and only at the tongue's leading edge, where the depth falls off along the
+      // flow: the foam of the swash rides its front, the sheet behind it is glass.
+      const hOf = (ox: number, oz: number): F => max(U(ox, oz).x.sub(bedOf(ox, oz)), 0.0) as unknown as F;
+      const gradH = vec2(hOf(1, 0).sub(hOf(-1, 0)), hOf(0, 1).sub(hOf(0, -1))).div(dx.mul(2.0));
+      const flowDir = vec2(u, v).div(max(speedHere, 1e-3));
+      const thinning = gradH.x.mul(flowDir.x).add(gradH.y.mul(flowDir.y)).negate();
+      const leadingEdge = smoothstep(0.03, 0.12, thinning);
+      const front = smoothstep(0.25, 0.7, speedHere).mul(smoothstep(0.004, 0.012, h)).mul(smoothstep(0.08, 0.03, h)).mul(wet).mul(gentleBed).mul(atLine).mul(leadingEdge);
       const foam = clamp(max(bore, front), 0.0, 1.0);
       return vec4(depth, clamp(u, -6.0, 6.0).mul(wet), clamp(v, -6.0, 6.0).mul(wet), foam);
     })();
@@ -464,6 +473,17 @@ export class ShallowWater {
 
   get simTime(): number {
     return this._simTime;
+  }
+
+  /** One row (v = z) of the view: depth per cell, fast enough to poll many times a second. */
+  async readRow(j: number): Promise<Float32Array> {
+    const size = this.size;
+    const row = Math.max(0, Math.min(size - 1, j));
+    const raw = await this.renderer.readRenderTargetPixelsAsync(this.view, 0, row, size, 1);
+    const decode = raw instanceof Uint16Array ? (x: number) => THREE.DataUtils.fromHalfFloat(x) : (x: number) => x;
+    const depth = new Float32Array(size);
+    for (let i = 0; i < size; i++) depth[i] = decode(raw[i * 4]);
+    return depth;
   }
 
   /** The view read back from the GPU as floats (the target is half-float; decode it). */

@@ -303,7 +303,14 @@ export function createWater(options: WaterOptions): Water {
       .add(foamPrev.sample(from.add(vec2(0.0, texel))).r)
       .add(foamPrev.sample(from.sub(vec2(0.0, texel))).r)
       .mul(0.2);
-    const decayed = spread.mul(exp(foamDt.negate().div(foamDecaySeconds)));
+    // On water the whitecap e-folding; on sand the swash left behind, the bubbles
+    // burst in a couple of seconds — the band follows the run-up, not its history.
+    // Bubble lifetime by the water under them: a whitecap's e-folding (Monahan,
+    // 3.85 s) on a body of water; on the millimetre sheet of the swash the film
+    // drains and they burst in about 1.5 s; the same on the sand they were left on.
+    const depthHere = sim.stateNode.sample(q).r;
+    const tau = mix(float(1.5), foamDecaySeconds, smoothstep(0.01, 0.08, depthHere));
+    const decayed = spread.mul(exp(foamDt.negate().div(tau)));
 
     // Only the solver's sources: breaking, the run-up front, impact spray. The
     // analytic "shore lace" band that ignored the water is gone (grill Q12/Q20).
@@ -675,6 +682,32 @@ export function createWater(options: WaterOptions): Water {
     simStats: async () => sim.readStats(),
     simProbe: async () => sim.readProbe(),
     sprayStats: async () => spray.readStats(),
+    /** Along the row z: the x of the wet edge (last wet cell toward +x), the depth 30 cm seaward of it, the beach slope there. */
+    /** The bare beach profile along x at row z: [x, height − level] every 10 cm. */
+    profile: (z: number) => {
+      const out: number[][] = [];
+      for (let x = -half; x <= half; x += 0.1) out.push([Number(x.toFixed(2)), Number((field.height(x, z) - field.waterLevel).toFixed(3))]);
+      return out;
+    },
+    simRow: async (z: number) => {
+      const size = sim.size;
+      const j = Math.max(0, Math.min(size - 1, Math.floor(((z + half) / (2 * half)) * size)));
+      const depth = await sim.readRow(j);
+      // From the sea (−x) toward the beach: the edge is the last wet cell before the
+      // first dry run of three cells; the two boundary rings are skipped.
+      let edge = 2;
+      for (let i = 2; i < size - 4; i++) {
+        if (depth[i] > 0.001) edge = i;
+        else if (depth[i + 1] <= 0.001 && depth[i + 2] <= 0.001 && i > size * 0.3) break;
+      }
+      const cell = (2 * half) / size;
+      const edgeX = -half + (edge + 0.5) * cell;
+      const back = Math.max(0, edge - Math.round(0.3 / cell));
+      let hNearShore = 0;
+      for (let i = back; i <= edge; i++) hNearShore = Math.max(hNearShore, depth[i]);
+      const slope = Math.abs(field.height(edgeX + 0.25, z) - field.height(edgeX - 0.25, z)) / 0.5;
+      return { edgeX, hNearShore, slope };
+    },
     /** The GUI knobs, for scripts: set fields, then `apply()`. */
     controls: () => water.controls,
     foamDebug: () => ({ isRenderTarget: (foamRead as unknown as { isRenderTarget?: boolean }).isRenderTarget, textures: foamRead.textures?.length, width: foamRead.width }),
