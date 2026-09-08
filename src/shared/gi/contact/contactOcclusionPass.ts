@@ -8,6 +8,8 @@ import { contactVisibility } from './boundedTrace.ts';
 
 export interface ContactOcclusionSettings {
   enabled: boolean;
+  /** Frames between traces; 1 traces every frame. See the dispatch for what a skip means. */
+  traceInterval: number;
   /** How far a contact ray looks, metres. Short on purpose: this is what the surfel gather cannot resolve. */
   radius: number;
   /** Rays per pixel per frame; the history does the rest. */
@@ -26,6 +28,10 @@ export const DEFAULT_CONTACT_SETTINGS: Readonly<ContactOcclusionSettings> = {
   // tens of ms were the composite being rebuilt every frame by a reader object that
   // changed identity each call — a leak, not tracing cost.
   enabled: true,
+  // Traced every other frame: the pass keeps its result in a storage buffer the
+  // composite reads by parity and carries its own reprojected, depth-tested history,
+  // so a skipped frame shows the last trace rather than nothing.
+  traceInterval: 2,
   radius: 0.4,
   rays: 1,
   historyWeight: 0.92,
@@ -210,6 +216,7 @@ export class ContactOcclusionPass {
   private writeNodes: [THREE.StorageBufferNode, THREE.StorageBufferNode] | null = null;
   private readNodes: [THREE.StorageBufferNode, THREE.StorageBufferNode] | null = null;
   private kernel: THREE.ComputeNode | null = null;
+  private sinceTrace = 0;
   private boundStatic: ContactBVHBundle | null = null;
   private boundDynamic: DynamicBVHBundle | null = null;
   private boundDepth: THREE.Texture | null = null;
@@ -292,6 +299,13 @@ export class ContactOcclusionPass {
       this.buildKernel(staticBvh, dynamicBvh, depth, normal);
       this.historyValid = false;
     }
+
+    // Amortised (see traceInterval): on a skipped frame nothing is dispatched and
+    // neither the parity nor the previous view-projection moves, so the composite
+    // reads the last trace and the next one reprojects from where that trace stood.
+    const interval = Math.max(1, Math.round(this.settings.traceInterval));
+    this.sinceTrace = (this.sinceTrace + 1) % interval;
+    if (this.sinceTrace !== 0 && this.historyValid) return true;
 
     const cam = this.camera;
     this.uCamWorld.value.copy(cam.matrixWorld);

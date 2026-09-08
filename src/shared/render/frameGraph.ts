@@ -177,6 +177,8 @@ export class FrameGraph {
   private motionBlur: MotionBlur | null = null;
   /** Frame counter for the grain's per-frame noise. */
   private readonly frameIndex = uniform(0);
+  /** Counts FrameGraph.render() calls; the composite copies render once per value. */
+  private frameSerial = 0;
   /**
    * Contact occlusion reader: `(screenUV) => vec4(oct.xy, visibility, viewDepth)` from
    * the pass's storage buffers, plus its strength. Multiplies the indirect terms only;
@@ -469,7 +471,7 @@ export class FrameGraph {
       // The composite becomes a texture the overlay can refract through; the overlay
       // pass writes premultiplied colour with coverage in alpha, so a frame with no
       // overlay object is the composite unchanged.
-      const sceneColor = rtt(beauty as ReturnType<typeof vec4>);
+      const sceneColor = this.copyOncePerFrame(rtt(beauty as ReturnType<typeof vec4>), 'composite.beforeOverlay');
       const over = this.overlayPass.getTextureNode('output');
       // Premultiplied: the overlay's opaque water writes (rgb, 1), its droplets write
       // (rgb·a, a); one formula composes both without squaring anyone's coverage.
@@ -504,7 +506,7 @@ export class FrameGraph {
     let resolved: TslNode;
     if (this.antialiasing === 'taa') {
       // The frame is accumulated as a texture: the resolve loads its 3x3 texels.
-      this.taa.setInput(rtt(composed as ReturnType<typeof vec4>));
+      this.taa.setInput(this.copyOncePerFrame(rtt(composed as ReturnType<typeof vec4>), 'composite.taaInput'));
       resolved = this.taa.getTextureNode().toInspector('AA / Temporal') as unknown as TslNode;
     } else if (this.antialiasing === 'fxaa') {
       resolved = fxaa(composed) as unknown as TslNode;
@@ -513,7 +515,7 @@ export class FrameGraph {
     }
     if (this.motionBlur) {
       // After the resolve (the history stays sharp), on the resolved frame as a texture.
-      const sharp = rtt(resolved as ReturnType<typeof vec4>);
+      const sharp = this.copyOncePerFrame(rtt(resolved as ReturnType<typeof vec4>), 'composite.beforeMotionBlur');
       resolved = this.motionBlur.apply(
         (at) => sharp.sample(at),
         this.scenePass.getTexture('velocity'),
@@ -648,7 +650,28 @@ export class FrameGraph {
     this.taa.endFrame();
   }
 
+  /**
+   * An `rtt()` renders once per `NodeFrame.frameId`, but that id advances on every
+   * nested `renderer.render()` — the TAA's resolve quad and the bloom chain included
+   * — so a copy read after one of those found a "new frame" and re-rendered the whole
+   * composite into it. Measured 2026-09-08 with scripts/_render_calls_probe.mjs: the
+   * pre-overlay copy of the composite rendered twice a frame, 0.45 ms each at 4K.
+   * These render once per FrameGraph.render() instead.
+   */
+  private copyOncePerFrame<T extends { updateBefore(frame: THREE.NodeFrame): void; renderTarget: THREE.RenderTarget | null }>(node: T, name: string): T {
+    if (node.renderTarget) node.renderTarget.texture.name = name;
+    const original = node.updateBefore.bind(node);
+    let renderedSerial = -1;
+    node.updateBefore = (frame: THREE.NodeFrame) => {
+      if (renderedSerial === this.frameSerial) return;
+      renderedSerial = this.frameSerial;
+      original(frame);
+    };
+    return node;
+  }
+
   render(): void {
+    this.frameSerial++;
     if (this.motionBlur) {
       this.renderer.getDrawingBufferSize(frameSize);
       this.motionBlur.update(this.renderer, this.scenePass.getTexture('velocity'), this.scenePass.getTexture('depth'), frameSize.width, frameSize.height, this.taa.cut);

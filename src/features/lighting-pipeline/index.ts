@@ -803,6 +803,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   });
   const reflectionsRoughness = num('reflectionsRoughness'); if (reflectionsRoughness !== null) reflections.settings.maxRoughness = reflectionsRoughness;
   const reflectionsEvery = num('reflectionsEvery'); if (reflectionsEvery !== null) reflections.settings.traceInterval = reflectionsEvery;
+  const contactEvery = num('contactEvery'); if (contactEvery !== null) contact.settings.traceInterval = contactEvery;
   const reflectionsIntensity = uniform(reflections.settings.intensity);
   let reflectionsReaderBound: unknown = null;
   const syncReflections = () => {
