@@ -362,7 +362,12 @@ export class ShallowWater {
         const hb = max(Ub.x.sub(bb), DRY);
         const na = axis === 0 ? desingularise(Ua.y, ha) : desingularise(Ua.z, ha);
         const nb = axis === 0 ? desingularise(Ub.y, hb) : desingularise(Ub.z, hb);
-        const converge = step(0.1, na.add(sqrt(g.mul(ha))).sub(nb.add(sqrt(g.mul(hb)))));
+        // Either family of characteristics converging is a shock: u+c for a jump
+        // running toward +axis, u−c for one running toward −axis (the swell comes in
+        // along −z, so the second family is the one the beach sees).
+        const ca = sqrt(g.mul(ha));
+        const cb = sqrt(g.mul(hb));
+        const converge = step(0.1, max(na.add(ca).sub(nb.add(cb)), na.sub(ca).sub(nb.sub(cb))));
         // A jump is a step in the *surface* between two wet cells; a step in the bed
         // (a boulder's face) with still water on both sides is not one.
         const bothWet = step(DRY * 2.0, ha).mul(step(DRY * 2.0, hb));
@@ -375,7 +380,10 @@ export class ShallowWater {
       const jx = max(jump(U(-1, 0), bedOf(-1, 0), U0, bedCell, 0), jump(U0, bedCell, U(1, 0), bedOf(1, 0), 0));
       const jz = max(jump(U(0, -1), bedOf(0, -1), U0, bedCell, 1), jump(U0, bedCell, U(0, 1), bedOf(0, 1), 1));
       const bore = max(jx, jz).mul(smoothstep(0.6, 0.02, h));
-      const front = length(vec2(u, v)).div(0.5).mul(smoothstep(0.02, 0.008, h)).mul(wet);
+      // The run-up front: the tongue's leading edge, thin and moving. Judged over the
+      // depths the sheet is drawn at (4 mm .. 8 cm), not only the invisible film.
+      const speedHere = length(vec2(u, v));
+      const front = smoothstep(0.25, 0.7, speedHere).mul(smoothstep(0.004, 0.012, h)).mul(smoothstep(0.08, 0.03, h)).mul(wet);
       const foam = clamp(max(bore, front), 0.0, 1.0);
       return vec4(depth, clamp(u, -6.0, 6.0).mul(wet), clamp(v, -6.0, 6.0).mul(wet), foam);
     })();

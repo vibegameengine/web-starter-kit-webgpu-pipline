@@ -43,12 +43,16 @@ export class IslandField {
 
     let y = mix(floor, berm + dunes, smooth(-0.32, 0.06, t));
 
-    // Ripples: sand ripples under water, wind ripples on the dry sand.
-    const wet = smooth(0.35, -0.05, y);
+    // Ripples: sand ripples under water, wind ripples on the dry sand. The swash zone
+    // between them is planar — the run-up erases ripples there, and a run-up front
+    // over ripples would follow their troughs as a row of cusps.
+    const rel = y - this.waterLevel;
+    const wet = smooth(-0.12, -0.3, rel);
+    const dry = smooth(0.15, 0.35, rel);
     const rippleDir = x * 0.86 + z * 0.5;
     const ripple = Math.sin(rippleDir * 15.0 + 3.0 * n.noise2(x * 0.6, z * 0.6));
     y += 0.007 * ripple * wet;
-    y += 0.0025 * Math.sin(rippleDir * 22.0 + 4.0 * n.noise2(x * 0.5 + 4, z * 0.5)) * (1 - wet);
+    y += 0.0025 * Math.sin(rippleDir * 22.0 + 4.0 * n.noise2(x * 0.5 + 4, z * 0.5)) * dry;
     y += 0.01 * n.fbm2(x * 1.7, z * 1.7, 2);
     return y;
   }

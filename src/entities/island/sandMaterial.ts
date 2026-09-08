@@ -71,8 +71,13 @@ export function createSandMaterial(u: SandMaterialUniforms): THREE.MeshStandardN
   // Wet where the swash has been (the simulation's wetness field), and always at and
   // below the water line; the static band is only a floor under the live one.
   const fieldUv = p.xz.div(vec3(u.slabHalf).x.mul(2.0)).add(0.5);
-  const swash = u.wetness.sample(fieldUv as unknown as ReturnType<typeof vec3>).g;
-  const wet = max(smoothstep(0.08, 0.0, aboveWater), smoothstep(0.04, 0.35, swash));
+  const field = u.wetness.sample(fieldUv as unknown as ReturnType<typeof vec3>);
+  const swash = field.g;
+  const wet = max(smoothstep(0.08, 0.0, aboveWater), smoothstep(0.02, 0.7, swash));
+  // Foam the swash left on the sand: the field's R channel, broken into lace.
+  // Lace, not paint: a fractal mask cut by the field's strength, thin bubble lines.
+  const foamLace = mx_fractal_noise_float(p.mul(14.0).add(vec3(u.time.mul(0.15), 0.0, 0.0)), 3, 2.2, 0.55);
+  const foamOnSand = smoothstep(0.45, 0.75, field.r.mul(0.9).add(foamLace.mul(0.55))).mul(wet).mul(smoothstep(-0.02, 0.01, aboveWater));
   const submerged = smoothstep(0.02, -0.06, aboveWater);
 
   const dry = color(0.86, 0.71, 0.48);
@@ -81,7 +86,8 @@ export function createSandMaterial(u: SandMaterialUniforms): THREE.MeshStandardN
   // Shell fragments and dark grains, sparse.
   const speck = step(0.78, mx_noise_float(p.mul(60.0).add(vec3(0.0, 13.0, 0.0))));
   const albedoBase = mix(dry, wetTint, wet).mul(float(1.0).add(dark));
-  const albedo = mix(albedoBase, albedoBase.mul(0.55), speck.mul(0.6));
+  const albedoSand = mix(albedoBase, albedoBase.mul(0.55), speck.mul(0.6));
+  const albedo = mix(albedoSand, color(0.93, 0.95, 0.96), foamOnSand.mul(0.7));
   // Below the water line the sun arrives through the water: the floor is lit by what
   // the medium let through, same absorption the tracer and the water surface use.
   const sunPath = u.waterLevel.sub(p.y).max(0.0).div(vec3(u.sunDir).y.max(0.08));

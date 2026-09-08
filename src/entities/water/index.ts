@@ -48,6 +48,7 @@ import {
 import type { IslandField } from '../island/heightField.ts';
 import { WATER_ABSORB } from './medium.ts';
 import { SurfaceField } from './surfaceField.ts';
+import { Spray } from './spray.ts';
 import { ShallowWater } from './shallowWater.ts';
 import { WaterInspector } from './waterInspector.ts';
 import { WindWaves } from './windWaves.ts';
@@ -112,8 +113,8 @@ export interface Water {
  * the answer itself — scene colour under a per-channel Beer–Lambert transmittance along
  * the real underwater path, in-scattered light, caustics projected onto the floor, sky by
  * Fresnel, the sun's own GGX highlight and shadow from the standard light loop, and foam
- * where the water is shallow against anything (sand, a boulder) or where a Gerstner wave
- * folds (Jacobian < 0). Waves displace the surface mesh and shoal over the shallows.
+ * from a persistent field fed by the solver's breaking and run-up sources. The solver's
+ * surface plus the wind spectrum displace the mesh (see surfaceField.ts).
  *
  * Only the pipeline's overlay pass draws it (`Layer.Overlay`); the GI never sees it.
  */
@@ -156,14 +157,6 @@ export function createWater(options: WaterOptions): Water {
   const wind = new WindWaves({ windSpeed: 4.5, fetch: 800, components: 48, gain: 1.0 });
   const windCap = Math.min(0.12, wind.amplitudeSum);
 
-  // The deepest water the floor allows, for the CFL sub-step; the slab bottom is not it.
-  let maxDepth = 0.2;
-  for (let j = 0; j < 64; j++) for (let i = 0; i < 64; i++) {
-    const x = -half + ((i + 0.5) / 64) * 2 * half;
-    const z = -half + ((j + 0.5) / 64) * 2 * half;
-    maxDepth = Math.max(maxDepth, field.waterLevel - field.height(x, z));
-  }
-  maxDepth += 0.15;
   sim.preroll(6.0);
 
   /** Sand height (with boulders stamped in) under (x, z); +z is row-down in the texture. */
@@ -190,7 +183,8 @@ export function createWater(options: WaterOptions): Water {
         const h = float(0.5 / sim.size);
         // Run-up ceiling: about one wave height over still water on a beach (Hunt),
         // but against a steep flank the water cannot climb — it breaks into spray
-        // (see ShallowWater.impactAt) — so there the sheet stays within 3 cm of the line.
+        // (the foam field's impact channel feeds the spray) — so there the sheet stays
+        // within 3 cm of the line.
         const bTex = (o: ReturnType<typeof vec2>) => (texture(heightTexture, q.add(o)).level(float(0.0)) as ReturnType<typeof vec4>).r;
         const t2 = float(2.0 / sim.size);
         const grad = vec2(bTex(vec2(t2, 0.0)).sub(bTex(vec2(t2.negate(), 0.0))), bTex(vec2(0.0, t2)).sub(bTex(vec2(0.0, t2.negate())))).div(float(sim.cell * 4));
@@ -225,7 +219,9 @@ export function createWater(options: WaterOptions): Water {
     const w2 = mx_worley_noise_vec2(q2, 1.0);
     const line1 = smoothstep(0.10, 0.0, w1.y.sub(w1.x));
     const line2 = smoothstep(0.10, 0.0, w2.y.sub(w2.x));
-    const filaments = line1.mul(0.6).add(line2.mul(0.6)).add(line1.mul(line2).mul(1.8));
+    // Filaments as a modulation around the mean (≈ ±60 %), so a bright rock under the
+    // water is never whitened ×4 and the average light on the floor is unchanged.
+    const filaments = line1.mul(0.6).add(line2.mul(0.6)).add(line1.mul(line2).mul(1.8)).sub(0.45).mul(0.55);
     // Fade in just below the surface, decay with depth as the light spreads.
     const fade = smoothstep(0.0, 0.05, depth).mul(exp(depth.mul(-1.5)));
     return filaments.mul(fade);
@@ -283,12 +279,35 @@ export function createWater(options: WaterOptions): Water {
     const foam = max(decayed, crest.mul(0.85));
     // Wetness: where water stands now, or stood in the last half minute. The sand
     // shader reads it; sand the swash has reached stays dark and glossy as it dries.
-    const standing = smoothstep(0.0005, 0.006, sim.stateNode.sample(q).r);
-    const wetPrev = foamPrev.sample(q).g;
+    // Saturation of the sand: a 2 cm tongue soaks it, a 1 mm film barely does — the
+    // run-up limit is where the tongue is thinnest, so the wet edge is a gradient, not
+    // a line. Capillary spread (a small blur) and drainage (28 s) follow.
+    const standing = smoothstep(0.0005, 0.02, sim.stateNode.sample(q).r);
+    const wt = float(0.6 / FOAM_SIZE);
+    const wetPrev = foamPrev.sample(q).g.mul(0.4)
+      .add(foamPrev.sample(q.add(vec2(wt, 0.0))).g.mul(0.15))
+      .add(foamPrev.sample(q.sub(vec2(wt, 0.0))).g.mul(0.15))
+      .add(foamPrev.sample(q.add(vec2(0.0, wt))).g.mul(0.15))
+      .add(foamPrev.sample(q.sub(vec2(0.0, wt))).g.mul(0.15));
     const wetness = max(standing, wetPrev.mul(exp(foamDt.negate().div(28.0))));
-    return vec4(foam, wetness, 0.0, 1.0);
+    // Impact: flow driven into a steep rise of the bed (a boulder's face) faster than
+    // it can climb — u·∇b is the vertical speed it would need. That energy leaves as
+    // spray; the spray emitter reads this channel (see spray.ts).
+    const state = sim.stateNode.sample(q);
+    const tb = float(1.0 / 512);
+    const bL = texture(heightTexture, q.sub(vec2(tb, 0.0))).r;
+    const bR = texture(heightTexture, q.add(vec2(tb, 0.0))).r;
+    const bB = texture(heightTexture, q.sub(vec2(0.0, tb))).r;
+    const bF = texture(heightTexture, q.add(vec2(0.0, tb))).r;
+    const gradB = vec2(bR.sub(bL), bF.sub(bB)).div(float(2 * (2 * half) / 512));
+    const climb = state.g.mul(gradB.x).add(state.b.mul(gradB.y));
+    const steep = smoothstep(0.6, 1.4, gradB.length());
+    const impact = smoothstep(0.3, 1.2, climb).mul(steep).mul(smoothstep(0.01, 0.05, state.r));
+    return vec4(foam, wetness, impact, 1.0);
   })();
   const foamQuad = new THREE.QuadMesh(foamSim);
+  /** Droplets where the water hits the boulders (spray.ts). */
+  const spray = new Spray({ renderer, half, waterLevel: field.waterLevel, foamField, simState: sim.stateNode, surface: surface.node, sunDir: uniforms.sunDir, sunColor: uniforms.sunColor, test: Number(params.get('sprayTest') ?? 0) });
 
   const stepFoam = (dt: number) => {
     foamDt.value = Math.min(0.05, Math.max(0.001, dt));
@@ -513,6 +532,7 @@ export function createWater(options: WaterOptions): Water {
       debugMode === 'depth' ? vec3(verticalDepth.mul(0.5))
       : debugMode === 'path' ? vec3(pathLength.mul(0.3))
       : debugMode === 'foam' ? vec3(foamMask)
+      : debugMode === 'impact' ? vec3(foamField.sample(p.xz.div(slabHalf.mul(2.0)).add(0.5)).b, simState.a, 0.0)
       : debugMode === 'sim' ? vec3(p.y.sub(waterLevel).mul(8.0).add(0.5), simState.gb.abs().mul(0.5))
       : null;
     const sceneHere = texture(screen.color, screenUV).rgb;
@@ -527,6 +547,7 @@ export function createWater(options: WaterOptions): Water {
   // --- geometry ------------------------------------------------------------------
   const group = new THREE.Group();
   group.name = 'water';
+  group.add(spray.mesh);
 
   const top = new THREE.PlaneGeometry(2 * half, 2 * half, 512, 512);
   top.rotateX(-Math.PI / 2);
@@ -584,6 +605,7 @@ export function createWater(options: WaterOptions): Water {
   placeholderColor.needsUpdate = true;
   let materials: THREE.MeshStandardNodeMaterial[] = [];
   const bindScreen = (color: THREE.Texture, depth: THREE.Texture, normal: THREE.Texture) => {
+    spray.bindDepth(depth);
     const previous = materials;
     const surface = buildMaterial({ color, depth, normal }, true);
     const cut = buildMaterial({ color, depth, normal }, false);
@@ -602,6 +624,7 @@ export function createWater(options: WaterOptions): Water {
   (window as unknown as Record<string, unknown>).__water = {
     simStats: async () => sim.readStats(),
     simProbe: async () => sim.readProbe(),
+    sprayStats: async () => spray.readStats(),
     /** The GUI knobs, for scripts: set fields, then `apply()`. */
     controls: () => water.controls,
     foamDebug: () => ({ isRenderTarget: (foamRead as unknown as { isRenderTarget?: boolean }).isRenderTarget, textures: foamRead.textures?.length, width: foamRead.width }),
@@ -656,6 +679,7 @@ export function createWater(options: WaterOptions): Water {
       surface.update();
       inspector?.update(performance.now());
       stepFoam(dt);
+      spray.update(dt);
       sunDirection.copy(sun.position).sub(sun.target.position).normalize();
       (uniforms.sunDir.value as THREE.Vector3).copy(sunDirection);
       (uniforms.sunColor.value as THREE.Color).copy(sun.color).multiplyScalar(Math.min(1.5, sun.intensity * 0.5));
