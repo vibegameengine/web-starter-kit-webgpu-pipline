@@ -308,8 +308,13 @@ export function createWater(options: WaterOptions): Water {
     // Bubble lifetime by the water under them: a whitecap's e-folding (Monahan,
     // 3.85 s) on a body of water; on the millimetre sheet of the swash the film
     // drains and they burst in about 1.5 s; the same on the sand they were left on.
+    // Foam is on the water. Where the solver says dry the sheet has gone and the
+    // bubbles with it — a residue lasts a fraction of a second, no more — so the band
+    // stays at the water's edge as the tongue runs up and draws back.
     const depthHere = sim.stateNode.sample(q).r;
-    const tau = mix(float(1.5), foamDecaySeconds, smoothstep(0.01, 0.08, depthHere));
+    const onWater = smoothstep(0.0008, 0.004, depthHere);
+    const tauWet = mix(float(1.5), foamDecaySeconds, smoothstep(0.01, 0.08, depthHere));
+    const tau = mix(float(0.3), tauWet, onWater);
     const decayed = spread.mul(exp(foamDt.negate().div(tau)));
 
     // Only the solver's sources: breaking, the run-up front, impact spray. The
@@ -365,6 +370,7 @@ export function createWater(options: WaterOptions): Water {
     foamRead = foamWrite;
     foamWrite = swap;
     foamField.value = foamRead.texture;
+    sim.setSaturation(foamRead.texture);
     water.onField?.(foamRead.texture);
   };
 
@@ -384,7 +390,11 @@ export function createWater(options: WaterOptions): Water {
     const t = time;
 
     if (top) {
-      material.positionNode = vec3(positionLocal.x, waterLevel.add(fieldAt(positionLocal.xz).x), positionLocal.z);
+      // The sheet rides 4 mm high: the sand *mesh* is piecewise linear at 6 cm and
+      // strays a few millimetres from the analytic bed the solver runs on, and a
+      // millimetre tongue drawn exactly on that bed vanished under the mesh — the
+      // visible water ended a metre short of where the solver had it.
+      material.positionNode = vec3(positionLocal.x, waterLevel.add(fieldAt(positionLocal.xz).x).add(0.004), positionLocal.z);
     }
 
     // --- normal ------------------------------------------------------------------
@@ -583,8 +593,8 @@ export function createWater(options: WaterOptions): Water {
     const gateOn = params.get('waterFilm') !== '0';
     // The film depth from the field's smooth reconstruction, not the raw cells.
     const filmDepth = fieldAt(p.xz).w;
-    const thinFilm = !gateOn ? float(0.0).greaterThan(1.0) : top ? filmDepth.lessThan(needed).or(sheetAboveFloor.lessThan(0.001)) : cutDry;
-    const filmFade = top ? smoothstep(needed, needed.add(0.008), filmDepth).mul(smoothstep(0.001, 0.01, sheetAboveFloor)) : float(1.0);
+    const thinFilm = !gateOn ? float(0.0).greaterThan(1.0) : top ? filmDepth.lessThan(needed).or(sheetAboveFloor.lessThan(0.0005)) : cutDry;
+    const filmFade = top ? smoothstep(needed, needed.add(0.008), filmDepth).mul(smoothstep(0.0005, 0.006, sheetAboveFloor)) : float(1.0);
     const debug: THREE.Node | null =
       debugMode === 'depth' ? vec3(verticalDepth.mul(0.5))
       : debugMode === 'path' ? vec3(pathLength.mul(0.3))
@@ -757,12 +767,17 @@ export function createWater(options: WaterOptions): Water {
     update(elapsedSeconds) {
       const dt = previousTime < 0 ? 1 / 60 : elapsedSeconds - previousTime;
       previousTime = elapsedSeconds;
+      const simBefore = sim.simTime;
       sim.step(Math.min(0.05, Math.max(0.001, dt)));
+      // Everything downstream of the solver runs on the solver's clock: when the
+      // solver falls behind wall time (a heavy frame) the foam must not decay and the
+      // droplets must not fall in wall time, or they come apart from the water.
+      const simDelta = Math.max(0.0005, sim.simTime - simBefore);
       wind.clock.value = sim.simTime;
       surface.update();
       inspector?.update(performance.now());
-      stepFoam(dt);
-      spray.update(dt);
+      stepFoam(simDelta);
+      spray.update(simDelta);
       sunDirection.copy(sun.position).sub(sun.target.position).normalize();
       (uniforms.sunDir.value as THREE.Vector3).copy(sunDirection);
       (uniforms.sunColor.value as THREE.Color).copy(sun.color).multiplyScalar(Math.min(1.5, sun.intensity * 0.5));

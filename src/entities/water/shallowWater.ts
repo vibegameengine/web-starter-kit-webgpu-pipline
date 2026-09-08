@@ -82,6 +82,10 @@ export class ShallowWater {
   readonly swellDir: ReturnType<typeof uniform>;
   /** Manning's n of the bed (sand ≈ 0.025). */
   readonly manning = uniform(0.025);
+  /** Hydraulic conductivity of the sand, m/s (fine 1e-4 … coarse 1e-3): the swash sinks into dry sand. */
+  readonly conductivity = uniform(5e-4);
+  /** Saturation of the sand (0..1) over the slab, R/G/B/A = ·, saturation, ·, · — the foam field's G. */
+  private readonly saturation: ReturnType<typeof texture>;
 
   private readonly renderer: THREE.WebGPURenderer;
   private readonly half: number;
@@ -103,7 +107,7 @@ export class ShallowWater {
   constructor(options: ShallowWaterOptions) {
     const {
       renderer, bathymetry, half, waterLevel, size = 384,
-      swellAmplitude = 0.12, swellPeriod = 3.2, swellDirection = Math.atan2(-1, 1),
+      swellAmplitude = 0.06, swellPeriod = 3.2, swellDirection = Math.atan2(-1, 1),
       faceDepth = { x: 1.2, z: 1.2 },
     } = options;
     this.renderer = renderer;
@@ -134,6 +138,9 @@ export class ShallowWater {
     this.prevNode = texture(this.stateA.texture);
     this.baseNode = texture(this.stateA.texture);
     this.stateNode = texture(this.view.texture);
+    const dry = new THREE.DataTexture(new Uint8Array([0, 0, 0, 255]), 1, 1);
+    dry.needsUpdate = true;
+    this.saturation = texture(dry);
 
     const level = uniform(waterLevel);
     const slabHalf = uniform(half);
@@ -261,8 +268,15 @@ export class ShallowWater {
       const rate = Hp.sub(Hm).add(Gp.sub(Gm)).div(dx).negate().add(source);
       const P = asV3(U0.add(rate.mul(dt))).toVar();
 
+      // Infiltration (Darcy): on sand above the water line that is not yet saturated
+      // the sheet loses K·(1 − s) per second into the bed — the tip of the run-up
+      // tongue sinks into dry sand, which is what stops it short of the frictionless
+      // Shen–Meyer distance on a real beach.
+      const sat = this.saturation.sample(q).g;
+      const onBeach = smoothstep(-0.03, 0.01, bedCell);
+      const sink = this.conductivity.mul(float(1.0).sub(sat)).mul(onBeach).mul(dt);
       // Positivity guard, dry cells, Manning friction (semi-implicit), a speed cap.
-      const hNew = max(P.x.sub(bedCell), 0.0);
+      const hNew = max(P.x.sub(bedCell).sub(sink), 0.0);
       P.x.assign(bedCell.add(hNew));
       const uNew = desingularise(P.y, hNew);
       const vNew = desingularise(P.z, hNew);
@@ -404,6 +418,11 @@ export class ShallowWater {
       return vec4(depth, clamp(u, -6.0, 6.0).mul(wet), clamp(v, -6.0, 6.0).mul(wet), foam);
     })();
     this.viewQuad = new THREE.QuadMesh(viewMaterial);
+  }
+
+  /** The sand's saturation field (the foam field: G = saturation), read by the infiltration sink. */
+  setSaturation(field: THREE.Texture): void {
+    this.saturation.value = field;
   }
 
   /** Points the incoming swell: radians in the xz plane, 0 = toward +x, π/2 = toward +z. */
