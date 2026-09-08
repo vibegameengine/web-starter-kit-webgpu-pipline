@@ -39,9 +39,21 @@ await page.evaluate(() => new Promise((resolve) => {
   requestAnimationFrame(f);
 }));
 console.log('frames steady', new Date().toISOString().slice(11,19));
+// Another session editing files makes Vite reload the page mid-measurement; that is
+// a lost run, not a result. Retry twice before giving up.
 const size = await page.evaluate(() => { const c = document.querySelector('canvas'); return [c.width, c.height]; });
 const info = await page.evaluate(() => { const i = window.__audit?.memory?.(); return i; });
-const r = await page.evaluate((n) => window.__gpuPasses(n), frames);
+let r = null;
+for (let attempt = 0; attempt < 3 && !r; attempt++) {
+  try { r = await page.evaluate((n) => window.__gpuPasses(n), frames); }
+  catch (error) {
+    if (!String(error).includes('Execution context was destroyed')) throw error;
+    console.log(`reloaded mid-measurement, retrying (${attempt + 1}/3)`);
+    await page.waitForFunction(() => window.__gpuPasses && document.querySelector('#loading-overlay')?.hidden, null, { timeout: 120000 });
+    await page.evaluate(() => new Promise((resolve) => { let last = performance.now(), run = 0; const f = () => { const t = performance.now(); run = t - last < 500 ? run + 1 : 0; last = t; if (run >= 30) resolve(); else requestAnimationFrame(f); }; requestAnimationFrame(f); }));
+  }
+}
+if (!r) { console.error('perf-passes: the page kept reloading'); process.exit(2); }
 console.log(`${url}\ndrawing buffer ${size[0]}x${size[1]}, ${r.framesUsed} frames: frame ${r.frameMs.toFixed(2)} ms (${(1000 / r.frameMs).toFixed(0)} fps), GPU sum ${r.gpuMs.toFixed(2)} ms`);
 if (info) console.log('memory', JSON.stringify(info));
 console.log('  gpu ms   cpu ms  x/frame  pass');

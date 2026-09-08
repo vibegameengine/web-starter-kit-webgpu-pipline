@@ -78,6 +78,19 @@ export interface SceneHost {
    * turns it off); idle in `lightmap` mode, which has no BVH.
    */
   contact?: Partial<ContactOcclusionSettings>;
+  /**
+   * Lighting mode this scene wants. `surfel` is the cached radiance cache alone;
+   * `hybrid` adds the virtual lightmap over it. `?mode=` overrides. Absent = hybrid.
+   */
+  lighting?: 'surfel' | 'lightmap' | 'hybrid';
+  /**
+   * The scene has no movable GI receiver: once the cache is warmed or restored the
+   * whole surfel lifecycle can stop — no spawning, ageing, allocation or ray
+   * integration, only the camera-centred grid and the per-pixel resolve. `?freezeAll=`
+   * overrides. Measured on the beach at 4K, 2026-09-08: 31.1 ms of frame with the
+   * lifecycle live, 23.8 ms frozen.
+   */
+  staticLighting?: boolean;
   /** Traced reflections preset. On by default (`?reflections=0` turns it off). */
   reflections?: Partial<ReflectionSettings>;
   /** Motion blur preset. Off by default (`?motionBlur=1` turns it on, `?gaze=centre|camera`, `?shutter=`, `?integration=` ms). */
@@ -226,7 +239,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   const lightmapRays = num('rays') ?? 32;
   // Default: frozen static atlas plus live GI for unbaked receivers.
   const requestedLightingMode = params.get('mode');
-  gi.freezeCompletely = params.get('freezeAll') === '1';
+  gi.freezeCompletely = params.get('freezeAll') === null ? host.staticLighting === true : params.get('freezeAll') === '1';
 
   // Unconditionally, and before the BVH. Unconditionally because the mode is a
   // runtime switch and the unwrap cannot be redone later: it must be in the geometry
@@ -399,7 +412,8 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
    * why this is async and shows the loading overlay rather than flipping instantly.
    */
   type LightingMode = 'surfel' | 'lightmap' | 'hybrid';
-  let lightingMode: LightingMode = requestedLightingMode === 'lightmap' || requestedLightingMode === 'surfel' ? requestedLightingMode : 'hybrid';
+  let lightingMode: LightingMode = requestedLightingMode === 'lightmap' || requestedLightingMode === 'surfel' || requestedLightingMode === 'hybrid'
+    ? requestedLightingMode : host.lighting ?? 'hybrid';
   const bakedHitTransport = params.get('bakedHits') !== '0';
   gi.bakedFeedbackEnabled = params.get('giPageFeedback') !== '0';
   let cameraPageDemandEnabled = true;
@@ -577,7 +591,8 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
           gi.resetCache(renderer);
           gi.restoreStaticBake(renderer, saved.surfels);
           bakeCache.source = 'saved'; bakeCache.storage = bakeStorageKind() === 'fs' ? 'file' : 'bundle'; bakeCache.saved = true;
-          console.log(`[surfel-cache] restored ${saved.surfels.count} surfels; no warming`);
+          gi.setFrozen(gi.freezeCompletely);
+          console.log(`[surfel-cache] restored ${saved.surfels.count} surfels; no warming` + (gi.frozen ? ', lifecycle frozen' : ''));
           return;
         }
       } catch (error) {
