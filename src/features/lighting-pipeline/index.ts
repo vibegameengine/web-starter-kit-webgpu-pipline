@@ -20,12 +20,7 @@ import { meanEnvironmentRadiance } from '../../shared/render/atmosphere/volumetr
 import { AutoExposure } from '../../shared/render/exposure.ts';
 import { DEFAULT_MOTION_BLUR, MotionBlur, type MotionBlurGaze, type MotionBlurSettings } from '../../shared/render/motionBlur.ts';
 import { readFloatTexture, readValidationTexture } from '../../shared/render/gpuReadback.ts';
-import { createLightmapPages, type LightmapPageSource } from '../../shared/render/virtualTexture/lightmapPages.ts';
-import { VirtualLightmap } from '../../shared/render/virtualTexture/virtualLightmap.ts';
-import { createLightmapDemand } from '../../shared/render/virtualTexture/lightmapDemand.ts';
 import { bakeKey, bakeStorageKind, loadBake, saveBake, surfelKey } from '../../shared/gi/bake/persistedBake.ts';
-import { loadStreamedBake } from '../../shared/gi/bake/streamedBake.ts';
-import { U_BAKED_LOD_OVERRIDE } from '../../shared/gi/bake/bakedHitLod.ts';
 import { padLightmapCharts } from '../../shared/gi/bake/chartPadding.ts';
 import {
   createLightControls,
@@ -292,10 +287,6 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   let lightmapTexture: THREE.Texture | null = null;
   let lightmapGBuffer: ReturnType<typeof rasteriseLightmapGBuffer> | null = null;
   let lightmapCoverage = 0;
-  let virtualLightmap: VirtualLightmap | null = null;
-  let lightmapDemand: ReturnType<typeof createLightmapDemand> | null = null;
-  let nextPageDemandAt = 0;
-  let pausePageStreaming = false;
   let bakedSunVersion = -1;
   let baked = false;
   const bakeCache = { source: 'none', storage: 'none', key: '', saved: false, error: '' };
@@ -414,9 +405,6 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   type LightingMode = 'surfel' | 'lightmap' | 'hybrid';
   let lightingMode: LightingMode = requestedLightingMode === 'lightmap' || requestedLightingMode === 'surfel' || requestedLightingMode === 'hybrid'
     ? requestedLightingMode : host.lighting ?? 'hybrid';
-  const bakedHitTransport = params.get('bakedHits') !== '0';
-  gi.bakedFeedbackEnabled = params.get('giPageFeedback') !== '0';
-  let cameraPageDemandEnabled = true;
 
   async function prepareLightmap(iterations: number, forceBake = false): Promise<void> {
     const persistent = lightingMode === 'hybrid' && params.get('bakeCache') !== '0';
@@ -427,20 +415,6 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
       try {
         key = await bakeKey(params.get('scene') ?? 'default');
         bakeCache.key = key;
-        // Inside cef-fsapp the bake is a file on disk: the bundle path reads it
-        // whole and the streamed (HTTP page) path is not consulted.
-        if (!forceBake && params.get('vt') !== '0' && bakeStorageKind() === 'http') {
-          const usePagesForGi = bakedHitTransport && lightingMode === 'hybrid';
-          const streamed = await loadStreamedBake(key, !usePagesForGi);
-          if (streamed) {
-            if (streamed.surfels) gi.restoreStaticBake(renderer, streamed.surfels);
-            publishPages(streamed.pages);
-            if (usePagesForGi) gi.useBakedLightmap(renderer, virtualLightmap!);
-            bakeCache.source = 'saved'; bakeCache.storage = 'streamed'; bakeCache.saved = true;
-            console.log(`[bake-cache] restored ${key}; lightmap pages load on demand`);
-            return;
-          }
-        }
         const saved = forceBake ? null : await loadBake(key);
         if (saved) {
           setLoading('Restoring saved static lighting');
@@ -449,7 +423,6 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
           texture.magFilter = texture.minFilter = THREE.LinearFilter; texture.needsUpdate = true;
           renderer.initTexture(texture);
           await publishLightmap(texture, saved.pixels);
-          if (bakedHitTransport && virtualLightmap) gi.useBakedLightmap(renderer, virtualLightmap);
           bakeCache.source = 'saved'; bakeCache.storage = 'bundle'; bakeCache.saved = true;
           console.log(`[bake-cache] restored ${key}`);
           return;
@@ -538,35 +511,21 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
         console.warn(`[bake-cache] bake is usable but could not be saved: ${error}`);
       }
     }
-    // Persistence captures authoring data before its GPU pool is released.
-    if (bakedHitTransport && virtualLightmap) gi.useBakedLightmap(renderer, virtualLightmap);
   }
 
-  async function publishLightmap(texture: THREE.Texture, pixels: Float32Array): Promise<void> {
-    if (params.get('vt') !== '0' && lightingMode === 'hybrid') {
-      setLoading('Preparing virtual lightmap pages');
-      const pageSize = Math.min(128, lightmapSize / 2);
-      publishPages(createLightmapPages(pixels, lightmapSize, pageSize, pageSize));
-    } else {
-      const previousVirtual = virtualLightmap;
-      virtualLightmap = null; lightmapDemand = null;
-      lightmapTexture = texture;
-      applyLightmap(scene, lightmapTexture, lightmapIntensity);
-      frameGraph.setLightmapTexture(lightmapTexture);
-      previousVirtual?.dispose();
-    }
-  }
-
-  function publishPages(pages: LightmapPageSource): void {
-    const previousVirtual = virtualLightmap;
-    virtualLightmap = previousVirtual?.replaceSource(pages)
-      ? previousVirtual : new VirtualLightmap(renderer, pages, num('vtSlots') ?? 8);
-    lightmapDemand = createLightmapDemand(scene, pages);
-    applyLightmap(scene, virtualLightmap.fallback, lightmapIntensity, virtualLightmap);
-    lightmapTexture = virtualLightmap.fallback;
-    nextPageDemandAt = 0;
+  /**
+   * Publishes the baked atlas as one resident texture.
+   *
+   * It used to have a second path that cut the atlas into 128-pixel pages and
+   * streamed them over HTTP, with a CPU pass over every static triangle each frame
+   * to decide which pages to fetch. That is for an atlas too large to hold; this one
+   * is 512 square and resident in full. Removed 2026-09-08; the machinery is in
+   * commit 34de65e if a scene ever needs it.
+   */
+  async function publishLightmap(texture: THREE.Texture, _pixels: Float32Array): Promise<void> {
+    lightmapTexture = texture;
+    applyLightmap(scene, lightmapTexture, lightmapIntensity);
     frameGraph.setLightmapTexture(lightmapTexture);
-    if (previousVirtual !== virtualLightmap) previousVirtual?.dispose();
   }
 
   /**
@@ -1261,17 +1220,6 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
       if (!auditPaused || !lightmapTexture) throw new Error('Pause a baked scene before lightmap readback');
       return readValidationTexture(renderer, lightmapTexture);
     },
-    pages: () => virtualLightmap?.stats() ?? null,
-    lightmapAnisotropy(value: number) {
-      if (virtualLightmap && Number.isFinite(value)) virtualLightmap.anisotropy.value = Math.max(1, Math.min(8, value));
-      nextPageDemandAt = 0;
-    },
-    cameraPageDemand(value: boolean) { cameraPageDemandEnabled = value; nextPageDemandAt = 0; },
-    giPageFeedback(value: boolean) { gi.bakedFeedbackEnabled = value; nextPageDemandAt = 0; },
-    bakedLod(value: number) { U_BAKED_LOD_OVERRIDE.value = Number.isFinite(value) ? value : -1; },
-    pageDetail(value: boolean) { if (virtualLightmap) virtualLightmap.enabled.value = value ? 1 : 0; },
-    pageStreaming(value: boolean) { pausePageStreaming = !value; },
-    clearPages() { virtualLightmap?.clear(); },
     realtimeContribution(value: number) { frameGraph.indirectIntensity.value = value; },
     shadowContribution(value: number) { sun.shadow.intensity = Math.max(0, Math.min(1, value)); },
     sun(azimuthDeg: number, elevationDeg: number, intensity?: number) {
@@ -1318,15 +1266,6 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
     // two frames of one session without motion between them.
     if (!still) host.update?.(now * 0.001);
     fog.update(now);
-    if (!switching && lightingMode === 'hybrid' && virtualLightmap && lightmapDemand) {
-      if (now >= nextPageDemandAt) {
-        virtualLightmap.setDemand(cameraPageDemandEnabled
-          ? lightmapDemand(camera, renderer.domElement.width, renderer.domElement.height, virtualLightmap.anisotropy.value) : [], gi.getBakedPageDemand(now));
-        nextPageDemandAt = now + 150;
-      }
-      if (!pausePageStreaming) virtualLightmap.update(now);
-    }
-
     // Hybrid retains the atlas for static receivers and runs the existing surfel
     // chain for unbaked receivers. Skip during an asynchronous pool rebuild.
     if (!switching && lightingMode !== 'lightmap') {

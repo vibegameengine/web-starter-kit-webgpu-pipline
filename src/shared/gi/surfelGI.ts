@@ -10,6 +10,8 @@ import {
 } from './bake/geometrySurfels.ts';
 import { createSurfelHoleFill } from './bake/holeFill.ts';
 import type { LightmapGBuffer } from './bake/lightmapGBuffer.ts';
+import { captureFrozenSurfels, restoreFrozenSurfels } from './bake/frozenSurfels.ts';
+import type { FrozenSurfelData } from './bake/persistedBake.ts';
 
 import {
   CASCADES,
@@ -20,9 +22,11 @@ import {
   SURFEL_POOL_BASE,
   SURFEL_POOL_GROW_AT,
   SURFEL_TTL,
+  SURFEL_KILL_SIGNAL,
   TOTAL_CELLS,
 } from './surfel/constants.ts';
 import { BYTES_PER_SURFEL } from './surfel/surfelPool.ts';
+import { createIntegrationSchedule } from './surfel/integrationSchedule';
 import { giKnobs } from './surfel/knobs.ts';
 
 /**
@@ -62,8 +66,9 @@ const HOLE_FILL_TO = 0.8;
  */
 const BAKE_WALL_CLOCK_CAP_MS = 120000;
 import { createGBuffer } from './surfel/gbuffer.ts';
-import { createSceneBVH, type SceneBVHBundle } from './surfel/sceneBvh.ts';
+import { createSceneBVH, refreshSceneMaterials, type SceneBVHBundle } from './surfel/sceneBvh.ts';
 import { createDynamicBVH, type DynamicBVHBundle } from './surfel/dynamicBvh.ts';
+import { createSurfelMotion } from './surfel/surfelMotion';
 import { createSurfelPool } from './surfel/surfelPool.ts';
 import { createSurfelPreparePass } from './surfel/surfelPreparePass.ts';
 import { createSurfelAgePass } from './surfel/surfelAgePass.ts';
@@ -107,7 +112,7 @@ export interface SurfelGiAssets {
  */
 export class SurfelGI {
   private readonly gbuffer: ReturnType<typeof createGBuffer>;
-  private readonly pool: ReturnType<typeof createSurfelPool>;
+  private pool: ReturnType<typeof createSurfelPool>;
   private prepare = createSurfelPreparePass();
   private age = createSurfelAgePass();
   private findMissing = createSurfelFindMissingPass();
@@ -120,12 +125,17 @@ export class SurfelGI {
   private integrate: ReturnType<typeof createSurfelIntegratePass> | null = null;
   private bvh: SceneBVHBundle | null = null;
   private dynamicBvh: DynamicBVHBundle | null = null;
+  private motion: ReturnType<typeof createSurfelMotion> | null = null;
+  rigidSurfels = true;
 
   private readonly prevCameraPos = new THREE.Vector3();
   private lastOutput: THREE.Texture | null = null;
   private _frozen = false;
   /** Ray count restored after a bake finishes. */
   private runtimeSampleCount = 4;
+  private integrationSchedule = createIntegrationSchedule();
+  runtimeRayBudget = 4096;
+  private lightingControls = { envIntensity: 1, envLod: 4, fromDirect: 1, fromIndirect: 1, albedoBoost: 1 };
   private immortaliser = createSurfelImmortaliser();
   private cacheAtlas: ReturnType<typeof createCacheAtlas> | null = null;
   private lightmapSurfels: ReturnType<typeof createLightmapSurfels> | null = null;
@@ -134,6 +144,10 @@ export class SurfelGI {
   private growthCheckPending = false;
   private growthCheckedAtFrame = 0;
   private poolSaturationReported = false;
+  private releasedBakePoolBytes = 0;
+  private dynamicMembershipChanged = false;
+  private dynamicRevision = 0;
+  bakedFeedbackEnabled = true;
 
   /** Set for the duration of a counted bake; see `maybeGrowPool` and `bake`. */
   private bakeFreezesPool = false;
@@ -147,8 +161,22 @@ export class SurfelGI {
    * change, and `giKnobs.dynamicSurfels` for the measurement.
    */
   private atlasPinned = false;
+  /** Receiver-aware live coverage; legacy is retained for the focused regression check. */
+  liveCoverage = true;
 
   readonly envTexture: THREE.DataTexture;
+  /** The 128x128 LDR blue-noise tile (nearest, repeat), shared with screen-space filters. */
+  get blueNoiseTexture(): THREE.Texture { return this.blueNoise; }
+  /** The static BVH bundle (null before `buildScene`), for passes that trace the same world. */
+  get staticBvh(): SceneBVHBundle | null { return this.bvh; }
+  /** The movers' BVH bundle, replaced on membership changes; read it every frame. */
+  get dynamicBvhBundle(): DynamicBVHBundle | null { return this.dynamicBvh; }
+  /** Depth of the GI's own G-buffer, rendered this frame by the scene camera. */
+  get gbufferDepthTexture(): THREE.Texture { return this.gbuffer.target.depthTexture!; }
+  /** (specularColor.rgb, roughness) of the GI G-buffer, for the reflection pass. */
+  get specularTexture(): THREE.Texture { return this.gbuffer.target.textures[2]; }
+  /** The static material array the GI shades hits with (null before `buildScene`). */
+  get diffuseArrayTexture(): THREE.Texture | null { return this.bvh?.diffuseArrayTex ?? null; }
 
   private constructor(
     renderer: THREE.WebGPURenderer,
@@ -167,19 +195,6 @@ export class SurfelGI {
     this.pool.ensureCapacity(base);
     this.resolve = createSurfelGIResolvePass(this.grid, this.pool);
   }
-
-  /** The 128x128 LDR blue-noise tile (nearest, repeat), shared with screen-space filters. */
-  get blueNoiseTexture(): THREE.Texture { return this.blueNoise; }
-  /** The static BVH bundle (null before `buildScene`), for passes that trace the same world. */
-  get staticBvh(): SceneBVHBundle | null { return this.bvh; }
-  /** The movers' BVH bundle, replaced on membership changes; read it every frame. */
-  get dynamicBvhBundle(): DynamicBVHBundle | null { return this.dynamicBvh; }
-  /** Depth of the GI's own G-buffer, rendered this frame by the scene camera. */
-  get gbufferDepthTexture(): THREE.Texture { return this.gbuffer.target.depthTexture!; }
-  /** (specularColor.rgb, roughness) of the GI G-buffer, for the reflection pass. */
-  get specularTexture(): THREE.Texture { return this.gbuffer.target.textures[2]; }
-  /** The static material array the GI shades hits with (null before `buildScene`). */
-  get diffuseArrayTexture(): THREE.Texture | null { return this.bvh?.diffuseArrayTex ?? null; }
 
   static async create(
     renderer: THREE.WebGPURenderer,
@@ -212,12 +227,14 @@ export class SurfelGI {
    * split exists to avoid.
    */
   buildScene(renderer: THREE.WebGPURenderer, scene: THREE.Scene): void {
+    this.gbuffer.prepareScene(scene);
     this.bvh = createSceneBVH(renderer, scene);
     // Built here rather than lazily: the buffers are bound into the integrator's
     // pipeline the first time it runs, and a structure that appears after that point
     // cannot be bound without recompiling the shader. It is created even when nothing
     // in the scene moves, so there is exactly one shader variant to reason about.
     this.dynamicBvh = createDynamicBVH(scene, this.bvh.materialIdByUUID);
+    this.motion = createSurfelMotion(scene);
     this.integrate = createSurfelIntegratePass(this.blueNoise, this.envTexture);
     this.integrate.setDynamicTracing(this.dynamicTracing);
     this.prepare.run(renderer, this.pool, { forceClear: true });
@@ -268,6 +285,7 @@ export class SurfelGI {
     );
 
     this.pool.ensureCapacity(target);
+    this.pool.releaseRetired(renderer);
     this.rebuildPoolBoundPasses();
     this.prepare.run(renderer, this.pool, { forceClear: true });
     return true;
@@ -302,6 +320,10 @@ export class SurfelGI {
       this.integrate = createSurfelIntegratePass(this.blueNoise, this.envTexture);
       this.integrate.setDynamicTracing(this.dynamicTracing);
       this.integrate.setBaseSampleCount(this.runtimeSampleCount);
+      const c = this.lightingControls;
+      this.integrate.setEnvControls(c.envIntensity, c.envLod);
+      this.integrate.setGiScales(c.fromDirect, c.fromIndirect);
+      this.integrate.setAlbedoBoost(c.albedoBoost);
     }
   }
 
@@ -367,6 +389,35 @@ export class SurfelGI {
     return this.dynamicBvh?.refresh(options) ?? false;
   }
 
+  /** Call once after a batch of dynamic additions/removals or geometry/material
+   * replacements. Does not bake, unwrap, rebuild static BVH or clear live history. */
+  syncDynamicScene(renderer: THREE.WebGPURenderer, scene: THREE.Scene, options: { materialsChanged?: boolean } = {}): void {
+    if (!this.bvh || !this.motion) throw new Error('Build the scene before synchronising movers');
+    if (this.bakeFreezesPool) throw new Error('Cannot change movers during an authoring bake');
+    this.gbuffer.prepareScene(scene);
+    let needsMaterials = options.materialsChanged === true;
+    const materialIds = new Set<string>();
+    scene.traverse(object => {
+      const mesh = object as THREE.Mesh;
+      if (!mesh.isMesh || !mesh.visible) return;
+      for (const material of Array.isArray(mesh.material) ? mesh.material : [mesh.material]) {
+        materialIds.add(material.uuid);
+        if (!this.bvh!.materialIdByUUID.has(material.uuid)) needsMaterials = true;
+      }
+    });
+    if (materialIds.size !== this.bvh.materialIdByUUID.size) needsMaterials = true;
+    this.integrate?.invalidate();
+    if (needsMaterials) refreshSceneMaterials(renderer, scene, this.bvh);
+    const nextBvh = createDynamicBVH(scene, this.bvh.materialIdByUUID);
+    const nextMotion = createSurfelMotion(scene, this.motion);
+    this.motion.remapTo(renderer, this.pool, nextMotion);
+    this.motion.dispose(renderer); this.dynamicBvh?.dispose(renderer);
+    this.motion = nextMotion; this.dynamicBvh = nextBvh;
+    this.dynamicMembershipChanged = true; this.dynamicRevision++;
+  }
+
+  get dynamicSceneRevision() { return this.dynamicRevision; }
+
   /**
    * The dynamic acceleration structure itself: bindings, world bounds and the enable
    * flag. Exposed so the dynamic GI pass can trace it without going back through the
@@ -419,6 +470,7 @@ export class SurfelGI {
       normal: bytesOf(this.bvh.normalNode),
       index: bytesOf(this.bvh.indexNode),
       color: bytesOf(this.bvh.colorNode),
+      lightmapUv: this.bvh.lightmapUvTexture.image.data?.byteLength ?? 0,
     };
     return {
       triangles: this.bvh.stats.triangles,
@@ -434,10 +486,12 @@ export class SurfelGI {
   }
 
   /** Slots the pool currently holds, and what one slot costs. */
-  get poolStats(): { capacity: number; bytesPerSurfel: number; generation: number } {
+  get poolStats(): { capacity: number; bytesPerSurfel: number; anchorBytes: number; totalGpuBytes: number; generation: number } {
     return {
       capacity: this.pool.getCapacity(),
       bytesPerSurfel: BYTES_PER_SURFEL,
+      anchorBytes: this.pool.getAnchorAttr().array.byteLength,
+      totalGpuBytes: this.pool.getCapacity() * BYTES_PER_SURFEL + this.pool.getAnchorAttr().array.byteLength + 28,
       generation: this.pool.getGeneration(),
     };
   }
@@ -456,7 +510,37 @@ export class SurfelGI {
     // The clear rewrites the free list and every age to the recycled sentinel, so the
     // pins go with it and the pool is one undivided region again.
     this.atlasPinned = false;
+    this.pool.setAnchorStart(renderer, this.pool.getCapacity());
     this.prepare.run(renderer, this.pool, { forceClear: true });
+  }
+
+  captureStaticBake(renderer: THREE.WebGPURenderer, count: number): Promise<FrozenSurfelData> {
+    return captureFrozenSurfels(renderer, this.pool, count);
+  }
+
+  /** Surfels the allocator has handed out — the size of the cache a warm produced. */
+  async readAllocatedCount(renderer: THREE.WebGPURenderer): Promise<number> {
+    const attr = this.pool.getPoolAllocAttr();
+    if (!attr) return 0;
+    return new Int32Array(await renderer.getArrayBufferAsync(attr))[0] ?? 0;
+  }
+
+  get bakeNoiseTexture(): THREE.Texture { return this.blueNoise; }
+
+  get bakedTransportStats() {
+    return { enabled: false, releasedBakePoolBytes: this.releasedBakePoolBytes,
+      livePool: this.poolStats, uvBytes: this.bvh?.lightmapUvTexture.image.data?.byteLength ?? 0 };
+  }
+
+  restoreStaticBake(renderer: THREE.WebGPURenderer, data: FrozenSurfelData): void {
+    if (data.capacity > MAX_SURFELS) throw new Error('Saved bake exceeds supported pool capacity');
+    this.ensurePoolCapacity(renderer, data.capacity);
+    this.resetCache(renderer);
+    restoreFrozenSurfels(this.pool, data);
+    if (this.rigidSurfels) this.pool.setAnchorStart(renderer, data.count);
+    this.atlasPinned = true;
+    this._frozen = false;
+    console.log(`[lightmap] restored ${data.count} pinned surfels; no integration`);
   }
 
   resize(renderer: THREE.WebGPURenderer): void {
@@ -471,6 +555,48 @@ export class SurfelGI {
   /** The G-Buffer albedo the composite multiplies indirect light by. */
   get albedoTexture(): THREE.Texture {
     return this.gbuffer.target.textures[1];
+  }
+
+  /** World normal RGB and baked/rigid receiver ownership in alpha. */
+  get receiverTexture(): THREE.Texture {
+    return this.gbuffer.target.textures[0];
+  }
+
+  /** On-demand lifecycle snapshot for diagnosing a missing receiver; no frame polling. */
+  async readCoverageDebug(renderer: THREE.WebGPURenderer) {
+    const fields = { spatial: this.pool.getSurfelAttr(), free: this.pool.getPoolAttr(),
+      allocated: this.pool.getPoolAllocAttr(), flags: this.findMissing.getTileAllocAttr(),
+      candidates: this.findMissing.getCandidatePackedAttr(), pixel: this.findMissing.getDebugAttr() };
+    const result: Record<string, number[]> = {};
+    for (const [name, attribute] of Object.entries(fields)) {
+      if (!attribute) continue;
+      const bytes = await renderer.getArrayBufferAsync(attribute);
+      result[name] = Array.from(name === 'spatial' || name === 'candidates' || name === 'pixel' ? new Float32Array(bytes) : new Int32Array(bytes));
+      if (name === 'spatial') result.ages = Array.from(new Int32Array(bytes)).filter((_, i) => i % 8 === 7);
+    }
+    return { frame: renderer.info.frame, inputs: this.findMissing.inputs(), shader: this.findMissing.getShader(renderer), ...result };
+  }
+
+  setCoverageDebugPixel(x: number, y: number) { this.findMissing.setDebugPixel(x, y); }
+
+  /** Audit: re-evaluate current coverage without aging, allocation or integration. */
+  recheckCoverage(renderer: THREE.WebGPURenderer, camera: THREE.PerspectiveCamera, rebuild: boolean | 'replay' = false) {
+    if (rebuild === 'replay') { this.findMissing.replay(renderer); return; }
+    if (rebuild) this.findMissing.invalidate();
+    this.findMissing.run(renderer, camera, this.gbuffer, this.pool, this.grid, this.prevCameraPos,
+      { hybridLive: this.atlasPinned && this.liveCoverage, motion: this.motion });
+  }
+
+  /** Audit-only fault injection: let the real economy retire one receiver's samples. */
+  async expireRigidReceiver(renderer: THREE.WebGPURenderer, owner: number) {
+    if (!Number.isInteger(owner) || owner <= 0 || !this.motion) throw new Error('Expected a rigid receiver id');
+    const state = await this.motion.readState(renderer, this.pool);
+    const rows = state.rows.filter(row => row.owner === owner);
+    const backend = renderer.backend as any;
+    const buffer = backend.get(this.pool.getTouched()!.value).buffer;
+    const kill = new Int32Array([SURFEL_KILL_SIGNAL]);
+    for (const row of rows) backend.device.queue.writeBuffer(buffer, row.sid * 4, kill);
+    return rows.map(row => ({ sid: row.sid, birth: row.birth }));
   }
 
   /**
@@ -507,7 +633,9 @@ export class SurfelGI {
     // that for the half of the pool the bake owns — while a blanket freeze would also
     // stop spawning on the half it does not, which is where every movable surface lives.
     // Under `?dynsurfel=0` nothing is ever pinned this way and this branch never runs.
-    if (frozen && this.atlasPinned) {
+    // `freezeCompletely` is a scene saying it has no movable receivers at all, and
+    // then a pinned cache is the whole lighting solution: freezing is exactly right.
+    if (frozen && this.atlasPinned && !this.freezeCompletely) {
       this._frozen = false;
       return;
     }
@@ -531,6 +659,13 @@ export class SurfelGI {
     if (!this.bvh || !this.dynamicBvh || !this.integrate) {
       this.prevCameraPos.copy(camera.position);
       return false;
+    }
+
+    this.motion?.prepare(renderer, this.pool, camera, this.rigidSurfels && this.atlasPinned && !options.staticOnly);
+    if (this.dynamicMembershipChanged) {
+      this.grid.build(renderer, this.pool, camera);
+      this.prevCameraPos.copy(camera.position);
+      this.dynamicMembershipChanged = false;
     }
 
     // --- G-Buffer, offscreen -------------------------------------------------
@@ -563,6 +698,7 @@ export class SurfelGI {
         this.pool,
         this.grid,
         this.prevCameraPos,
+        { hybridLive: this.atlasPinned && this.liveCoverage, motion: this.motion },
       );
       this.dispatchArgs.run(renderer, this.pool);
 
@@ -573,8 +709,10 @@ export class SurfelGI {
         this.grid,
         this.prevCameraPos,
         this.dispatchArgs.getIndirectAttr(),
+        { hybridLive: this.atlasPinned && this.liveCoverage, motion: this.motion },
       );
       this.allocate.run(renderer, this.pool, this.findMissing, found.tileCount);
+      this.motion?.capture(renderer, this.pool, camera, this.gbuffer);
     }
 
     // The grid is centred on the camera, so it must be rebuilt even when frozen —
@@ -595,11 +733,13 @@ export class SurfelGI {
         // A bake writes into surfels that are about to be pinned, so it must see the
         // static world and nothing else. Trace a mover here and its pose is frozen into
         // the cache permanently -- the cache stops being a property of the level.
-        { includeDynamic: !options.staticOnly },
+        { includeDynamic: !options.staticOnly,
+          schedule: this.atlasPinned && !options.staticOnly && this.runtimeRayBudget > 0
+            ? this.integrationSchedule.run(renderer, this.pool, this.runtimeRayBudget, this.runtimeSampleCount) : undefined },
       );
     }
 
-    this.resolve.run(renderer, camera, this.gbuffer);
+    this.resolve.run(renderer, camera, this.gbuffer, { skipPinned: this.atlasPinned });
 
     this.reportGridOccupancy(renderer);
 
@@ -1084,6 +1224,16 @@ export class SurfelGI {
     this.integrate?.setBaseSampleCount(count);
   }
 
+  async readIntegrationSchedule(renderer: THREE.WebGPURenderer) {
+    const schedule = await this.integrationSchedule.read(renderer);
+    if (!schedule) return null;
+    const moments = new Float32Array(await renderer.getArrayBufferAsync(this.pool.getMomentsAttr()!));
+    const spatial = new Float32Array(await renderer.getArrayBufferAsync(this.pool.getSurfelAttr()!));
+    const offset = this.pool.getOffsets().readOffset * 20;
+    return { ...schedule, moments: Array.from(moments.subarray(offset, offset + this.pool.getCapacity() * 20)),
+      spatial: Array.from(spatial) };
+  }
+
   /**
    * Reads the surfel buffer back off the GPU and counts what is actually in it.
    *
@@ -1116,6 +1266,10 @@ export class SurfelGI {
       else recycled++;
     }
     return { capacity, alive: pinned + live, pinned, live, recycled };
+  }
+
+  readRigidSurfelState(renderer: THREE.WebGPURenderer) {
+    return this.motion?.readState(renderer, this.pool) ?? null;
   }
 
   /**
@@ -1152,6 +1306,8 @@ export class SurfelGI {
       denoise?: number;
       /** Gutter-fill passes, so bilinear at a chart border never reads a hole. */
       dilate?: number;
+      /** Keep webgiya's lifecycle running beside the baked atlas for moving receivers. */
+      dynamicReceivers?: boolean;
       onProgress?: (fraction: number, iteration: number) => void;
     } = {},
   ): Promise<{
@@ -1251,9 +1407,10 @@ export class SurfelGI {
     // After `writeAtlas`, which is deliberate: the atlas texture is finished and read
     // back before anything is allowed to change the pool's meaning, so `?dynsurfel=1`
     // cannot alter a single texel of the lightmap it is bolted onto.
-    if (giKnobs.dynamicSurfels()) {
+    if (options.dynamicReceivers ?? giKnobs.dynamicSurfels()) {
       this.immortaliser.run(renderer, this.pool);
       this.atlasPinned = true;
+      if (this.rigidSurfels) this.pool.setAnchorStart(renderer, seeded);
       this._frozen = false;
     }
 
@@ -1278,14 +1435,19 @@ export class SurfelGI {
   }
 
   setEnvControls(intensity: number, lod: number): void {
+    this.lightingControls.envIntensity = intensity;
+    this.lightingControls.envLod = lod;
     this.integrate?.setEnvControls(intensity, lod);
   }
 
   setGiScales(fromDirect: number, fromIndirect: number): void {
+    this.lightingControls.fromDirect = fromDirect;
+    this.lightingControls.fromIndirect = fromIndirect;
     this.integrate?.setGiScales(fromDirect, fromIndirect);
   }
 
   setAlbedoBoost(boost: number): void {
+    this.lightingControls.albedoBoost = boost;
     this.integrate?.setAlbedoBoost(boost);
   }
 

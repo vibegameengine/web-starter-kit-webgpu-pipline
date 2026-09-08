@@ -3,7 +3,6 @@
 import * as THREE from 'three/webgpu';
 import { storage, uniform, wgslFn, wgsl, sampler, texture } from 'three/tsl';
 import type { SurfelPool } from './surfelPool';
-import type { VirtualLightmap } from '../../render/virtualTexture/virtualLightmap';
 import type { SceneBVHBundle } from './sceneBvh';
 import { SurfelMoments, SurfelStruct } from './surfelPool';
 import {
@@ -71,7 +70,7 @@ import { giKnobs } from './knobs';
 const MAX_SURFELS_PER_CELL_LOOKUP = 32;
 
 export type SurfelIntegratePass = {
-  setBakedLightmap: (value: VirtualLightmap | null) => void;
+  invalidate: () => void;
   /**
    * `scene` rather than a light: the tracer reads every analytic light in the graph out
    * of the storage buffer `sceneLights.ts` refreshes here. It used to take one
@@ -88,7 +87,7 @@ export type SurfelIntegratePass = {
     camera: THREE.PerspectiveCamera,
     scene: THREE.Object3D,
     dispatchArgs: THREE.IndirectStorageBufferAttribute,
-    options?: { includeDynamic?: boolean },
+    options?: { includeDynamic?: boolean; schedule?: boolean },
   ) => void;
   setBaseSampleCount: (count: number) => void;
   setAlbedoBoost: (boost: number) => void;
@@ -609,6 +608,7 @@ export function createSurfelIntegratePass(
   envTex: THREE.Texture,
 ): SurfelIntegratePass {
   let computeNode: THREE.ComputeNode | null = null;
+  let lastSchedule = null;
 
   // Uniforms
   const U_FRAME = uniform(0);
@@ -617,7 +617,7 @@ export function createSurfelIntegratePass(
   const U_WRITE_OFFSET = uniform(0);
   const U_GRID_ORIGIN = uniform(new THREE.Vector3());
   const U_BASE_SAMPLE_COUNT = uniform(4);
-  let bakedLightmap: VirtualLightmap | null = null;
+  const renderSize = new THREE.Vector2();
   const U_ALBEDO_BOOST = uniform(1.0);
   const U_GI_FROM_DIRECT = uniform(1.0);
   const U_GI_FROM_INDIRECT = uniform(1.0);
@@ -661,7 +661,7 @@ export function createSurfelIntegratePass(
     camera: THREE.PerspectiveCamera,
     scene: THREE.Object3D,
     dispatchArgs: THREE.IndirectStorageBufferAttribute,
-    options: { includeDynamic?: boolean } = {},
+    options: { includeDynamic?: boolean; schedule?: boolean } = {},
   ) {
     const surfelAttr = pool.getSurfelAttr();
     const momentsAttr = pool.getMomentsAttr();
@@ -685,6 +685,8 @@ export function createSurfelIntegratePass(
       return;
 
     const touchedBuffer = touchedAtomic.setName('touched');
+    const schedule = options.schedule ?? null;
+    if (schedule !== lastSchedule) { computeNode?.dispose(); computeNode = null; lastSchedule = schedule; }
 
     // Update Uniforms
     U_FRAME.value = renderer.info.frame;
@@ -799,7 +801,8 @@ export function createSurfelIntegratePass(
         cam_pos: vec3f,
         grid_origin: vec3f,
         readOffset: u32,
-        occParams: vec4f
+        occParams: vec4f,
+        samplePhase: f32
       ) -> vec3f {
         // Position relative to camera, matches grid build
         let pRel = pt_ws - grid_origin;
@@ -826,7 +829,17 @@ export function createSurfelIntegratePass(
         var bestSid = 0;
 
         for (var i: i32 = 0; i < maxCount; i = i + 1) {
-          let sid = offsetsAndList.value[OFFSETS_AND_LIST_START + start + i];
+          // A cell contains several surfaces, especially with one probe per bake
+          // texel. Its insertion order is not a spatially representative ordering:
+          // taking only the prefix can miss the hit's entire wall near a corner.
+          // Keep the same fetch budget, stratify over the full list, and vary the
+          // phase independently of the bounce direction to avoid fixed omissions.
+          // Noise textures can contain the endpoint 1. Small cells still visit
+          // every entry exactly once; large cells keep the phase below that endpoint.
+          let sampleIndex = select(
+            min(count - 1, i32((f32(i) + min(samplePhase, 0.9999)) * f32(count) / f32(maxCount))),
+            i, count == maxCount);
+          let sid = offsetsAndList.value[OFFSETS_AND_LIST_START + start + sampleIndex];
           
           if (sid < 0) {
             continue;
@@ -906,7 +919,6 @@ export function createSurfelIntegratePass(
       );
 
       // --- WGSL Integrator ---
-      const bakedSampler = bakedLightmap?.computeSampler();
       const integrator = wgslFn(
         /* wgsl */ `
       fn compute(
@@ -935,9 +947,6 @@ export function createSurfelIntegratePass(
           dynBounds: vec4f,
           diffuseLodScale: f32,
           medium: vec4f,
-          ${bakedSampler ? `bakedUv: texture_2d<f32>, bakedFallback: texture_2d<f32>, bakedFallbackSampler: sampler,
-          bakedPages: texture_2d_array<f32>, bakedPageSampler: sampler, bakedTable: texture_2d<u32>,
-          bakedClock: f32, bakedEnabled: f32,` : ''}
         ) -> void {
           let index = instanceIndex;
           // let total = atomicLoad(&poolMax[0]);
@@ -962,6 +971,10 @@ export function createSurfelIntegratePass(
           }
 
           // Compute basis once per surfel (used for ray directions + final meanWorld).
+          ${schedule ? `if (moments.value[index + writeOffset].hit.w < 1.0) {
+            moments.value[index + writeOffset] = moments.value[index + readOffset];
+            return;
+          }` : ''}
           let basis = getTangentBasis(s.normal);
           let nW = basis[2];
 
@@ -996,7 +1009,6 @@ export function createSurfelIntegratePass(
           
           var diffuseGI = vec3f(0.0);
           var validSamples = 0.0;
-          ${bakedSampler ? 'var pageFeedback = vec3f(0.0); var feedbackScore = -1.0;' : ''}
 
           // Adaptive based on MSME inconsistency
           let baseCount = max(1u, baseSampleCount);
@@ -1008,6 +1020,7 @@ export function createSurfelIntegratePass(
           let warmup = (sinceBirth <= 4u) || (prevCount < 32.0);
           // let warmup = (sinceBirth <= 2u) || (prevCount < 32.0);  // <-- tune threshold
           if (warmup) { sampleCount = 32u; }
+          ${schedule ? 'sampleCount = u32(moments.value[index + writeOffset].hit.w);' : ''}
 
           var hitPos0 = s.posb.xyz;
           var debugFlag = 0.0;
@@ -1192,31 +1205,11 @@ export function createSurfelIntegratePass(
                   emissiveBase, emissiveScale
                 );
 
-                var gi = vec3f(0.0);
-                ${bakedSampler ? `
-                var bakedHit = false;
-                if (!hit.isDynamic) {
-                  let width = textureDimensions(bakedUv).x;
-                  let a = textureLoad(bakedUv, vec2i(i32(hit.indices.x % width), i32(hit.indices.x / width)), 0).xy;
-                  let b = textureLoad(bakedUv, vec2i(i32(hit.indices.y % width), i32(hit.indices.y / width)), 0).xy;
-                  let c = textureLoad(bakedUv, vec2i(i32(hit.indices.z % width), i32(hit.indices.z / width)), 0).xy;
-                  bakedHit = all(a >= vec2f(0.0)) && all(b >= vec2f(0.0)) && all(c >= vec2f(0.0));
-                  if (bakedHit) {
-                    let uv = a * hit.barycoord.x + b * hit.barycoord.y + c * hit.barycoord.z;
-                    gi = sampleVirtualBaked(uv, 1.0, bakedFallback, bakedFallbackSampler,
-                      bakedPages, bakedPageSampler, bakedTable, bakedClock, bakedEnabled);
-                    // Select one existing static hit per live probe. This feedback
-                    // changes residency only; no additional ray or lighting sample.
-                    let score = fract(u4.w + f32(i) * 0.618033989);
-                    if (score > feedbackScore) {
-                      feedbackScore = score;
-                      pageFeedback = vec3f(clamp(uv, vec2f(0.0), vec2f(1.0 - 1e-7)),
-                        clamp(cosTerm / (PI * mixPdf), 0.001, 8.0));
-                    }
-                  }
-                }
-                if (!bakedHit) { gi = lookupSurfelGI(hitPoint, hitNormal, camPos, gridOrigin, readOffset, occParams); }
-                ` : `gi = lookupSurfelGI(hitPoint, hitNormal, camPos, gridOrigin, readOffset, occParams);`}
+                // A secondary bounce reads the surfel cache, static or dynamic alike.
+                // It used to read the virtual lightmap's pages at static hits, with a
+                // hit-cone LOD and a residency vote; that machinery is gone (see
+                // commit 34de65e) because the atlas is resident in full.
+                var gi = lookupSurfelGI(hitPoint, hitNormal, camPos, gridOrigin, readOffset, occParams, lightU);
                 bounceLi += gi * hitAlbedo * giFromIndirect;
               } else {
                 // Basic Sky
@@ -1304,9 +1297,9 @@ export function createSurfelIntegratePass(
           moments.value[outIdx].irradiance   = vec4f(msmeState.mean, totalCount);
           moments.value[outIdx].msmeData0    = vec4f(msmeState.shortMean, msmeState.vbbr);
           moments.value[outIdx].msmeData1    = vec4f(msmeState.variance, msmeState.inconsistency);
-          // The unused debug-hit record carries UV/importance/frame in baked mode.
+          // Baked mode packs floor(LOD)*16 + importance into z; xy=UV, w=frame.
           // Authoring retains its original world-hit diagnostic format.
-          moments.value[outIdx].hit          = ${bakedSampler ? 'vec4f(pageFeedback, f32(frame))' : 'vec4f(hitPos0, debugFlag)'};
+          moments.value[outIdx].hit          = vec4f(hitPos0, debugFlag);
           moments.value[outIdx].guiding      = vec4f(meanWorld, slgMass);
         }
       `,
@@ -1349,7 +1342,6 @@ export function createSurfelIntegratePass(
 
           // cache lookup + color
           lookupSurfelGI,
-          ...(bakedSampler ? [bakedSampler.fn] : []),
           gridHelpers,
           colorHelpers,
           msmeHelpers,
@@ -1378,7 +1370,6 @@ export function createSurfelIntegratePass(
       );
 
       const computeCall = integrator({
-        ...(bakedSampler ? { ...bakedSampler.bindings, bakedUv: texture(bvh.lightmapUvTexture) } : {}),
         diffuseTex: texture(bvh.diffuseArrayTex),
         diffuseTexSampler: sampler(bvh.diffuseArrayTex),
 
@@ -1419,9 +1410,7 @@ export function createSurfelIntegratePass(
 
   return {
     run,
-    setBakedLightmap: (value: VirtualLightmap | null) => {
-      if (value !== bakedLightmap) { computeNode?.dispose(); computeNode = null; bakedLightmap = value; }
-    },
+    invalidate: () => { computeNode?.dispose(); computeNode = null; },
     setBaseSampleCount: (count: number) => {
       U_BASE_SAMPLE_COUNT.value = Math.max(1, Math.floor(count));
     },

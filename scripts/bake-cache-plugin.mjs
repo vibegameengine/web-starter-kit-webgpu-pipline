@@ -2,7 +2,6 @@ import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { readdir, readFile, mkdir, rm, writeFile, rename, unlink, stat } from 'node:fs/promises';
 import path from 'node:path';
-import { packBakePages } from './pack-bake-pages.mjs';
 import { gunzip } from 'node:zlib';
 import { promisify } from 'node:util';
 const decompressBake = promisify(gunzip);
@@ -14,7 +13,9 @@ export function bakeCachePlugin() {
     async configResolved(config) { root = config.root; },
     configureServer(server) {
       server.middlewares.use(async (req, res, next) => {
-        const asset = /^\/bakes\/((?:[a-f0-9]{64}\.(?:bin|stream\.json))|(?:blobs\/[a-f0-9]{64}\.chunk))$/.exec(req.url ?? '');
+        // One file per bake. The page chunks and their manifest are gone with the
+        // virtual-texture machinery (commit 34de65e).
+        const asset = /^\/bakes\/([a-f0-9]{64}\.bin)$/.exec(req.url ?? '');
         if (asset && req.method === 'GET') {
           // These files are excluded from HMR. Serve them explicitly because Vite's
           // public-file inventory otherwise misses files written after server start.
@@ -58,8 +59,6 @@ export function bakeCachePlugin() {
           for (const name of await readdir(directory)) {
             if (name.startsWith(match[1])) await rm(path.join(directory, name), { recursive: true, force: true });
           }
-          // A surfel-only cache declares no lightmap (size 0) and has no pages to pack.
-          if (data.readUInt32LE(8) > 0) await packBakePages(directory, match[1], data);
           await writeFile(temporary, data);
           await rename(temporary, path.join(directory, `${match[1]}.bin`));
           await writeFile(path.join(directory, `${match[1]}.json`), JSON.stringify({
