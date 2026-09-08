@@ -303,7 +303,11 @@ export function createWater(options: WaterOptions): Water {
       .add(foamPrev.sample(from.add(vec2(0.0, texel))).r)
       .add(foamPrev.sample(from.sub(vec2(0.0, texel))).r)
       .mul(0.2);
-    const decayed = spread.mul(exp(foamDt.negate().div(foamDecaySeconds)));
+    // Foam on water lives its whitecap e-folding; foam the swash left on the sand
+    // bursts within about a second, so only a thin line marks the run-up limit.
+    const wetNow = smoothstep(0.002, 0.01, sim.stateNode.sample(q).r);
+    const tau = mix(float(1.0), foamDecaySeconds, wetNow);
+    const decayed = spread.mul(exp(foamDt.negate().div(tau)));
 
     // Only the solver's sources: breaking, the run-up front, impact spray. The
     // analytic "shore lace" band that ignored the water is gone (grill Q12/Q20).

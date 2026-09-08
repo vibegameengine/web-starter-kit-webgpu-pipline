@@ -77,7 +77,7 @@ export function createSandMaterial(u: SandMaterialUniforms): THREE.MeshStandardN
   // Foam the swash left on the sand: the field's R channel, broken into lace.
   // Lace, not paint: a fractal mask cut by the field's strength, thin bubble lines.
   const foamLace = mx_fractal_noise_float(p.mul(14.0).add(vec3(u.time.mul(0.15), 0.0, 0.0)), 3, 2.2, 0.55);
-  const foamOnSand = smoothstep(0.45, 0.75, field.r.mul(0.9).add(foamLace.mul(0.55))).mul(wet).mul(smoothstep(-0.02, 0.01, aboveWater));
+  const foamOnSand = smoothstep(0.55, 0.85, field.r.mul(0.9).add(foamLace.mul(0.55))).mul(wet).mul(smoothstep(-0.02, 0.01, aboveWater));
   const submerged = smoothstep(0.02, -0.06, aboveWater);
 
   const dry = color(0.86, 0.71, 0.48);
