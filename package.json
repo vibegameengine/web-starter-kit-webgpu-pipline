@@ -9,6 +9,7 @@
     "dev:gi": "vite --config vite.webgiya.config.ts",
     "build": "vite build",
     "typecheck": "tsc --noEmit",
+    "clean-code:baseline": "node scripts/clean-code-baseline.mjs",
     "preview": "vite preview --port 5188",
     "shot": "node scripts/capture-chrome.mjs"
   },

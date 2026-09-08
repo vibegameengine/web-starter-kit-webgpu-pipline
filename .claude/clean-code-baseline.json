@@ -1,0 +1,705 @@
+{
+  "files": {
+    ".claude/hooks/clean-code-guard.test.mjs": {
+      "commentRun": 11,
+      "commentShare": 0.1,
+      "fileLines": 196,
+      "functionsOverLimit": 0,
+      "worstFunction": 40
+    },
+    "scripts/anisotropic-lightmap-fixture.ts": {
+      "commentRun": 2,
+      "commentShare": 0.05,
+      "fileLines": 109,
+      "functionsOverLimit": 1,
+      "worstFunction": 93
+    },
+    "scripts/chart-filter-fixture.ts": {
+      "commentRun": 1,
+      "commentShare": 0.02,
+      "fileLines": 97,
+      "functionsOverLimit": 1,
+      "worstFunction": 85
+    },
+    "scripts/dynamic-hierarchy-fixture.ts": {
+      "commentRun": 1,
+      "commentShare": 0.02,
+      "fileLines": 128,
+      "functionsOverLimit": 1,
+      "worstFunction": 90
+    },
+    "scripts/lib/cleanCode.mjs": {
+      "commentRun": 11,
+      "commentShare": 0.15,
+      "fileLines": 336,
+      "functionsOverLimit": 0,
+      "worstFunction": 43
+    },
+    "src/entities/foliage/leafMaterial.ts": {
+      "commentRun": 38,
+      "commentShare": 0.19,
+      "fileLines": 267,
+      "functionsOverLimit": 0,
+      "worstFunction": 38
+    },
+    "src/entities/foliage/leafOptics.ts": {
+      "commentRun": 24,
+      "commentShare": 0.15,
+      "fileLines": 375,
+      "functionsOverLimit": 0,
+      "worstFunction": 39
+    },
+    "src/entities/foliage/leafSurface.ts": {
+      "commentRun": 21,
+      "commentShare": 0.24,
+      "fileLines": 183,
+      "functionsOverLimit": 1,
+      "worstFunction": 106
+    },
+    "src/entities/foliage/translucency.ts": {
+      "commentRun": 9,
+      "commentShare": 0.45,
+      "fileLines": 44,
+      "functionsOverLimit": 0,
+      "worstFunction": 9
+    },
+    "src/entities/palm/trunkSurface.ts": {
+      "commentRun": 28,
+      "commentShare": 0.2,
+      "fileLines": 373,
+      "functionsOverLimit": 1,
+      "worstFunction": 190
+    },
+    "src/features/lighting-pipeline/sunFromEnvironment.ts": {
+      "commentRun": 14,
+      "commentShare": 0.43,
+      "fileLines": 37,
+      "functionsOverLimit": 0,
+      "worstFunction": 19
+    },
+    "src/shared/gi/surfel/dynamicHierarchy.ts": {
+      "commentRun": 3,
+      "commentShare": 0.04,
+      "fileLines": 156,
+      "functionsOverLimit": 1,
+      "worstFunction": 140
+    },
+    "src/shared/gi/surfel/integrationSchedule.ts": {
+      "commentRun": 2,
+      "commentShare": 0.08,
+      "fileLines": 115,
+      "functionsOverLimit": 2,
+      "worstFunction": 100
+    },
+    "src/shared/gi/surfel/surfelMotion.ts": {
+      "commentRun": 3,
+      "commentShare": 0.03,
+      "fileLines": 277,
+      "functionsOverLimit": 2,
+      "worstFunction": 248
+    },
+    "scripts/_contact.mjs": {
+      "commentRun": 13,
+      "commentShare": 0.23,
+      "fileLines": 100,
+      "functionsOverLimit": 0,
+      "worstFunction": 11
+    },
+    "scripts/_grad.mjs": {
+      "commentRun": 12,
+      "commentShare": 0.09,
+      "fileLines": 145,
+      "functionsOverLimit": 0,
+      "worstFunction": 10
+    },
+    "scripts/check-atmosphere.mjs": {
+      "commentRun": 16,
+      "commentShare": 0.12,
+      "fileLines": 140,
+      "functionsOverLimit": 0,
+      "worstFunction": 12
+    },
+    "scripts/check-contact.mjs": {
+      "commentRun": 16,
+      "commentShare": 0.12,
+      "fileLines": 147,
+      "functionsOverLimit": 0,
+      "worstFunction": 12
+    },
+    "scripts/check-motion-blur.mjs": {
+      "commentRun": 28,
+      "commentShare": 0.16,
+      "fileLines": 188,
+      "functionsOverLimit": 0,
+      "worstFunction": 14
+    },
+    "scripts/check-reflections.mjs": {
+      "commentRun": 14,
+      "commentShare": 0.16,
+      "fileLines": 94,
+      "functionsOverLimit": 0,
+      "worstFunction": 6
+    },
+    "scripts/check-soft-shadows.mjs": {
+      "commentRun": 21,
+      "commentShare": 0.22,
+      "fileLines": 135,
+      "functionsOverLimit": 0,
+      "worstFunction": 14
+    },
+    "scripts/check-taa.mjs": {
+      "commentRun": 27,
+      "commentShare": 0.15,
+      "fileLines": 194,
+      "functionsOverLimit": 0,
+      "worstFunction": 21
+    },
+    "scripts/compare.mjs": {
+      "commentRun": 9,
+      "commentShare": 0.07,
+      "fileLines": 159,
+      "functionsOverLimit": 0,
+      "worstFunction": 36
+    },
+    "scripts/pixels.mjs": {
+      "commentRun": 12,
+      "commentShare": 0.24,
+      "fileLines": 57,
+      "functionsOverLimit": 0,
+      "worstFunction": 4
+    },
+    "scripts/scale.mjs": {
+      "commentRun": 13,
+      "commentShare": 0.06,
+      "fileLines": 252,
+      "functionsOverLimit": 0,
+      "worstFunction": 24
+    },
+    "src/entities/backdrop/index.ts": {
+      "commentRun": 11,
+      "commentShare": 0.22,
+      "fileLines": 76,
+      "functionsOverLimit": 0,
+      "worstFunction": 34
+    },
+    "src/entities/island/index.ts": {
+      "commentRun": 7,
+      "commentShare": 0.11,
+      "fileLines": 198,
+      "functionsOverLimit": 1,
+      "worstFunction": 131
+    },
+    "src/entities/island/sandMaterial.ts": {
+      "commentRun": 12,
+      "commentShare": 0.28,
+      "fileLines": 138,
+      "functionsOverLimit": 0,
+      "worstFunction": 60
+    },
+    "src/entities/palm/index.ts": {
+      "commentRun": 23,
+      "commentShare": 0.17,
+      "fileLines": 681,
+      "functionsOverLimit": 2,
+      "worstFunction": 191
+    },
+    "src/entities/rocks/rockGeometry.ts": {
+      "commentRun": 5,
+      "commentShare": 0.06,
+      "fileLines": 259,
+      "functionsOverLimit": 1,
+      "worstFunction": 127
+    },
+    "src/entities/shrub/index.ts": {
+      "commentRun": 5,
+      "commentShare": 0.09,
+      "fileLines": 498,
+      "functionsOverLimit": 1,
+      "worstFunction": 159
+    },
+    "src/entities/water/bathymetry.ts": {
+      "commentRun": 10,
+      "commentShare": 0.26,
+      "fileLines": 114,
+      "functionsOverLimit": 0,
+      "worstFunction": 77
+    },
+    "src/entities/water/index.ts": {
+      "commentRun": 13,
+      "commentShare": 0.22,
+      "fileLines": 850,
+      "functionsOverLimit": 2,
+      "worstFunction": 547
+    },
+    "src/entities/water/shallowWater.ts": {
+      "commentRun": 21,
+      "commentShare": 0.19,
+      "fileLines": 587,
+      "functionsOverLimit": 2,
+      "worstFunction": 247
+    },
+    "src/entities/water/spray.ts": {
+      "commentRun": 24,
+      "commentShare": 0.19,
+      "fileLines": 366,
+      "functionsOverLimit": 1,
+      "worstFunction": 173
+    },
+    "src/entities/water/surfaceField.ts": {
+      "commentRun": 9,
+      "commentShare": 0.24,
+      "fileLines": 108,
+      "functionsOverLimit": 0,
+      "worstFunction": 46
+    },
+    "src/entities/water/waterInspector.ts": {
+      "commentRun": 13,
+      "commentShare": 0.11,
+      "fileLines": 191,
+      "functionsOverLimit": 1,
+      "worstFunction": 91
+    },
+    "src/entities/water/windWaves.ts": {
+      "commentRun": 14,
+      "commentShare": 0.23,
+      "fileLines": 174,
+      "functionsOverLimit": 0,
+      "worstFunction": 25
+    },
+    "src/features/lighting-pipeline/index.ts": {
+      "commentRun": 9,
+      "commentShare": 0.05,
+      "fileLines": 1271,
+      "functionsOverLimit": 2,
+      "worstFunction": 1038
+    },
+    "src/features/time-of-day/index.ts": {
+      "commentRun": 11,
+      "commentShare": 0.27,
+      "fileLines": 71,
+      "functionsOverLimit": 0,
+      "worstFunction": 16
+    },
+    "src/shared/gi/bake/applyLightmap.ts": {
+      "commentRun": 15,
+      "commentShare": 0.47,
+      "fileLines": 129,
+      "functionsOverLimit": 0,
+      "worstFunction": 47
+    },
+    "src/shared/gi/bake/dilateLightmap.ts": {
+      "commentRun": 18,
+      "commentShare": 0.28,
+      "fileLines": 71,
+      "functionsOverLimit": 0,
+      "worstFunction": 50
+    },
+    "src/shared/gi/bake/geometrySurfels.ts": {
+      "commentRun": 27,
+      "commentShare": 0.15,
+      "fileLines": 358,
+      "functionsOverLimit": 2,
+      "worstFunction": 118
+    },
+    "src/shared/gi/bake/holeFill.ts": {
+      "commentRun": 39,
+      "commentShare": 0.29,
+      "fileLines": 460,
+      "functionsOverLimit": 2,
+      "worstFunction": 235
+    },
+    "src/shared/gi/bake/lightmapGBuffer.ts": {
+      "commentRun": 10,
+      "commentShare": 0.24,
+      "fileLines": 164,
+      "functionsOverLimit": 0,
+      "worstFunction": 75
+    },
+    "src/shared/gi/bake/lightmapSurfels.ts": {
+      "commentRun": 27,
+      "commentShare": 0.2,
+      "fileLines": 480,
+      "functionsOverLimit": 2,
+      "worstFunction": 316
+    },
+    "src/shared/gi/bake/lightmapUv.ts": {
+      "commentRun": 29,
+      "commentShare": 0.15,
+      "fileLines": 408,
+      "functionsOverLimit": 1,
+      "worstFunction": 141
+    },
+    "src/shared/gi/bvh/core/MeshBVH.js": {
+      "commentRun": 4,
+      "commentShare": 0.06,
+      "fileLines": 573,
+      "functionsOverLimit": 0,
+      "worstFunction": 59
+    },
+    "src/shared/gi/bvh/core/build/geometryUtils.js": {
+      "commentRun": 11,
+      "commentShare": 0.18,
+      "fileLines": 160,
+      "functionsOverLimit": 0,
+      "worstFunction": 43
+    },
+    "src/shared/gi/bvh/core/build/splitUtils.js": {
+      "commentRun": 2,
+      "commentShare": 0.09,
+      "fileLines": 310,
+      "functionsOverLimit": 1,
+      "worstFunction": 158
+    },
+    "src/shared/gi/bvh/core/cast/bvhcast.js": {
+      "commentRun": 3,
+      "commentShare": 0.12,
+      "fileLines": 318,
+      "functionsOverLimit": 1,
+      "worstFunction": 156
+    },
+    "src/shared/gi/bvh/core/cast/closestPointToGeometry.generated.js": {
+      "commentRun": 3,
+      "commentShare": 0.06,
+      "fileLines": 257,
+      "functionsOverLimit": 1,
+      "worstFunction": 139
+    },
+    "src/shared/gi/bvh/core/cast/closestPointToGeometry.template.js": {
+      "commentRun": 2,
+      "commentShare": 0.09,
+      "fileLines": 272,
+      "functionsOverLimit": 1,
+      "worstFunction": 145
+    },
+    "src/shared/gi/bvh/core/cast/closestPointToGeometry_indirect.generated.js": {
+      "commentRun": 3,
+      "commentShare": 0.06,
+      "fileLines": 257,
+      "functionsOverLimit": 1,
+      "worstFunction": 142
+    },
+    "src/shared/gi/bvh/core/cast/intersectsGeometry.template.js": {
+      "commentRun": 3,
+      "commentShare": 0.16,
+      "fileLines": 200,
+      "functionsOverLimit": 1,
+      "worstFunction": 86
+    },
+    "src/shared/gi/bvh/core/cast/refit.generated.js": {
+      "commentRun": 3,
+      "commentShare": 0.06,
+      "fileLines": 173,
+      "functionsOverLimit": 2,
+      "worstFunction": 104
+    },
+    "src/shared/gi/bvh/core/cast/refit.template.js": {
+      "commentRun": 2,
+      "commentShare": 0.05,
+      "fileLines": 197,
+      "functionsOverLimit": 2,
+      "worstFunction": 120
+    },
+    "src/shared/gi/bvh/core/cast/refit_indirect.generated.js": {
+      "commentRun": 3,
+      "commentShare": 0.06,
+      "fileLines": 180,
+      "functionsOverLimit": 2,
+      "worstFunction": 108
+    },
+    "src/shared/gi/bvh/core/cast/shapecast.js": {
+      "commentRun": 2,
+      "commentShare": 0.09,
+      "fileLines": 215,
+      "functionsOverLimit": 1,
+      "worstFunction": 111
+    },
+    "src/shared/gi/bvh/math/ExtendedTriangle.js": {
+      "commentRun": 8,
+      "commentShare": 0.05,
+      "fileLines": 814,
+      "functionsOverLimit": 2,
+      "worstFunction": 300
+    },
+    "src/shared/gi/bvh/math/OrientedBox.js": {
+      "commentRun": 1,
+      "commentShare": 0.03,
+      "fileLines": 422,
+      "functionsOverLimit": 2,
+      "worstFunction": 98
+    },
+    "src/shared/gi/bvh/utils/StaticGeometryGenerator.js": {
+      "commentRun": 2,
+      "commentShare": 0.06,
+      "fileLines": 775,
+      "functionsOverLimit": 2,
+      "worstFunction": 102
+    },
+    "src/shared/gi/cacheAtlas.ts": {
+      "commentRun": 13,
+      "commentShare": 0.41,
+      "fileLines": 54,
+      "functionsOverLimit": 0,
+      "worstFunction": 24
+    },
+    "src/shared/gi/contact/contactBvh.ts": {
+      "commentRun": 12,
+      "commentShare": 0.27,
+      "fileLines": 67,
+      "functionsOverLimit": 0,
+      "worstFunction": 32
+    },
+    "src/shared/gi/contact/contactOcclusionPass.ts": {
+      "commentRun": 13,
+      "commentShare": 0.13,
+      "fileLines": 383,
+      "functionsOverLimit": 0,
+      "worstFunction": 38
+    },
+    "src/shared/gi/immortalise.ts": {
+      "commentRun": 28,
+      "commentShare": 0.49,
+      "fileLines": 101,
+      "functionsOverLimit": 0,
+      "worstFunction": 40
+    },
+    "src/shared/gi/reflect/reflectionPass.ts": {
+      "commentRun": 11,
+      "commentShare": 0.06,
+      "fileLines": 501,
+      "functionsOverLimit": 0,
+      "worstFunction": 75
+    },
+    "src/shared/gi/surfel/constants.ts": {
+      "commentRun": 14,
+      "commentShare": 0.66,
+      "fileLines": 118,
+      "functionsOverLimit": 0,
+      "worstFunction": 0
+    },
+    "src/shared/gi/surfel/content.ts": {
+      "commentRun": 1,
+      "commentShare": 0,
+      "fileLines": 1075,
+      "functionsOverLimit": 2,
+      "worstFunction": 116
+    },
+    "src/shared/gi/surfel/debug/debugLogs.ts": {
+      "commentRun": 2,
+      "commentShare": 0.01,
+      "fileLines": 309,
+      "functionsOverLimit": 1,
+      "worstFunction": 154
+    },
+    "src/shared/gi/surfel/debug/surfelScreenDebug.ts": {
+      "commentRun": 3,
+      "commentShare": 0.03,
+      "fileLines": 1142,
+      "functionsOverLimit": 3,
+      "worstFunction": 813
+    },
+    "src/shared/gi/surfel/diffuseArray.ts": {
+      "commentRun": 14,
+      "commentShare": 0.18,
+      "fileLines": 405,
+      "functionsOverLimit": 1,
+      "worstFunction": 191
+    },
+    "src/shared/gi/surfel/dynamicBvh.ts": {
+      "commentRun": 10,
+      "commentShare": 0.19,
+      "fileLines": 392,
+      "functionsOverLimit": 0,
+      "worstFunction": 13
+    },
+    "src/shared/gi/surfel/hashUtils.ts": {
+      "commentRun": 3,
+      "commentShare": 0.43,
+      "fileLines": 94,
+      "functionsOverLimit": 0,
+      "worstFunction": 10
+    },
+    "src/shared/gi/surfel/hitShading.ts": {
+      "commentRun": 51,
+      "commentShare": 0.23,
+      "fileLines": 349,
+      "functionsOverLimit": 0,
+      "worstFunction": 0
+    },
+    "src/shared/gi/surfel/knobs.ts": {
+      "commentRun": 28,
+      "commentShare": 0.84,
+      "fileLines": 267,
+      "functionsOverLimit": 0,
+      "worstFunction": 6
+    },
+    "src/shared/gi/surfel/sceneBvh.ts": {
+      "commentRun": 14,
+      "commentShare": 0.15,
+      "fileLines": 668,
+      "functionsOverLimit": 2,
+      "worstFunction": 180
+    },
+    "src/shared/gi/surfel/sceneLights.ts": {
+      "commentRun": 28,
+      "commentShare": 0.31,
+      "fileLines": 283,
+      "functionsOverLimit": 1,
+      "worstFunction": 98
+    },
+    "src/shared/gi/surfel/surfelAgePass.ts": {
+      "commentRun": 5,
+      "commentShare": 0.14,
+      "fileLines": 237,
+      "functionsOverLimit": 2,
+      "worstFunction": 128
+    },
+    "src/shared/gi/surfel/surfelAllocatePass.ts": {
+      "commentRun": 4,
+      "commentShare": 0.16,
+      "fileLines": 300,
+      "functionsOverLimit": 5,
+      "worstFunction": 190
+    },
+    "src/shared/gi/surfel/surfelFindMissingPass.ts": {
+      "commentRun": 10,
+      "commentShare": 0.15,
+      "fileLines": 687,
+      "functionsOverLimit": 5,
+      "worstFunction": 427
+    },
+    "src/shared/gi/surfel/surfelGIResolvePass.ts": {
+      "commentRun": 16,
+      "commentShare": 0.2,
+      "fileLines": 461,
+      "functionsOverLimit": 4,
+      "worstFunction": 218
+    },
+    "src/shared/gi/surfel/surfelHashGrid.ts": {
+      "commentRun": 25,
+      "commentShare": 0.31,
+      "fileLines": 996,
+      "functionsOverLimit": 5,
+      "worstFunction": 381
+    },
+    "src/shared/gi/surfel/surfelIntegratePass.ts": {
+      "commentRun": 15,
+      "commentShare": 0.15,
+      "fileLines": 1485,
+      "functionsOverLimit": 2,
+      "worstFunction": 644
+    },
+    "src/shared/gi/surfel/surfelPool.ts": {
+      "commentRun": 22,
+      "commentShare": 0.22,
+      "fileLines": 389,
+      "functionsOverLimit": 1,
+      "worstFunction": 203
+    },
+    "src/shared/gi/surfel/surfelPreparePass.ts": {
+      "commentRun": 2,
+      "commentShare": 0.1,
+      "fileLines": 135,
+      "functionsOverLimit": 1,
+      "worstFunction": 84
+    },
+    "src/shared/gi/surfel/surfelRadialDepth.ts": {
+      "commentRun": 11,
+      "commentShare": 0.06,
+      "fileLines": 541,
+      "functionsOverLimit": 0,
+      "worstFunction": 25
+    },
+    "src/shared/gi/surfel/wgslConsts.ts": {
+      "commentRun": 9,
+      "commentShare": 0.14,
+      "fileLines": 95,
+      "functionsOverLimit": 0,
+      "worstFunction": 0
+    },
+    "src/shared/gi/surfelGI.ts": {
+      "commentRun": 25,
+      "commentShare": 0.05,
+      "fileLines": 1488,
+      "functionsOverLimit": 3,
+      "worstFunction": 193
+    },
+    "src/shared/render/atmosphere/volumetricFog.ts": {
+      "commentRun": 26,
+      "commentShare": 0.16,
+      "fileLines": 530,
+      "functionsOverLimit": 0,
+      "worstFunction": 60
+    },
+    "src/shared/render/exposure.ts": {
+      "commentRun": 11,
+      "commentShare": 0.18,
+      "fileLines": 162,
+      "functionsOverLimit": 0,
+      "worstFunction": 44
+    },
+    "src/shared/render/frameGraph.ts": {
+      "commentRun": 19,
+      "commentShare": 0.27,
+      "fileLines": 667,
+      "functionsOverLimit": 1,
+      "worstFunction": 111
+    },
+    "src/shared/render/motionBlur.ts": {
+      "commentRun": 22,
+      "commentShare": 0.27,
+      "fileLines": 218,
+      "functionsOverLimit": 1,
+      "worstFunction": 84
+    },
+    "src/shared/render/softSunShadow.ts": {
+      "commentRun": 5,
+      "commentShare": 0.09,
+      "fileLines": 209,
+      "functionsOverLimit": 2,
+      "worstFunction": 90
+    },
+    "src/shared/render/temporalAA.ts": {
+      "commentRun": 34,
+      "commentShare": 0.27,
+      "fileLines": 441,
+      "functionsOverLimit": 1,
+      "worstFunction": 96
+    },
+    "src/shared/render/vertexMotion.ts": {
+      "commentRun": 15,
+      "commentShare": 0.56,
+      "fileLines": 48,
+      "functionsOverLimit": 0,
+      "worstFunction": 7
+    },
+    "src/shared/world/mobility.ts": {
+      "commentRun": 13,
+      "commentShare": 0.46,
+      "fileLines": 110,
+      "functionsOverLimit": 0,
+      "worstFunction": 28
+    },
+    "src/shared/world/worldState.ts": {
+      "commentRun": 11,
+      "commentShare": 0.29,
+      "fileLines": 151,
+      "functionsOverLimit": 0,
+      "worstFunction": 22
+    },
+    "src/widgets/world/beachScene.ts": {
+      "commentRun": 11,
+      "commentShare": 0.1,
+      "fileLines": 301,
+      "functionsOverLimit": 1,
+      "worstFunction": 217
+    },
+    "src/widgets/world/cornellScene.ts": {
+      "commentRun": 17,
+      "commentShare": 0.4,
+      "fileLines": 165,
+      "functionsOverLimit": 0,
+      "worstFunction": 37
+    }
+  },
+  "recorded": "2026-09-08"
+}
