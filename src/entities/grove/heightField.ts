@@ -26,14 +26,18 @@ const TRAIL_POINTS: Array<[number, number]> = [
   [1.3, 6.5],
 ];
 
-const LEDGE_HEIGHT = 0.65;
+const LEDGE_HEIGHT = 0.72;
 const LEDGE_LINE_Z = -1.6;
 const LEDGE_LINE_SKEW = 0.3;
-const LEDGE_SLOPE = 0.45;
+const LEDGE_SLOPE = 0.5;
+const LEDGE_STEPS = 2;
+const PLUNGE_POOL_RADIUS = 1.15;
+const PLUNGE_POOL_DEPTH = 0.16;
 const CLEARING_RISE = 0.28;
 const STREAM_HALF_WIDTH = 0.5;
 const STREAM_DEPTH = 0.2;
 const STREAM_WATER_DEPTH = 0.1;
+const PLUNGE_ALONG = 0.44;
 const TRAIL_HALF_WIDTH = 0.85;
 const TRAIL_DEPTH = 0.07;
 
@@ -90,13 +94,31 @@ export class GroveField {
     const bank = this.terrace(x, z) + this.bumps(x, z) * (1 - this.streamMask(x, z));
     const channel = STREAM_DEPTH * this.streamMask(x, z);
     const rut = TRAIL_DEPTH * this.trailMask(x, z);
-    return bank - channel - rut;
+    return bank - channel - rut - this.plungePool(x, z);
   }
 
   terrace(x: number, z: number): number {
     const towardBack = smooth(this.half, -this.half, z);
-    const shelf = smooth(LEDGE_SLOPE, -LEDGE_SLOPE, this.ledgeSigned(x, z));
-    return CLEARING_RISE * towardBack + LEDGE_HEIGHT * shelf;
+    return CLEARING_RISE * towardBack + LEDGE_HEIGHT * this.scarp(x, z);
+  }
+
+  private scarp(x: number, z: number): number {
+    const across = clamp01((LEDGE_SLOPE - this.ledgeSigned(x, z)) / (2 * LEDGE_SLOPE));
+    const jitter = 0.16 * this.noise.fbm2(x * 0.8 + 21.0, z * 0.8, 2);
+    const stepped = across * LEDGE_STEPS + jitter;
+    const index = Math.floor(stepped);
+    const within = smooth(0.15, 0.85, stepped - index);
+    return clamp01((index + within) / LEDGE_STEPS);
+  }
+
+  private plungePool(x: number, z: number): number {
+    const centre = this.plungeCentre();
+    const distance = Math.hypot(x - centre.x, z - centre.y);
+    return PLUNGE_POOL_DEPTH * smooth(PLUNGE_POOL_RADIUS, PLUNGE_POOL_RADIUS * 0.25, distance);
+  }
+
+  plungeCentre(): THREE.Vector2 {
+    return this.stream.pointAt(PLUNGE_ALONG);
   }
 
   private ledgeSigned(x: number, z: number): number {
@@ -113,7 +135,8 @@ export class GroveField {
   }
 
   streamSurface(x: number, z: number): number {
-    return this.terrace(x, z) - STREAM_DEPTH + STREAM_WATER_DEPTH;
+    const pool = this.plungePool(x, z);
+    return this.terrace(x, z) - STREAM_DEPTH + STREAM_WATER_DEPTH - pool * 0.35;
   }
 
   streamCentre(along: number): THREE.Vector2 {
@@ -153,8 +176,8 @@ export class GroveField {
   cover(x: number, z: number): Cover {
     const trail = this.trailMask(x, z);
     const stream = this.streamMask(x, z);
-    const rockFromLedge = smooth(LEDGE_SLOPE * 1.6, LEDGE_SLOPE * 0.4, this.ledgeDistance(x, z));
-    const rock = clamp01(Math.max(stream * 0.85, rockFromLedge * 0.8));
+    const rockFromLedge = smooth(LEDGE_SLOPE * 1.1, LEDGE_SLOPE * 0.25, this.ledgeDistance(x, z));
+    const rock = clamp01(Math.max(stream * 0.7, rockFromLedge * 0.55));
     const mud = clamp01(trail * (1 - rock));
     return [clamp01(1 - rock - mud), mud, rock];
   }

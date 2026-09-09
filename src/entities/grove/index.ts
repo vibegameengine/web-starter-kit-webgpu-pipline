@@ -2,10 +2,13 @@ import * as THREE from 'three/webgpu';
 import { GroveField } from './heightField.ts';
 import { buildAdaptiveMesh } from './adaptiveMesh.ts';
 import { BLOCKOUT_WALL, createCoverMaterial, createFlatMaterial } from './blockoutMaterial.ts';
+import type { ForestMaps } from './dressedMaterials.ts';
+import { createDressedBoulderMaterial, createDressedGroundMaterial } from './dressedMaterials.ts';
 
 export { GroveField } from './heightField.ts';
 export { buildAdaptiveMesh, type AdaptiveMeshData } from './adaptiveMesh.ts';
 export * from './blockoutMaterial.ts';
+export * from './dressedMaterials.ts';
 
 const COARSEST_QUAD_METERS = 1.5;
 const FINEST_QUAD_METERS = 0.1875;
@@ -14,6 +17,7 @@ const GROUND_UV_REPEATS_PER_METRE = 0.5;
 
 export interface GroveOptions {
   field: GroveField;
+  maps?: ForestMaps;
 }
 
 export interface Grove {
@@ -77,13 +81,16 @@ export function createGrove(options: GroveOptions): Grove {
     uvRepeatsPerMetre: GROUND_UV_REPEATS_PER_METRE,
   });
 
-  const ground = new THREE.Mesh(mesh.geometry, createCoverMaterial());
+  const groundMaterial = options.maps ? createDressedGroundMaterial(options.maps) : createCoverMaterial();
+  const ground = new THREE.Mesh(mesh.geometry, groundMaterial);
   ground.name = 'groveGround';
   ground.castShadow = true;
   ground.receiveShadow = true;
   group.add(ground);
 
-  const wallMaterial = createFlatMaterial('groveSkirt', BLOCKOUT_WALL, 1);
+  const wallMaterial = options.maps
+    ? createDressedBoulderMaterial(options.maps, 'bare')
+    : createFlatMaterial('groveSkirt', BLOCKOUT_WALL, 1);
   wallMaterial.side = THREE.DoubleSide;
   const skirt = new THREE.Mesh(buildSkirt(field), wallMaterial);
   skirt.name = 'groveSkirt';

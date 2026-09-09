@@ -5,13 +5,13 @@ import { createScene } from '../../shared/gi/surfel/scene.ts';
 import { Mobility, applyMobility, Layer } from '../../shared/world/index.ts';
 import { GroveField, createGrove } from '../../entities/grove/index.ts';
 import { BLOCKOUT_WATER, createFlatMaterial } from '../../entities/grove/blockoutMaterial.ts';
+import { createDressedBoulderMaterial, type ForestMaps } from '../../entities/grove/dressedMaterials.ts';
 import {
   createBlockoutMaterials,
   createBoulder,
   createFallenLog,
-  createFernClump,
-  createSpruce,
 } from '../../entities/grove/blockoutProps.ts';
+import { createEzPine, type EzPreset } from '../../entities/conifer/ezPine.ts';
 import { createBackdrop } from '../../entities/backdrop/index.ts';
 import type { VolumetricFogSettings } from '../../shared/render/index.ts';
 
@@ -67,6 +67,31 @@ const FERNS = [
   { x: 0.8, z: -4.2, radius: 0.4, seed: 88 },
 ];
 
+async function loadForestMaps(): Promise<ForestMaps> {
+  const base = import.meta.env.BASE_URL;
+  const loader = new THREE.TextureLoader();
+  const load = async (name: string, srgb: boolean) => {
+    const map = await loader.loadAsync(`${base}textures/forest/${name}`);
+    map.colorSpace = srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
+    map.wrapS = map.wrapT = THREE.RepeatWrapping;
+    map.anisotropy = 8;
+    return map;
+  };
+  const [mossColor, mossNormal, mossRoughness, floorColor, floorNormal, floorRoughness, graniteColor, graniteNormal, graniteRoughness] =
+    await Promise.all([
+      load('moss_color.jpg', true),
+      load('moss_normal.jpg', false),
+      load('moss_roughness.jpg', false),
+      load('floor_color.jpg', true),
+      load('floor_normal.jpg', false),
+      load('floor_roughness.jpg', false),
+      load('granite_color.jpg', true),
+      load('granite_normal.jpg', false),
+      load('granite_roughness.jpg', false),
+    ]);
+  return { mossColor, mossNormal, mossRoughness, floorColor, floorNormal, floorRoughness, graniteColor, graniteNormal, graniteRoughness };
+}
+
 function placeCamera(camera: THREE.PerspectiveCamera, controls: OrbitControls, search: URLSearchParams): void {
   camera.fov = 30;
   camera.near = 0.2;
@@ -117,11 +142,21 @@ function buildStreamRibbon(field: GroveField, samples = 96): THREE.Mesh {
   return mesh;
 }
 
-function populate(scene: THREE.Scene, field: GroveField): void {
+function populate(scene: THREE.Scene, field: GroveField, maps: ForestMaps): void {
   const materials = createBlockoutMaterials();
+  materials.rock = createDressedBoulderMaterial(maps, 'bare');
+  materials.moss = createDressedBoulderMaterial(maps, 'mossy');
   const trees = new THREE.Group();
-  trees.name = 'spruces';
-  for (const spec of SPRUCES) trees.add(createSpruce(spec, materials, field.height(spec.x, spec.z)));
+  trees.name = 'conifers';
+  let treeTriangles = 0;
+  for (const spec of SPRUCES) {
+    const preset = spec.height > 7 ? 'Pine Large' : spec.height > 5 ? 'Pine Medium' : 'Pine Small';
+    const pine = createEzPine({ seed: spec.seed, height: spec.height, preset });
+    pine.group.position.set(spec.x, field.height(spec.x, spec.z) - 0.05, spec.z);
+    trees.add(pine.group);
+    treeTriangles += pine.triangleCount;
+  }
+  console.info(`[forest] ${SPRUCES.length} pines, ${treeTriangles} tris`);
 
   const rocks = new THREE.Group();
   rocks.name = 'boulders';
@@ -129,15 +164,30 @@ function populate(scene: THREE.Scene, field: GroveField): void {
 
   const undergrowth = new THREE.Group();
   undergrowth.name = 'undergrowth';
-  for (const spec of FERNS) {
-    undergrowth.add(createFernClump(spec.x, spec.z, spec.radius, spec.seed, materials, field.height(spec.x, spec.z)));
+  const bushPresets: EzPreset[] = ['Bush 1', 'Bush 2', 'Bush 3'];
+  const withBushes = new URLSearchParams(window.location.search).get('bushes') !== '0';
+  for (const [index, spec] of (withBushes ? FERNS : []).entries()) {
+    const bush = createEzPine({
+      seed: spec.seed,
+      height: spec.radius * 2.4,
+      preset: bushPresets[index % bushPresets.length],
+      bakeIntoLightmap: false,
+    });
+    bush.group.position.set(spec.x, field.height(spec.x, spec.z) - 0.02, spec.z);
+    undergrowth.add(bush.group);
   }
 
   const log = createFallenLog(2.2, 1.6, 3.2, 0.6, materials, field.height(2.2, 1.6));
-  for (const object of [trees, rocks, undergrowth, log]) {
+  for (const object of [rocks, undergrowth, log]) {
     scene.add(object);
     applyMobility(object, Mobility.Static);
   }
+  scene.add(trees);
+  trees.traverse((object) => {
+    const mesh = object as THREE.Mesh;
+    if (!mesh.isMesh) return;
+    applyMobility(mesh, Mobility.Static, { animatesVertices: mesh.userData.animatesVertices === true });
+  });
 }
 
 export async function createForestScene(renderer: THREE.WebGPURenderer): Promise<ForestScene> {
@@ -145,8 +195,9 @@ export async function createForestScene(renderer: THREE.WebGPURenderer): Promise
   scene.background = null;
   placeCamera(camera, controls, new URLSearchParams(window.location.search));
 
+  const maps = await loadForestMaps();
   const field = new GroveField(21, 6, -2.4);
-  const grove = createGrove({ field });
+  const grove = createGrove({ field, maps });
   scene.add(grove.group);
   applyMobility(grove.group, Mobility.Static);
 
@@ -154,7 +205,7 @@ export async function createForestScene(renderer: THREE.WebGPURenderer): Promise
   scene.add(stream);
   applyMobility(stream, Mobility.Static);
 
-  populate(scene, field);
+  populate(scene, field, maps);
 
   const backdrop = createBackdrop({ islandBottom: field.bottom, islandHalf: field.half });
   scene.add(backdrop);

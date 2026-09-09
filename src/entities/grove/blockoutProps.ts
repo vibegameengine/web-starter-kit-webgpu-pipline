@@ -1,5 +1,6 @@
 import * as THREE from 'three/webgpu';
 import { seededRandom } from '../../shared/lib/noise.ts';
+import { createRock } from '../rocks/index.ts';
 import { BLOCKOUT_BARK, BLOCKOUT_NEEDLE, BLOCKOUT_ROCK, BLOCKOUT_MOSS, createFlatMaterial } from './blockoutMaterial.ts';
 
 export interface SpruceSpec {
@@ -69,17 +70,9 @@ export function createSpruce(spec: SpruceSpec, materials: BlockoutMaterials, gro
 
 export function createBoulder(spec: BoulderSpec, materials: BlockoutMaterials, groundY: number): THREE.Mesh {
   const random = seededRandom(spec.seed);
-  const geometry = new THREE.IcosahedronGeometry(spec.radius, 1);
-  const position = geometry.getAttribute('position') as THREE.BufferAttribute;
-  const vertex = new THREE.Vector3();
-  for (let i = 0; i < position.count; i++) {
-    vertex.fromBufferAttribute(position, i).multiplyScalar(0.82 + random() * 0.36);
-    position.setXYZ(i, vertex.x, vertex.y * 0.78, vertex.z);
-  }
-  geometry.computeVertexNormals();
-  const mesh = new THREE.Mesh(geometry, spec.mossy ? materials.moss : materials.rock);
+  const mesh = createRock({ seed: spec.seed, radius: spec.radius }, spec.mossy ? materials.moss : materials.rock);
   mesh.name = `boulder-${spec.seed}`;
-  mesh.position.set(spec.x, groundY + spec.radius * 0.42, spec.z);
+  mesh.position.set(spec.x, groundY + spec.radius * 0.34, spec.z);
   mesh.rotation.set((random() - 0.5) * 0.3, random() * Math.PI * 2, (random() - 0.5) * 0.3);
   mesh.castShadow = true;
   mesh.receiveShadow = true;
