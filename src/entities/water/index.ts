@@ -269,8 +269,11 @@ export function createWater(options: WaterOptions): Water {
 
   /** 0 at the slab boundary, 1 a hand inside: the surface stays sealed to the cut faces. */
   const rimMask = Fn(([xz]: [ReturnType<typeof vec2>]) => {
+    // A seal, not a border: the cut faces follow the surface now (see below), so the
+    // waves only have to be flattened in the last few centimetres. At 45 cm the mask
+    // drew a rectangular frame of calm across the whole lagoon.
     const edge = max(abs(xz.x), abs(xz.y));
-    return smoothstep(slabHalf.sub(0.02), slabHalf.sub(0.45), edge);
+    return smoothstep(slabHalf, slabHalf.sub(0.06), edge);
   });
 
   /** Simulated free surface η = b + d (capped); dry cells sit below the sand. */
@@ -495,6 +498,13 @@ export function createWater(options: WaterOptions): Water {
     const p = positionWorld;
     const t = time;
 
+    if (!top) {
+      // The top of a cut face is the same water as the sheet: it rides the free
+      // surface and settles back to the still line with depth, so the two meet
+      // without the bright thread the fixed edge left along every cut.
+      const ride = smoothstep(waterLevel.sub(0.4), waterLevel, positionLocal.y);
+      material.positionNode = positionLocal.add(vec3(0.0, fieldAt(positionLocal.xz).x.add(0.004).mul(ride), 0.0));
+    }
     if (top) {
       // The sheet rides 4 mm high: the sand *mesh* is piecewise linear at 6 cm and
       // strays a few millimetres from the analytic bed the solver runs on, and a
