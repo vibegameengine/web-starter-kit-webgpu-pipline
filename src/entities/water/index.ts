@@ -18,6 +18,7 @@ import {
   equirectUV,
   exp,
   float,
+  fwidth,
   getViewPosition,
   max,
   min,
@@ -707,11 +708,21 @@ export function createWater(options: WaterOptions): Water {
     const gateOn = params.get('waterFilm') !== '0';
     // The film depth from the field's smooth reconstruction, not the raw cells.
     const filmDepth = fieldAt(p.xz).w;
-    const thinFilm = !gateOn ? float(0.0).greaterThan(1.0) : top ? filmDepth.lessThan(needed).or(sheetAboveFloor.lessThan(0.0005)) : cutDry;
-    // A film two millimetres over the gate is water, fully: the ramp is 2 mm, not
-    // 8 — an 8 mm ramp left the 4–8 mm tongue of the swash half transparent and
-    // without caustics, indistinguishable from wet sand (the critic's measurement).
-    const filmFade = !gateOn ? float(1.0) : top ? smoothstep(needed, needed.add(0.002), filmDepth).mul(smoothstep(0.0005, 0.004, sheetAboveFloor)) : float(1.0);
+    // Coverage, not a threshold. The film's edge is a contour of a field sampled at
+    // 1.17 cm and the sheet's own mesh at 2.34 cm; a binary test of either draws that
+    // contour as a staircase of its cells. Dividing by the screen derivative makes
+    // the transition one pixel wide wherever the bed slopes, at any resolution.
+    const edge = (value: THREE.Node, at: number) =>
+      clamp((value as ReturnType<typeof float>).sub(at).div(max(fwidth(value as ReturnType<typeof float>), 1e-5)).add(0.5), 0.0, 1.0);
+    const filmCoverage = edge(filmDepth.sub(needed), 0);
+    const floorCoverage = edge(sheetAboveFloor, 0.0005);
+    // A waterline, not a silhouette: as the sheet comes within a few centimetres of
+    // whatever the scene drew behind it — a boulder, the ball, the sand — it fades
+    // out over that depth instead of ending on the object's hard edge.
+    const contact = smoothstep(0.0, 0.06, viewZ.sub(sceneZ0));
+    const covered = filmCoverage.mul(floorCoverage);
+    const thinFilm = !gateOn ? float(0.0).greaterThan(1.0) : top ? covered.lessThanEqual(0.0) : cutDry;
+    const filmFade = !gateOn ? float(1.0) : top ? covered.mul(contact) : contact;
     const debug: THREE.Node | null =
       debugMode === 'depth' ? vec3(verticalDepth.mul(0.5))
       : debugMode === 'path' ? vec3(pathLength.mul(0.3))
