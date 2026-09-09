@@ -4,14 +4,15 @@ import type { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js
 import { createScene } from '../../shared/gi/surfel/scene.ts';
 import { Mobility, applyMobility, Layer } from '../../shared/world/index.ts';
 import { GroveField, createGrove } from '../../entities/grove/index.ts';
-import { BLOCKOUT_WATER, createFlatMaterial } from '../../entities/grove/blockoutMaterial.ts';
+import { createStreamMaterial, type StreamMaterial } from '../../entities/grove/streamMaterial.ts';
 import { createDressedBoulderMaterial, type ForestMaps } from '../../entities/grove/dressedMaterials.ts';
 import {
   createBlockoutMaterials,
   createBoulder,
   createFallenLog,
 } from '../../entities/grove/blockoutProps.ts';
-import { createEzPine, type EzPreset } from '../../entities/conifer/ezPine.ts';
+import { cloneEzPlant, createEzPine, type EzPine, type EzPreset } from '../../entities/conifer/ezPine.ts';
+import { seededRandom } from '../../shared/lib/noise.ts';
 import { createBackdrop } from '../../entities/backdrop/index.ts';
 import type { VolumetricFogSettings } from '../../shared/render/index.ts';
 
@@ -55,6 +56,19 @@ const BOULDERS = [
   { x: 4.8, z: 1.2, radius: 0.5, seed: 67, mossy: true },
   { x: 0.2, z: 3.6, radius: 0.42, seed: 68 },
 ];
+
+const BACKGROUND_PINES = [
+  { x: -5.4, z: -5.6, height: 6.4, seed: 31 },
+  { x: -2.6, z: -6.0, height: 7.2, seed: 32 },
+  { x: 0.8, z: -6.1, height: 8.1, seed: 33 },
+  { x: 5.8, z: -3.4, height: 6.8, seed: 34 },
+  { x: 5.9, z: 0.6, height: 5.6, seed: 35 },
+  { x: -5.8, z: 0.4, height: 5.2, seed: 36 },
+];
+
+const SCATTER_COUNT = 90;
+const SCATTER_MIN_HEIGHT = 0.25;
+const SCATTER_MAX_HEIGHT = 0.85;
 
 const FERNS = [
   { x: -0.9, z: -1.6, radius: 0.38, seed: 81 },
@@ -113,7 +127,7 @@ function placeCamera(camera: THREE.PerspectiveCamera, controls: OrbitControls, s
   camera.layers.enable(Layer.Debug);
 }
 
-function buildStreamRibbon(field: GroveField, samples = 96): THREE.Mesh {
+function buildStreamRibbon(field: GroveField, stream: StreamMaterial, samples = 128): THREE.Mesh {
   const positions: number[] = [];
   const halfWidth = field.streamHalfWidth * 1.15;
   const surface = (p: THREE.Vector2) => field.streamSurface(p.x, p.y);
@@ -134,12 +148,29 @@ function buildStreamRibbon(field: GroveField, samples = 96): THREE.Mesh {
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
   geometry.computeVertexNormals();
-  const material = createFlatMaterial('groveStream', BLOCKOUT_WATER, 0.12);
-  material.side = THREE.DoubleSide;
-  const mesh = new THREE.Mesh(geometry, material);
+  const mesh = new THREE.Mesh(geometry, stream.material);
   mesh.name = 'groveStream';
   mesh.receiveShadow = true;
   return mesh;
+}
+
+function scatterUndergrowth(field: GroveField, variants: EzPine[]): THREE.Group {
+  const group = new THREE.Group();
+  group.name = 'scatter';
+  const random = seededRandom(7788);
+  const reach = field.half - 0.5;
+  for (let i = 0; i < SCATTER_COUNT; i++) {
+    const x = (random() * 2 - 1) * reach;
+    const z = (random() * 2 - 1) * reach;
+    if (field.streamMask(x, z) > 0.12 || field.trailMask(x, z) > 0.35) continue;
+    const plant = cloneEzPlant(variants[i % variants.length]);
+    const scale = (SCATTER_MIN_HEIGHT + random() * (SCATTER_MAX_HEIGHT - SCATTER_MIN_HEIGHT)) / SCATTER_MAX_HEIGHT;
+    plant.scale.setScalar(scale);
+    plant.position.set(x, field.height(x, z) - 0.02, z);
+    plant.rotation.y = random() * Math.PI * 2;
+    group.add(plant);
+  }
+  return group;
 }
 
 function populate(scene: THREE.Scene, field: GroveField, maps: ForestMaps): void {
@@ -149,7 +180,7 @@ function populate(scene: THREE.Scene, field: GroveField, maps: ForestMaps): void
   const trees = new THREE.Group();
   trees.name = 'conifers';
   let treeTriangles = 0;
-  for (const spec of SPRUCES) {
+  for (const spec of [...SPRUCES, ...BACKGROUND_PINES]) {
     const preset = spec.height > 7 ? 'Pine Large' : spec.height > 5 ? 'Pine Medium' : 'Pine Small';
     const pine = createEzPine({ seed: spec.seed, height: spec.height, preset });
     pine.group.position.set(spec.x, field.height(spec.x, spec.z) - 0.05, spec.z);
@@ -177,6 +208,10 @@ function populate(scene: THREE.Scene, field: GroveField, maps: ForestMaps): void
     undergrowth.add(bush.group);
   }
 
+  const variants = ['Bush 1', 'Bush 2', 'Bush 3'].map((preset, index) =>
+    createEzPine({ seed: 500 + index, height: SCATTER_MAX_HEIGHT, preset: preset as EzPreset, bakeIntoLightmap: false }));
+  undergrowth.add(scatterUndergrowth(field, variants));
+
   const log = createFallenLog(2.2, 1.6, 3.2, 0.6, materials, field.height(2.2, 1.6));
   for (const object of [rocks, undergrowth, log]) {
     scene.add(object);
@@ -201,9 +236,10 @@ export async function createForestScene(renderer: THREE.WebGPURenderer): Promise
   scene.add(grove.group);
   applyMobility(grove.group, Mobility.Static);
 
-  const stream = buildStreamRibbon(field);
-  scene.add(stream);
-  applyMobility(stream, Mobility.Static);
+  const stream = createStreamMaterial();
+  const streamMesh = buildStreamRibbon(field, stream);
+  scene.add(streamMesh);
+  applyMobility(streamMesh, Mobility.Static);
 
   populate(scene, field, maps);
 
@@ -230,7 +266,9 @@ export async function createForestScene(renderer: THREE.WebGPURenderer): Promise
     field,
     atmosphere: forestMist(field),
     glare: { strength: 0.24, radius: 0.5 },
-    update() {},
+    update(elapsedSeconds: number) {
+      stream.update(elapsedSeconds);
+    },
   };
 }
 

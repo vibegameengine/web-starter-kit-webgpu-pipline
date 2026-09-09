@@ -15,6 +15,24 @@ export interface EzPine {
   triangleCount: number;
 }
 
+export function cloneEzPlant(source: EzPine): THREE.Group {
+  const clone = new THREE.Group();
+  clone.name = `${source.group.name}-clone`;
+  source.group.traverse((object) => {
+    const mesh = object as THREE.Mesh;
+    if (!mesh.isMesh) return;
+    const copy = new THREE.Mesh(mesh.geometry, mesh.material);
+    copy.name = mesh.name;
+    copy.castShadow = true;
+    copy.receiveShadow = true;
+    copy.userData = { ...mesh.userData };
+    mesh.updateWorldMatrix(true, false);
+    copy.applyMatrix4(mesh.matrixWorld);
+    clone.add(copy);
+  });
+  return clone;
+}
+
 function tallestSide(object: THREE.Object3D): number {
   const box = new THREE.Box3().setFromObject(object);
   return Math.max(0.001, box.max.y - box.min.y);

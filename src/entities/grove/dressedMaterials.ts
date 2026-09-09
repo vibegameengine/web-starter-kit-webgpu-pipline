@@ -126,6 +126,34 @@ export function createDressedBoulderMaterial(maps: ForestMaps, cover: BoulderCov
   return material;
 }
 
+const SLAB_GRANITE_GAIN = 0.42;
+
+export function createSlabFaceMaterial(maps: ForestMaps, rimHeight: number, bottom: number): THREE.MeshStandardNodeMaterial {
+  const material = new THREE.MeshStandardNodeMaterial();
+  material.name = 'groveSlabFace';
+  material.color = new THREE.Color(0.22, 0.20, 0.17);
+  material.map = maps.graniteColor;
+  material.metalness = 0;
+  material.roughness = 0.95;
+  material.side = THREE.DoubleSide;
+  material.userData.lightmapAlbedo = true;
+
+  const weights = triplanarWeights();
+  const granite = triplanar(maps.graniteColor, 0.55, weights).mul(SLAB_GRANITE_GAIN);
+  const soil = triplanar(maps.floorColor, 0.6, weights).mul(0.6);
+  const moss = triplanar(maps.mossColor, 1.0, weights);
+  const depth = smoothstep(rimHeight, bottom + 0.2, positionWorld.y);
+  const patch = mx_fractal_noise_float(positionWorld.mul(0.8), 3).mul(0.5).add(0.5);
+  const rock = smoothstep(0.35, 0.75, patch);
+  const drape = smoothstep(rimHeight - 0.9, rimHeight, positionWorld.y).mul(smoothstep(0.35, 0.8, patch));
+
+  material.colorNode = mix(mix(mix(soil, granite, rock), soil.mul(0.8), depth), moss, drape.mul(0.8));
+  material.roughnessNode = mix(float(0.96), float(0.85), rock);
+  const graniteNormal = triplanar(maps.graniteNormal, 0.55, weights).mul(2).sub(1);
+  material.normalNode = transformNormalToView(normalize(graniteNormal.add(normalWorld)));
+  return material;
+}
+
 export function createBarkMaterial(maps: { color: THREE.Texture; normal: THREE.Texture; roughness: THREE.Texture }): THREE.MeshStandardNodeMaterial {
   const material = new THREE.MeshStandardNodeMaterial();
   material.name = 'forestBark';

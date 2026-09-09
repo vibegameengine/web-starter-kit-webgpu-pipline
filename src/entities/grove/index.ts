@@ -3,7 +3,7 @@ import { GroveField } from './heightField.ts';
 import { buildAdaptiveMesh } from './adaptiveMesh.ts';
 import { BLOCKOUT_WALL, createCoverMaterial, createFlatMaterial } from './blockoutMaterial.ts';
 import type { ForestMaps } from './dressedMaterials.ts';
-import { createDressedBoulderMaterial, createDressedGroundMaterial } from './dressedMaterials.ts';
+import { createDressedGroundMaterial, createSlabFaceMaterial } from './dressedMaterials.ts';
 
 export { GroveField } from './heightField.ts';
 export { buildAdaptiveMesh, type AdaptiveMeshData } from './adaptiveMesh.ts';
@@ -89,7 +89,7 @@ export function createGrove(options: GroveOptions): Grove {
   group.add(ground);
 
   const wallMaterial = options.maps
-    ? createDressedBoulderMaterial(options.maps, 'bare')
+    ? createSlabFaceMaterial(options.maps, field.height(0, 0), field.bottom)
     : createFlatMaterial('groveSkirt', BLOCKOUT_WALL, 1);
   wallMaterial.side = THREE.DoubleSide;
   const skirt = new THREE.Mesh(buildSkirt(field), wallMaterial);
