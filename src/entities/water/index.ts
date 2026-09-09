@@ -582,8 +582,13 @@ export function createWater(options: WaterOptions): Water {
     // far side of it, is a different surface and would tear the floor apart.
     const hit1 = p.add(refracted.mul(t0));
     const seen1 = floorAt(uv1c, depth1);
-    const consistent1 = distance(seen1, hit1).lessThan(0.15).and(seen1.y.lessThan(waterLevel.add(0.02)));
+    // How well the sample agrees, as a weight rather than a verdict: a boolean here
+    // flipped whole pixels between two floors half a metre apart, and the path length
+    // is the colour of the water — that flip is the sawtooth around every rock.
+    const agrees1 = smoothstep(0.15, 0.04, distance(seen1, hit1)).mul(smoothstep(0.06, 0.0, seen1.y.sub(waterLevel)));
+    const consistent1 = agrees1.greaterThan(0.5);
     const valid1 = inside01(uv1raw).and(perspectiveDepthToViewZ(depth1, cameraNear, cameraFar).lessThan(viewZ)).and(consistent1);
+    const weight1 = agrees1.mul(select(inside01(uv1raw).and(perspectiveDepthToViewZ(depth1, cameraNear, cameraFar).lessThan(viewZ)), float(1.0), float(0.0)));
     const uv1 = select(valid1, uv1c, screenUV) as unknown as V2;
     const depthAt1 = select(valid1, depth1, sceneDepth0) as unknown as F1;
     const floor1 = floorAt(uv1, depthAt1);
@@ -593,8 +598,8 @@ export function createWater(options: WaterOptions): Water {
     const depth2 = depthAt(uv2c);
     const hit2 = p.add(refracted.mul(t1));
     const seen2 = floorAt(uv2c, depth2);
-    const consistent2 = distance(seen2, hit2).lessThan(0.15).and(seen2.y.lessThan(waterLevel.add(0.02)));
-    const valid2 = inside01(uv2raw).and(perspectiveDepthToViewZ(depth2, cameraNear, cameraFar).lessThan(viewZ)).and(consistent2);
+    const agrees2 = smoothstep(0.15, 0.04, distance(seen2, hit2)).mul(smoothstep(0.06, 0.0, seen2.y.sub(waterLevel)));
+    const weight2 = agrees2.mul(select(inside01(uv2raw).and(perspectiveDepthToViewZ(depth2, cameraNear, cameraFar).lessThan(viewZ)), float(1.0), float(0.0)));
     // Where no plane hit is consistent (a boulder's flank, its far side) the refracted
     // ray is marched through the depth buffer in eight steps: the first step whose
     // point lies behind what the screen shows there is the hit.
@@ -623,18 +628,49 @@ export function createWater(options: WaterOptions): Water {
           hitT.assign(t);
         });
       }
+      // Eight steps quantise the path to 50 cm on a long ray, and the path is the
+      // colour: two bisections between the hit and the step before it bring that
+      // under 15 cm for two more depth samples.
+      const lo = max(hitT.sub(span.div(8.0)), 0.0).toVar();
+      const hi = hitT.toVar();
+      for (let i = 0; i < 2; i++) {
+        const mid = lo.add(hi).mul(0.5);
+        const q = p.add(refracted.mul(mid)) as unknown as V3;
+        const uvq = project(q);
+        const uvqc = clamp(uvq, vec2(0.0), vec2(1.0)) as unknown as V2;
+        const dq = depthAt(uvqc);
+        const zq = perspectiveDepthToViewZ(dq, cameraNear, cameraFar);
+        const qz = cameraViewMatrix.mul(vec4(q, 1.0)).z;
+        const crossed = zq.greaterThan(qz).and(inside01(uvq));
+        If(hitT.greaterThan(0.0).and(crossed), () => {
+          hi.assign(mid);
+          hitUv.assign(uvqc);
+          hitDepth.assign(dq);
+        });
+        If(hitT.greaterThan(0.0).and(crossed.not()), () => { lo.assign(mid); });
+      }
+      hitT.assign(select(hitT.greaterThan(0.0), hi, float(0.0)));
       return vec4(hitUv, hitDepth, hitT);
     })();
     const marchUv = march.xy as unknown as V2;
     const marchDepth = march.z as unknown as F1;
     const marchT = march.w as unknown as F1;
     const marchFound = marchT.greaterThan(0.0);
-    const uvF = select(valid2, uv2c, select(valid1, uv1c, select(marchFound, marchUv, screenUV))) as unknown as V2;
-    const depthF = select(valid2, depth2, select(valid1, depth1, select(marchFound, marchDepth, sceneDepth0))) as unknown as F1;
+    // Blend the three candidates by how much each agrees, never switch between them:
+    // the refined hit wins where it agrees, the first hit fills in behind it, and the
+    // march is the floor of last resort.
+    const baseUv = select(marchFound, marchUv, screenUV) as unknown as V2;
+    const baseDepth = select(marchFound, marchDepth, sceneDepth0) as unknown as F1;
+    const basePath = select(marchFound, marchT, distance(p, floor0)) as unknown as F1;
+    const w2 = clamp(weight2, 0.0, 1.0);
+    const w1 = clamp(weight1.mul(float(1.0).sub(w2)), 0.0, 1.0);
+    const uvF = mix(mix(baseUv, uv1c, w1), uv2c, w2) as unknown as V2;
+    const depthF = mix(mix(baseDepth, depth1, w1), depth2, w2) as unknown as F1;
     const floorWorld = floorAt(uvF, depthF);
     // Length of the refracted path to the floor, held to the distance the sampled
     // floor actually is from the surface.
-    const refractedPath = clamp(select(valid2, t1, select(valid1, t0, select(marchFound, marchT, distance(p, floorWorld)))), 0.0, distance(p, floorWorld).mul(1.5));
+    const blendedPath = mix(mix(basePath, t0, w1), t1, w2);
+    const refractedPath = clamp(blendedPath, 0.0, distance(p, floorWorld).mul(1.5));
     const floorOutside = max(abs(floorWorld.x), abs(floorWorld.z)).greaterThan(slabHalf.add(0.6));
     const boundaryT = Fn(() => {
       const tx = select(refracted.x.greaterThan(0.0), slabHalf.sub(p.x), slabHalf.negate().sub(p.x)).div(select(abs(refracted.x).greaterThan(1e-4), refracted.x, float(1e-4)));
