@@ -84,20 +84,58 @@ export interface WaterOptions {
 }
 
 /**
+ * The bed exactly as the solver has it: the baked bathymetry read back once, so a
+ * body floating on the water measures the same free surface the solver computed.
+ * The analytic height field is not that bed — it carries the boulder stamps, and a
+ * surface derived from it stood centimetres below the water the solver drew.
+ */
+class SolverBed {
+  private grid: Float32Array | null = null;
+  private size = 0;
+  private reading = false;
+
+  constructor(private readonly renderer: THREE.WebGPURenderer, private readonly bathymetry: THREE.Texture, private readonly field: IslandField) {}
+
+  /** Reads the bed once, off the render loop; until it lands the analytic bed stands in. */
+  request(): void {
+    const target = this.bathymetry.userData.renderTarget as THREE.RenderTarget | undefined;
+    if (this.grid || this.reading || !target) return;
+    this.reading = true;
+    setTimeout(() => {
+      void this.renderer.readRenderTargetPixelsAsync(target, 0, 0, target.width, target.height).then((raw) => {
+        const decode = raw instanceof Uint16Array ? (v: number) => THREE.DataUtils.fromHalfFloat(v) : (v: number) => v;
+        const grid = new Float32Array(target.width * target.height);
+        for (let i = 0; i < grid.length; i++) grid[i] = decode(raw[i * 4]);
+        this.size = target.width;
+        this.grid = grid;
+      }).catch(() => undefined);
+    }, 0);
+  }
+
+  at(x: number, z: number): number {
+    const { grid, size } = this;
+    if (!grid) return this.field.obstacleHeight(x, z);
+    const half = this.field.half;
+    const i = Math.max(0, Math.min(size - 1, Math.round(((x + half) / (2 * half)) * size - 0.5)));
+    const j = Math.max(0, Math.min(size - 1, Math.round(((z + half) / (2 * half)) * size - 0.5)));
+    return grid[j * size + i];
+  }
+}
+
+/**
  * The free surface at one world point, taken from the solver's own thread: three
  * rows of cells around it, η = bed + depth, and the slopes by differences. No
- * readback of a render target — those stall the frame the water is drawn in.
+ * readback of a render target on the frame — those stall the water they draw.
  */
-async function sampleSurfaceAt(sim: WaterSim, field: IslandField, x: number, z: number) {
+async function sampleSurfaceAt(sim: WaterSim, bed: SolverBed, half: number, x: number, z: number) {
   const size = sim.size;
-  const half = field.half;
   const cell = (2 * half) / size;
   const column = Math.max(1, Math.min(size - 2, Math.round((x + half) / cell - 0.5)));
   const row = Math.max(1, Math.min(size - 2, Math.round((z + half) / cell - 0.5)));
   const [back, here, front] = await Promise.all([sim.readRow(row - 1), sim.readRow(row), sim.readRow(row + 1)]);
   const worldX = (i: number) => -half + (i + 0.5) * cell;
   const worldZ = (j: number) => -half + (j + 0.5) * cell;
-  const eta = (depths: Float32Array, i: number, j: number) => field.obstacleHeight(worldX(i), worldZ(j)) + depths[i];
+  const eta = (depths: Float32Array, i: number, j: number) => bed.at(worldX(i), worldZ(j)) + depths[i];
   return {
     eta: eta(here, column, row),
     slopeX: (eta(here, column + 1, row) - eta(here, column - 1, row)) / (2 * cell),
@@ -875,11 +913,12 @@ export function createWater(options: WaterOptions): Water {
   // or it keeps a second device busy on a frame nobody looks at.
   if (workerSim && params.get('still') === '1') void workerSim.ready.then(() => workerSim.setRunning(false));
 
+  const solverBed = new SolverBed(renderer, heightTexture, field);
   const water: Water = {
     group,
     fields: {
-      sampleSurface: (x, z) => sampleSurfaceAt(sim, field, x, z),
-      bedAt: (x, z) => field.obstacleHeight(x, z),
+      sampleSurface: (x, z) => { solverBed.request(); return sampleSurfaceAt(sim, solverBed, half, x, z); },
+      bedAt: (x, z) => solverBed.at(x, z),
       waterLevel: field.waterLevel,
       half,
     },

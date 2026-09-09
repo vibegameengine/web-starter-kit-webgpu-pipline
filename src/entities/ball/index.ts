@@ -18,7 +18,7 @@ export interface BallWater {
 export interface BallOptions {
   water: BallWater;
   radius?: number;
-  /** kg/m³. Water is 1000, so 250 rides with a quarter of the ball under. */
+  /** kg/m³. Water is 1000: a beach ball is mostly air, and rides with a tenth under. */
   density?: number;
   start?: THREE.Vector2;
 }
@@ -53,7 +53,7 @@ function createMesh(radius: number): THREE.Mesh {
 }
 
 export function createFloatingBall(options: BallOptions): Ball {
-  const { water, radius = 0.16, density = 250, start = new THREE.Vector2(-2.6, 1.2) } = options;
+  const { water, radius = 0.16, density = 80, start = new THREE.Vector2(-2.6, 1.2) } = options;
   const mesh = createMesh(radius);
   mesh.position.set(start.x, water.waterLevel + radius * 0.6, start.y);
 
