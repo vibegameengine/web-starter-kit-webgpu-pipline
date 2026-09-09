@@ -83,8 +83,46 @@ export interface WaterOptions {
   offThread?: boolean;
 }
 
+/**
+ * The free surface at one world point, taken from the solver's own thread: three
+ * rows of cells around it, η = bed + depth, and the slopes by differences. No
+ * readback of a render target — those stall the frame the water is drawn in.
+ */
+async function sampleSurfaceAt(sim: WaterSim, field: IslandField, x: number, z: number) {
+  const size = sim.size;
+  const half = field.half;
+  const cell = (2 * half) / size;
+  const column = Math.max(1, Math.min(size - 2, Math.round((x + half) / cell - 0.5)));
+  const row = Math.max(1, Math.min(size - 2, Math.round((z + half) / cell - 0.5)));
+  const [back, here, front] = await Promise.all([sim.readRow(row - 1), sim.readRow(row), sim.readRow(row + 1)]);
+  const worldX = (i: number) => -half + (i + 0.5) * cell;
+  const worldZ = (j: number) => -half + (j + 0.5) * cell;
+  const eta = (depths: Float32Array, i: number, j: number) => field.obstacleHeight(worldX(i), worldZ(j)) + depths[i];
+  return {
+    eta: eta(here, column, row),
+    slopeX: (eta(here, column + 1, row) - eta(here, column - 1, row)) / (2 * cell),
+    slopeZ: (eta(front, column, row + 1) - eta(back, column, row - 1)) / (2 * cell),
+  };
+}
+
+/** What a body floating on this water needs to know (see entities/ball). */
+export interface WaterFields {
+  /** The free surface at a world point: height over the still line and its slopes. */
+  sampleSurface(x: number, z: number): Promise<{ eta: number; slopeX: number; slopeZ: number }>;
+  /** Bed height under a world point, absolute metres. */
+  bedAt(x: number, z: number): number;
+  waterLevel: number;
+  half: number;
+}
+
 export interface Water {
   group: THREE.Group;
+  fields: WaterFields;
+  /**
+   * Called with the time the solver itself advanced, every step: whatever floats
+   * on this water moves on its clock, not the frame's.
+   */
+  onStep: ((simDelta: number) => void) | null;
   uniforms: {
     absorb: ReturnType<typeof uniform>;
     scatter: ReturnType<typeof uniform>;
@@ -428,24 +466,11 @@ export function createWater(options: WaterOptions): Water {
       // the solver says wet, the sheet is seated on the *rendered* sand: the vertex
       // projects itself, reads the scene depth there, and rises to that floor plus
       // the film — so the visible water reaches exactly where the water is.
-      material.positionNode = Fn(() => {
-        const field = fieldAt(positionLocal.xz);
-        const film = field.w;
-        const eta = waterLevel.add(field.x).add(0.004);
-        const clip = cameraProjectionMatrix.mul(cameraViewMatrix.mul(vec4(positionLocal.x, eta, positionLocal.z, 1.0)));
-        const ndc = clip.xy.div(max(clip.w, 1e-4));
-        const uvV = vec2(ndc.x.mul(0.5).add(0.5), float(0.5).sub(ndc.y.mul(0.5)));
-        const uvC = clamp(uvV, vec2(0.0), vec2(1.0)) as unknown as ReturnType<typeof vec2>;
-        const floorV = cameraWorldMatrix.mul(vec4(getViewPosition(uvC, texture(screen.depth, uvC).level(float(0.0)).x, cameraProjectionMatrixInverse), 1.0)).xyz;
-        // Only the sand under this very vertex counts (not a boulder or a leaf in
-        // front of it): the floor must lie within 5 cm of the vertex in the plane and
-        // stand no more than 3 cm over the analytic sheet — the mesh's stray, not a rock.
-        const near = distance(floorV.xz, positionLocal.xz).lessThan(0.05);
-        const stray = floorV.y.sub(eta);
-        const seat = near.and(stray.greaterThan(-0.002)).and(stray.lessThan(0.03)).and(film.greaterThan(0.001));
-        const y = select(seat, floorV.y.add(max(film, 0.002)), eta);
-        return vec3(positionLocal.x, y, positionLocal.z);
-      })();
+      // The sheet is the free surface, lifted by the millimetres the sand mesh
+      // strays from the analytic bed it is drawn on. It is never seated on the scene
+      // depth: a vertex behind a rock, the ball or a nearer fold of sand reads THAT
+      // surface and rises to it, which stood a curtain of water at every contact.
+      material.positionNode = vec3(positionLocal.x, waterLevel.add(fieldAt(positionLocal.xz).x).add(0.004), positionLocal.z);
     }
 
     // --- normal ------------------------------------------------------------------
@@ -852,6 +877,13 @@ export function createWater(options: WaterOptions): Water {
 
   const water: Water = {
     group,
+    fields: {
+      sampleSurface: (x, z) => sampleSurfaceAt(sim, field, x, z),
+      bedAt: (x, z) => field.obstacleHeight(x, z),
+      waterLevel: field.waterLevel,
+      half,
+    },
+    onStep: null,
     ready: workerSim ? workerSim.ready : Promise.resolve(),
     async readFoamField() {
       const raw = await renderer.readRenderTargetPixelsAsync(foamRead, 0, 0, FOAM_SIZE, FOAM_SIZE);
@@ -889,6 +921,7 @@ export function createWater(options: WaterOptions): Water {
       inspector?.update(performance.now());
       stepFoam(simDelta);
       spray.update(simDelta);
+      water.onStep?.(simDelta);
       sunDirection.copy(sun.position).sub(sun.target.position).normalize();
       (uniforms.sunDir.value as THREE.Vector3).copy(sunDirection);
       (uniforms.sunColor.value as THREE.Color).copy(sun.color).multiplyScalar(Math.min(1.5, sun.intensity * 0.5));

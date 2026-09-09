@@ -7,6 +7,7 @@ import { Layer, Mobility, applyMobility } from '../../shared/world/index.ts';
 import { seededRandom } from '../../shared/lib/noise.ts';
 import { IslandField, createIsland, type CliffTextures } from '../../entities/island/index.ts';
 import { createWater, type Water } from '../../entities/water/index.ts';
+import { createFloatingBall } from '../../entities/ball/index.ts';
 import { bakeBathymetry } from '../../entities/water/bathymetry.ts';
 import { createBackdrop } from '../../entities/backdrop/index.ts';
 import { createRock, createRockMaterial, type RockTextures } from '../../entities/rocks/index.ts';
@@ -16,7 +17,7 @@ import type { VolumetricFogSettings } from '../../shared/render/index.ts';
 import { updateFoliageSun } from '../../entities/foliage/translucency.ts';
 
 export interface BeachScene {
-  /** Nothing in the diorama moves: the live surfel chain stops once the atlas is in. */
+  /** Nothing in the diorama moves: the surfel lifecycle stops once the cache is in. */
   staticLighting: boolean;
   scene: THREE.Scene;
   camera: THREE.PerspectiveCamera;
@@ -228,6 +229,17 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
   const water = createWater({ renderer, field, environment, sun, bathymetry, simulationFrames, offThread });
   // The sand darkens where the simulated swash has been.
   water.onField = (fieldTexture) => island.setWetness(fieldTexture);
+  // A ball adrift on the lagoon: it floats by Archimedes on the same surface field
+  // the water is drawn from, and moves on the solver's clock.
+  const wantBall = new URLSearchParams(window.location.search).get('ball') !== '0';
+  const ball = createFloatingBall({ water: water.fields });
+  if (wantBall) {
+    water.onStep = (simDelta) => ball.update(simDelta);
+    scene.add(ball.mesh);
+    applyMobility(ball.mesh, Mobility.Movable, { animatesVertices: true });
+    ball.mesh.userData.giExclude = true;
+  }
+  (window as unknown as Record<string, unknown>).__ball = { pose: () => ball.pose(), reading: () => ball.reading() };
   // The worker's device has to come up and run its 6 s preroll before the first
   // frame, or the lagoon is drawn as a dry bed for the first second of the session.
   await water.ready;
@@ -255,8 +267,6 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
     sun,
     water,
     field,
-    // Nothing in this diorama moves, so the live half has nothing to serve: the
-    // atlas is the whole answer and the surfel chain can stop once it is in.
     staticLighting: true,
     bindScreen: water.bindScreen,
     // Mist sits on the water (density at the water line, e-folding every ~2.5 m up),

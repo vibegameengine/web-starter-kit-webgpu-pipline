@@ -100,6 +100,27 @@ export class SurfaceField {
     renderer.setRenderTarget(previousTarget);
   }
 
+  /**
+   * The free surface at one world point, read back from the GPU: height over the
+   * still-water line and the two slopes, bilinear between the four texels around it.
+   * One 2x2 read; for a body floating on the water, not for the frame's shading.
+   */
+  async readAt(x: number, z: number): Promise<{ eta: number; slopeX: number; slopeZ: number }> {
+    const span = this.texel * this.size;
+    const px = (x / span + 0.5) * this.size - 0.5;
+    const pz = (z / span + 0.5) * this.size - 0.5;
+    const i = Math.max(0, Math.min(this.size - 2, Math.floor(px)));
+    const j = Math.max(0, Math.min(this.size - 2, Math.floor(pz)));
+    const raw = await this.renderer.readRenderTargetPixelsAsync(this.target, i, j, 2, 2);
+    const decode = raw instanceof Uint16Array ? (v: number) => THREE.DataUtils.fromHalfFloat(v) : (v: number) => v;
+    const fx = Math.max(0, Math.min(1, px - i));
+    const fz = Math.max(0, Math.min(1, pz - j));
+    const at = (corner: number, channel: number) => decode(raw[corner * 4 + channel]);
+    const lerp2 = (channel: number) =>
+      (at(0, channel) * (1 - fx) + at(1, channel) * fx) * (1 - fz) + (at(2, channel) * (1 - fx) + at(3, channel) * fx) * fz;
+    return { eta: lerp2(0), slopeX: lerp2(1), slopeZ: lerp2(2) };
+  }
+
   /** Field uv of a world xz. */
   uvOf(xz: THREE.Node) {
     return (xz as ReturnType<typeof vec2>).div(this.texel * this.size).add(0.5);
