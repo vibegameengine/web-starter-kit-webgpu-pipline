@@ -2,7 +2,8 @@ import GUI from 'lil-gui';
 
 import { initRenderer } from '../shared/render/index.ts';
 import { createLightingPipeline, type SceneHost } from '../features/lighting-pipeline/index.ts';
-import { createBeachScene, createCornellScene, populateCornell } from '../widgets/world/index.ts';
+import { createBeachScene, createCornellScene, createForestScene, populateCornell } from '../widgets/world/index.ts';
+import { addGuiSettingsSave, applyGuiSettings, guiSettingsApply, loadGuiSettings } from './guiSettings.ts';
 
 const loadingOverlay = document.querySelector<HTMLElement>('#loading-overlay');
 const loadingMessage = document.querySelector<HTMLElement>('#loading-message');
@@ -60,14 +61,20 @@ async function boot(): Promise<void> {
     (renderer.inspector as unknown as { domElement?: HTMLElement }).domElement?.style.setProperty('display', 'none');
   }
 
-  const ui = { setLoading, clearLoading, showError, showChrome };
+  // The panel's saved state (`config/gui-settings.json`) replaces the code defaults;
+  // it is applied once before the bake (the sun) and once after the panel is complete.
+  const saved = guiSettingsApply(params) ? await loadGuiSettings() : null;
+  const ui = { setLoading, clearLoading, showError, showChrome, applySavedSettings: (target: GUI) => applyGuiSettings(target, saved) };
   const pipeline = await createLightingPipeline(renderer, ui);
 
   setLoading('Building scene');
   let host: SceneHost;
-  if (params.get('scene') === 'beach') {
+  if (params.get('scene') === 'forest') {
+    const forest = await createForestScene(renderer);
+    host = { ...forest, skyIsBackground: false, moverByDefault: false, sunIntensity: 'environment' };
+  } else if (params.get('scene') === 'beach') {
     const beach = await createBeachScene(renderer, pipeline.envTexture);
-    host = { ...beach, skyIsBackground: false, moverByDefault: false };
+    host = { ...beach, skyIsBackground: false, moverByDefault: false, sunIntensity: 'environment' };
   } else {
     const cornell = createCornellScene(renderer);
     setLoading('Building Cornell box');
@@ -76,6 +83,8 @@ async function boot(): Promise<void> {
   }
 
   await pipeline.run(host, gui, ui);
+  applyGuiSettings(gui, saved);
+  addGuiSettingsSave(gui, ui);
 }
 
 boot().catch(showError);
