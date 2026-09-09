@@ -86,6 +86,87 @@ export const intersectTriangles = wgslFn( /* wgsl */ `
 
 `, [ intersectsTriangle, rayStruct, intersectionResultStruct, constants ] );
 
+/**
+ * Closest hit, with a ceiling on how many nodes one ray may visit.
+ *
+ * The traversal cost of a ray is unbounded: a ray grazing dense geometry pops far
+ * more nodes than one that hits a wall. Measured on the beach 2026-09-09, the
+ * reflection pass ran at 3.18 ms on a median frame and 7.75 / 9.73 / 10.76 ms on
+ * three frames out of 506 — the same rays, the same budget, a different set of
+ * random directions. A node ceiling turns that tail into a fixed worst case.
+ *
+ * A ray that exhausts its budget returns whatever it had found so far, which for a
+ * reflection means the environment rather than a geometry hit. That is a real
+ * change to those rays, so the budget belongs to the caller, not in here.
+ */
+export const bvhIntersectFirstHitBudget = wgslFn( /* wgsl */ `
+
+	fn bvhIntersectFirstHitBudget(
+		ray: Ray,
+		maxNodes: u32
+	) -> IntersectionResult {
+
+		var pointer = 0;
+		var visited = 0u;
+		var stack: array<u32, BVH_STACK_DEPTH>;
+		stack[ 0 ] = 0u;
+
+		var bestHit: IntersectionResult;
+
+		bestHit.didHit = false;
+		bestHit.dist = INFINITY;
+
+		loop {
+
+			if ( pointer < 0 || pointer >= i32( BVH_STACK_DEPTH ) ) { break; }
+			if ( visited >= maxNodes ) { break; }
+			visited = visited + 1u;
+
+			let currNodeIndex = stack[ pointer ];
+			let node = bvh.value[ currNodeIndex ];
+
+			pointer = pointer - 1;
+
+			var boundsHitDistance: f32 = 0.0;
+
+			if ( ! intersectsBounds( ray, node.bounds, &boundsHitDistance ) || boundsHitDistance > bestHit.dist ) { continue; }
+
+			let boundsInfox = node.splitAxisOrTriangleCount;
+			let boundsInfoy = node.rightChildOrTriangleOffset;
+
+			let isLeaf = ( boundsInfox & 0xffff0000u ) != 0u;
+
+			if ( isLeaf ) {
+
+				let localHit = intersectTriangles( boundsInfoy, boundsInfox & 0x0000ffffu, ray );
+				if ( localHit.didHit && localHit.dist < bestHit.dist ) { bestHit = localHit; }
+
+			} else {
+
+				let leftIndex = currNodeIndex + 1u;
+				let splitAxis = boundsInfox & 0x0000ffffu;
+				let rightIndex = currNodeIndex + boundsInfoy;
+
+				let leftToRight = ray.direction[splitAxis] >= 0.0;
+				let c1 = select( rightIndex, leftIndex, leftToRight );
+				let c2 = select( leftIndex, rightIndex, leftToRight );
+
+				pointer = pointer + 1;
+				stack[ pointer ] = c2;
+
+				pointer = pointer + 1;
+				stack[ pointer ] = c1;
+
+			}
+
+		}
+
+		return bestHit;
+
+	}
+
+`, [ intersectTriangles, intersectsBounds, rayStruct, bvhNodeStruct, intersectionResultStruct, constants ] );
+
 export const bvhIntersectFirstHit = wgslFn( /* wgsl */ `
 
 	fn bvhIntersectFirstHit(

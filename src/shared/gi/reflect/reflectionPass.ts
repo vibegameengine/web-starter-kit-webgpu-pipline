@@ -34,6 +34,18 @@ export interface ReflectionSettings {
    * a 15.2 ms frame per trace.
    */
   traceInterval: number;
+  /**
+   * Nodes one reflection ray may visit in the static BVH before it gives up and
+   * takes the environment instead. 0 removes the ceiling.
+   *
+   * Traversal cost per ray is unbounded, and it is what makes this pass spike:
+   * measured on the beach 2026-09-09 over 506 frames, 3.18 ms on the median frame
+   * against 7.75 / 9.73 / 10.76 ms on three of them — same rays, same budget,
+   * different random directions. The ceiling turns that tail into a fixed worst
+   * case and pays for it with the rays that hit the limit: they reflect the sky
+   * instead of the geometry they would have found.
+   */
+  rayNodeBudget: number;
   /** Screen-trace steps before the ray is handed to the BVH. */
   screenSteps: number;
 }
@@ -47,6 +59,7 @@ export const DEFAULT_REFLECTION_SETTINGS: Readonly<ReflectionSettings> = {
   intensity: 1,
   resolutionScale: 0.5,
   traceInterval: 2,
+  rayNodeBudget: 192,
   screenSteps: 40,
 };
 
@@ -110,6 +123,7 @@ const KERNEL = /* wgsl */ `
     parity: f32,
     maxRoughness: f32,
     screenSteps: f32,
+    rayNodeBudget: u32,
     dynTrace: f32,
     dynBounds: vec4f,
     ambient: vec3f
@@ -195,7 +209,7 @@ const KERNEL = /* wgsl */ `
               var ray: Ray;
               ray.origin = worldPos + n * 0.01;
               ray.direction = l;
-              let hit = traceScene( ray, dynTrace, dynBounds );
+              let hit = traceScene( ray, dynTrace, dynBounds, rayNodeBudget );
               radiance = radiance + shadeReflectionHit( hit, ray, lightsTex, lightCount, lightSamples, medium, diffuseTex, diffuseSampler, envTex, envSampler, envIntensity, dynTrace, dynBounds, ambient, bn.y ) * ( 1.0 - fade );
               found = true;
             }
@@ -212,7 +226,7 @@ const KERNEL = /* wgsl */ `
         var ray: Ray;
         ray.origin = worldPos + n * 0.01;
         ray.direction = l;
-        let hit = traceScene( ray, dynTrace, dynBounds );
+        let hit = traceScene( ray, dynTrace, dynBounds, rayNodeBudget );
         radiance = shadeReflectionHit( hit, ray, lightsTex, lightCount, lightSamples, medium, diffuseTex, diffuseSampler, envTex, envSampler, envIntensity, dynTrace, dynBounds, ambient, bn.y );
       }
 
@@ -325,6 +339,7 @@ export class ReflectionPass {
   readonly uParity = uniform(0);
   private readonly uMaxRoughness = uniform(0.55);
   private readonly uScreenSteps = uniform(40);
+  private readonly uRayNodeBudget = uniform(192, 'uint');
   private readonly uDynTrace = uniform(0);
   private readonly uEnvIntensity = uniform(1);
   private readonly uAmbient = uniform(new THREE.Color(0.1, 0.12, 0.15));
@@ -406,6 +421,7 @@ export class ReflectionPass {
     this.uParity.value = this.frame & 1;
     this.uMaxRoughness.value = this.settings.maxRoughness;
     this.uScreenSteps.value = Math.max(4, Math.round(this.settings.screenSteps));
+    this.uRayNodeBudget.value = Math.max(0, Math.round(this.settings.rayNodeBudget));
     this.uDynTrace.value = dynamicBvh.enabled.value > 0 ? 1 : 0;
     this.uEnvIntensity.value = envIntensity;
 
@@ -507,6 +523,7 @@ export class ReflectionPass {
       parity: this.uParity,
       maxRoughness: this.uMaxRoughness,
       screenSteps: this.uScreenSteps,
+      rayNodeBudget: this.uRayNodeBudget,
       dynTrace: this.uDynTrace,
       dynBounds: dynamicBvh.influence,
       ambient: this.uAmbient,

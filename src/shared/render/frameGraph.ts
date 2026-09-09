@@ -118,6 +118,13 @@ export class FrameGraph {
   giMode: GiMode;
   readonly indirectIntensity = uniform(1);
   /** Suppress realtime GI only on receivers already lit by the baked atlas. */
+  /**
+   * 1 while an atlas is published: a pixel whose receiver is baked (alpha of the
+   * albedo attachment) then keeps the atlas's light and does NOT also get the live
+   * indirect on top. Collapsing the three lighting modes into one path deleted the
+   * only place this was set and left it at 0, which adds both to every static
+   * surface — invisible only while the pool is empty and the live term is near zero.
+   */
   readonly hybridReceivers = uniform(0);
   /**
    * Where the divider sits, `?splitAt=` overriding the half-and-half default.

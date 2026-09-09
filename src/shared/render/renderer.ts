@@ -56,8 +56,12 @@ export async function initRenderer(
   });
 
   // The pass viewer. Every intermediate buffer registers here via `.toInspector()`,
-  // which is how we obey the Prime Law without guessing.
-  renderer.inspector = new Inspector();
+  // which is how we obey the Prime Law without guessing. `?inspector=0` detaches it —
+  // it records the last 512 frames and their per-pass stats, which is a suspect
+  // whenever the frame stalls periodically for no work.
+  if (new URLSearchParams(window.location.search).get('inspector') !== '0') {
+    renderer.inspector = new Inspector();
+  }
 
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.setSize(window.innerWidth, window.innerHeight);

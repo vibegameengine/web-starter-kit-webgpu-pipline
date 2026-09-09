@@ -530,6 +530,9 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
     lightmapTexture = texture;
     applyLightmap(scene, lightmapTexture, lightmapIntensity);
     frameGraph.setLightmapTexture(lightmapTexture);
+    // Baked receivers take their indirect from the atlas; the live term must not be
+    // added on top of it.
+    frameGraph.hybridReceivers.value = 1;
     // The tracer reads the same atlas at static hits (`?atlasHits=0` keeps every hit
     // on the surfel cache, which is the A/B control for what that read changes).
     if (params.get('atlasHits') !== '0') gi.useBakedAtlas(lightmapTexture);

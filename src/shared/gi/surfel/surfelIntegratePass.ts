@@ -1100,7 +1100,7 @@ export function createSurfelIntegratePass(
 
             ray.direction = rayDirDepth;
 
-            let hitD = traceScene(ray, dynTrace, dynBounds);
+            let hitD = traceScene(ray, dynTrace, dynBounds, 0u);
 
             let maxDepth = sRad * 2.0;
             let dHit = clamp(hitD.dist, 0.0, maxDepth);
@@ -1142,7 +1142,7 @@ export function createSurfelIntegratePass(
               // nearer of the static and dynamic hits and resolves the interpolated
               // uv/matId out of whichever structure won, so everything below this line
               // is upstream's shading path with no knowledge of the split.
-              var hit = traceScene(ray, dynTrace, dynBounds);
+              var hit = traceScene(ray, dynTrace, dynBounds, 0u);
               // Foliage is see-through for a bounce ray with probability (1 - opacity):
               // the ray that would have stopped on a frond continues to whatever is
               // behind it, so the sky reaches the ground under a crown and the crown
@@ -1159,7 +1159,7 @@ export function createSurfelIntegratePass(
                   let advance = hit.dist - passOffset + eps;
                   passRay.origin = passRay.origin + passRay.direction * advance;
                   passOffset = passOffset + advance;
-                  var next = traceScene(passRay, dynTrace, dynBounds);
+                  var next = traceScene(passRay, dynTrace, dynBounds, 0u);
                   next.dist = next.dist + passOffset;
                   hit = next;
                 }

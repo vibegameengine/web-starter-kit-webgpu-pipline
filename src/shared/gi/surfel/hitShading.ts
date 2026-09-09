@@ -132,7 +132,7 @@ export const giVisibility = wgslFn(
     var remaining = maxDist;
     var transmitted = vec3f( 1.0 );
     for ( var k: u32 = 0u; k < 4u; k = k + 1u ) {
-      let hit = traceScene( ray, dynEnabled, dynBounds );
+      let hit = traceScene( ray, dynEnabled, dynBounds, 0u );
       if ( !hit.didHit || hit.dist >= remaining ) { return transmitted; }
       let layerCount = i32( textureNumLayers( diffuseTex ) );
       let layer = clamp( i32( round( hit.attrib.z ) ), 0, layerCount - 1 );
