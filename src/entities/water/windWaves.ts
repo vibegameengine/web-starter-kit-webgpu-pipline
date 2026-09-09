@@ -39,6 +39,13 @@ export interface WindWaveOptions {
   seed?: number;
   /** Global amplitude multiplier for art direction after the physics. */
   gain?: number;
+  /**
+   * Shortest wave the geometry may carry, metres. A surface sampled every dx cannot
+   * hold a wave below 2 dx: below that the sum folds into a zig-zag locked to the
+   * grid — the accordion along the shoreline, growing with the wind. Everything
+   * shorter belongs in the roughness of the shading, never in the displacement.
+   */
+  minWavelength?: number;
 }
 
 const GRAVITY = 9.81;
@@ -78,6 +85,7 @@ export class WindWaves {
       components: 48,
       seed: 11,
       gain: 1,
+      minWavelength: 0.07,
       ...options,
     };
     this.count = this.options.components;
@@ -102,7 +110,8 @@ export class WindWaves {
   get windDirection(): number { return this.options.windDirection; }
 
   private sample(): void {
-    const { windSpeed, windDirection, fetch, components, seed, gain } = this.options;
+    const { windSpeed, windDirection, fetch, components, seed, gain, minWavelength } = this.options;
+    let tail = 0;
     const random = seededRandom(seed);
 
     // Fetch-limited JONSWAP peak and alpha (Hasselmann): dimensionless fetch.
@@ -127,9 +136,22 @@ export class WindWaves {
       const amplitude = Math.sqrt(2 * Math.max(energy, 0)) * gain;
       // Deep-water k for the seed; the shader re-solves k(h) per point.
       const k = (omega * omega) / GRAVITY;
-      this.params[i].set(Math.cos(theta) * k, Math.sin(theta) * k, omega, amplitude);
+      // Below the grid's limit the component is dropped from the displaced surface;
+      // its slope variance is what the roughness of the shading stands for.
+      const carried = (2 * Math.PI) / k >= minWavelength;
+      if (!carried) tail += 0.5 * (amplitude * k) ** 2;
+      this.params[i].set(Math.cos(theta) * k, Math.sin(theta) * k, omega, carried ? amplitude : 0);
       this.phases[i] = random() * Math.PI * 2;
     }
+    this.tailSlopeVariance = tail;
+  }
+
+  /** Slope variance of the components too short for the grid: the shading's share. */
+  private tailSlopeVariance = 0;
+
+  /** Root-mean-square slope of what the displacement cannot carry (Cox–Munk tail). */
+  get tailSlope(): number {
+    return Math.sqrt(this.tailSlopeVariance);
   }
 
   /** Total significant amplitude (for capping the surface). */

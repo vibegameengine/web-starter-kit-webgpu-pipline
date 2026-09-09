@@ -42,7 +42,11 @@ export interface Island {
  * zero displacement on the top row), so the beach turns over the edge with no crack.
  */
 export function createIsland(options: IslandOptions): Island {
-  const { field, textures, topSegments = 192, wallSegments = 48 } = options;
+  // 512 segments, the spacing of the bathymetry texture the water stands on: at 192
+  // the mesh cut the corners of that bed by up to 5 mm between its vertices, and the
+  // water sheet came through those dips as a row of triangular teeth along the
+  // waterline — the sand's own triangulation, seen edge-on.
+  const { field, textures, topSegments = 512, wallSegments = 48 } = options;
   const half = field.half;
 
   const uniforms: SandMaterialUniforms = {

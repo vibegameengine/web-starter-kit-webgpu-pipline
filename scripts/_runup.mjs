@@ -11,12 +11,12 @@ const browser = await chromium.launch({ channel: 'chrome', headless: true, args:
 const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
 page.on('pageerror', e => console.log('pageerror', String(e).slice(0, 200)));
 await page.goto('http://127.0.0.1:5188/?scene=beach&hud=0&mode=surfel&bake=0');
-await page.waitForFunction(() => !!window.__water && document.querySelector('#loading-overlay')?.hidden, null, { timeout: 240000 });
+await page.waitForFunction(() => !!window.__lagoon && document.querySelector('#loading-overlay')?.hidden, null, { timeout: 240000 });
 const samples = [];
 const t0 = Date.now();
 while (Date.now() - t0 < secs * 1000) {
   const r = await page.evaluate(async (z) => {
-    const s = await window.__water.simRow(z);
+    const s = await window.__lagoon.simRow(z);
     return s;
   }, z);
   samples.push(r);

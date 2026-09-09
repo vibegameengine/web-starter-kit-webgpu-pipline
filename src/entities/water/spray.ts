@@ -13,6 +13,7 @@ import {
   instanceIndex,
   length,
   max,
+  min,
   mix,
   mrt,
   normalize,
@@ -266,7 +267,10 @@ export class Spray {
     const vLen = length(vScreen);
     const axis = select(vLen.greaterThan(1e-4), vScreen.div(max(vLen, 1e-4)), vec2(1.0, 0.0)) as unknown as V2;
     const perp = vec2(axis.y.negate(), axis.x);
-    const stretch = size.add(vLen.mul(0.012).mul(float(1.0).sub(mist)));
+    // A droplet is a droplet: the motion streak is at most twice its own size. The
+    // unbounded stretch drew every fast drop as a hanging icicle.
+    const streak = min(vLen.mul(0.012), size.mul(2.0));
+    const stretch = size.add(streak.mul(float(1.0).sub(mist)));
     const local = axis.mul(positionLocal.x.mul(stretch)).add(perp.mul(positionLocal.y.mul(size)));
     const offset = right.mul(local.x).add(up.mul(local.y)).mul(select(alive, float(1.0), float(0.0)));
     sprite.positionNode = state.xyz.add(offset);

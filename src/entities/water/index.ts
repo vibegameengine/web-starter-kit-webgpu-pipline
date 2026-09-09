@@ -256,7 +256,10 @@ export function createWater(options: WaterOptions): Water {
   const workerSim = offThread ? new WorkerWaterSim({ ...simSetup, swellAmplitude: 0.06, swellPeriod: 3.2, swellDirection: Math.atan2(-1, 1), prerollSeconds: PREROLL_SECONDS }) : null;
   const sim: WaterSim = workerSim ?? new ShallowWater(simSetup);
   // Wind waves from the spectrum ride on the simulated surface (see windWaves.ts).
-  const wind = new WindWaves({ windSpeed: 4.5, fetch: 800, components: 48, gain: 1.0 });
+  // `?wind=<m/s>` for a check: no wave may be taller than the water under it, so a
+  // gale must roughen the lagoon and still leave the run-up's film smooth.
+  const windSpeed = Number(params.get('wind') ?? 4.5);
+  const wind = new WindWaves({ windSpeed: Number.isFinite(windSpeed) ? windSpeed : 4.5, fetch: 150, components: 48, gain: 1.0 });
   const windCap = Math.min(0.12, wind.amplitudeSum);
 
   if (!workerSim) (sim as ShallowWater).preroll(PREROLL_SECONDS);
@@ -278,32 +281,27 @@ export function createWater(options: WaterOptions): Water {
 
   /** Simulated free surface η = b + d (capped); dry cells sit below the sand. */
   const simBase = Fn(([xz]: [ReturnType<typeof vec2>]) => {
-        const q = sim.uvOf(xz) as unknown as ReturnType<typeof vec2>;
-        // Interpolate the free surface η = b + d, never b and d apart: between a deep
-        // cell and a boulder's flank, depth blended on its own lands metre-deep water
-        // on the stone and lifts a ring of teeth around every rock. A dry cell is the
-        // still-water line (capped a little above the ground) so the sheet runs level
-        // into the stone instead of climbing it; what is drawn there is the fragment's
-        // call (see thinFilm). Four taps at half-texel offsets: a 2×2 box.
-        const h = float(0.5 / sim.size);
-        // Run-up ceiling: about one wave height over still water on a beach (Hunt),
-        // but against a steep flank the water cannot climb — it breaks into spray
-        // (the foam field's impact channel feeds the spray) — so there the sheet stays
-        // within 3 cm of the line.
-        const bTex = (o: ReturnType<typeof vec2>) => (texture(heightTexture, q.add(o)).level(float(0.0)) as ReturnType<typeof vec4>).r;
-        const t2 = float(2.0 / sim.size);
-        const grad = vec2(bTex(vec2(t2, 0.0)).sub(bTex(vec2(t2.negate(), 0.0))), bTex(vec2(0.0, t2)).sub(bTex(vec2(0.0, t2.negate())))).div(float(sim.cell * 4));
-        const gentle = smoothstep(1.2, 0.5, grad.length());
-        const ceiling = waterLevel.add(float(0.03).add((sim.swellAmplitude as unknown as ReturnType<typeof float>).mul(1.5).mul(gentle)));
-        const etaTap = (o: ReturnType<typeof vec2>) => {
-          const uv = q.add(o);
-          const d = ((sim.stateNode.sample(uv) as typeof sim.stateNode).level(float(0.0)) as ReturnType<typeof vec4>).r;
-          const b = (texture(heightTexture, uv).level(float(0.0)) as ReturnType<typeof vec4>).r;
-          return select(d.greaterThan(0.002), b.add(d), min(b, waterLevel.add(0.02)));
-        };
-        const eta = etaTap(vec2(h, h)).add(etaTap(vec2(h.negate(), h))).add(etaTap(vec2(h, h.negate()))).add(etaTap(vec2(h.negate(), h.negate()))).mul(0.25);
-        return min(eta, ceiling);
-      });
+    // The free surface, and nothing else: eta = b + d, the bed plus the column the
+    // solver holds over it. A dry cell is d = 0, so the sheet lies exactly on the
+    // sand and the surface is continuous from the lagoon to the top of the beach.
+    //
+    // What stood here before made the teeth. A dry cell was pinned to
+    // min(b, level + 2 cm) while its wet neighbour was b + d: on a beach, where b is
+    // already above the line, that is a cliff of a few centimetres between one cell
+    // and the next, and a ceiling of level + 3 cm + 1.5 A cut the wet side flat —
+    // a row of spikes as tall as the ceiling, one per wet cell, and a plateau
+    // slicing through the sand. Both are gone; whether a thin sheet is DRAWN is the
+    // fragment's decision (see the film coverage), never the geometry's.
+    const q = sim.uvOf(xz) as unknown as ReturnType<typeof vec2>;
+    const h = float(0.5 / sim.size);
+    const etaTap = (o: ReturnType<typeof vec2>) => {
+      const uv = q.add(o);
+      const d = ((sim.stateNode.sample(uv) as typeof sim.stateNode).level(float(0.0)) as ReturnType<typeof vec4>).r;
+      const b = (texture(heightTexture, uv).level(float(0.0)) as ReturnType<typeof vec4>).r;
+      return b.add(d);
+    };
+    return etaTap(vec2(h, h)).add(etaTap(vec2(h.negate(), h))).add(etaTap(vec2(h, h.negate()))).add(etaTap(vec2(h.negate(), h.negate()))).mul(0.25);
+  });
   /** Wind waves at (x, z): height and slope, shoaled by the local depth. */
   const windAt = Fn(([xz]: [ReturnType<typeof vec2>]) => {
     const depth = waterLevel.sub(sandHeight(xz));
@@ -519,7 +517,9 @@ export function createWater(options: WaterOptions): Water {
       // strays from the analytic bed it is drawn on. It is never seated on the scene
       // depth: a vertex behind a rock, the ball or a nearer fold of sand reads THAT
       // surface and rises to it, which stood a curtain of water at every contact.
-      material.positionNode = vec3(positionLocal.x, waterLevel.add(fieldAt(positionLocal.xz).x).add(0.004), positionLocal.z);
+      // Half a millimetre, not four: the lift only has to beat the depth buffer, and
+      // four stood the run-up's film proud of the sand wherever the sand mesh dipped.
+      material.positionNode = vec3(positionLocal.x, waterLevel.add(fieldAt(positionLocal.xz).x).add(0.0005), positionLocal.z);
     }
 
     // --- normal ------------------------------------------------------------------
@@ -541,7 +541,11 @@ export function createWater(options: WaterOptions): Water {
     const sceneZ0 = perspectiveDepthToViewZ(sceneDepth0, cameraNear, cameraFar);
     // The overlay pass has its own depth buffer; the scene's is applied by hand, inside
     // the emissive Fn below — a bare `Discard` outside a stack is never emitted.
-    const behindScene = viewZ.lessThan(sceneZ0.sub(0.003));
+    // Near the shore the sheet and the sand are all but coplanar, and a hard test
+    // between them flips from pixel to pixel along the sand's triangles: that flip is
+    // the accordion at every contact. The sheet fades out over the last 6 cm instead
+    // (see `contact`), and is only cut where it is unambiguously behind.
+    const behindScene = viewZ.sub(sceneZ0).lessThan(-0.06);
 
     // --- Snell refraction (grill Q26/Q39) -------------------------------------------
     // The view ray bends at the surface (n = 1.333). The refracted ray is intersected
@@ -769,8 +773,13 @@ export function createWater(options: WaterOptions): Water {
     const covered = filmCoverage.mul(floorCoverage);
     const thinFilm = !gateOn ? float(0.0).greaterThan(1.0) : top ? covered.lessThanEqual(0.0) : cutDry;
     const filmFade = !gateOn ? float(1.0) : top ? covered.mul(contact) : contact;
+    // `?waterWire=1` draws the sheet as its own mesh: the shape of the surface, with
+    // nothing shaded over it. The only way to tell a defect of the geometry from one
+    // of the gate — and the tool this session did not have.
+    if (params.get('waterWire') === '1') material.wireframe = true;
     const debug: THREE.Node | null =
-      debugMode === 'depth' ? vec3(verticalDepth.mul(0.5))
+      debugMode === 'eta' ? vec3(p.y.sub(waterLevel).mul(6.0).add(0.5), float(0.5), float(0.5))
+      : debugMode === 'depth' ? vec3(verticalDepth.mul(0.5))
       : debugMode === 'path' ? vec3(pathLength.mul(0.3))
       : debugMode === 'foam' ? vec3(foamMask)
       : debugMode === 'impact' ? vec3(foamField.sample(p.xz.div(slabHalf.mul(2.0)).add(0.5)).b, simState.a, 0.0)
@@ -788,7 +797,8 @@ export function createWater(options: WaterOptions): Water {
   // --- geometry ------------------------------------------------------------------
   const group = new THREE.Group();
   group.name = 'water';
-  group.add(spray.mesh);
+  // `?spray=0` leaves the droplets out: what is left at a contact is the sheet.
+  if (params.get('spray') !== '0') group.add(spray.mesh);
 
   const top = new THREE.PlaneGeometry(2 * half, 2 * half, 512, 512);
   top.rotateX(-Math.PI / 2);
@@ -862,7 +872,9 @@ export function createWater(options: WaterOptions): Water {
 
   // Numbers, not impressions: `__water.simStats()` reads the state back, and
   // `?waterInspect=1` (or `=z:<metres>`) draws the map and a section on screen.
-  (window as unknown as Record<string, unknown>).__water = {
+  // `__lagoon`, not `__water`: another session owns that name on this page, and its
+  // value is a function — every probe of mine was silently reading theirs.
+  (window as unknown as Record<string, unknown>).__lagoon = {
     simStats: async () => sim.readStats(),
     simProbe: async () => sim.readProbe(),
     sprayStats: async () => spray.readStats(),
@@ -872,6 +884,12 @@ export function createWater(options: WaterOptions): Water {
       const out: number[][] = [];
       for (let x = -half; x <= half; x += 0.1) out.push([Number(x.toFixed(2)), Number((field.height(x, z) - field.waterLevel).toFixed(3))]);
       return out;
+    },
+    /** One row of the solver's depth, as cells: for looking at the front cell by cell. */
+    depthRow: async (z: number) => {
+      const size = sim.size;
+      const j = Math.max(0, Math.min(size - 1, Math.floor(((z + half) / (2 * half)) * size)));
+      return { size, cell: (2 * half) / size, depth: Array.from(await sim.readRow(j)) };
     },
     simRow: async (z: number) => {
       const size = sim.size;

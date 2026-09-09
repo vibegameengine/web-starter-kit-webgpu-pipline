@@ -58,10 +58,15 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
   camera.updateProjectionMatrix();
   camera.position.set(-15.5, 14.5, 20.5);
   controls.target.set(0.4, -0.7, 0.0);
-  // Close-up presets for judging detail: `?cam=shore|rocks|water|wide`.
+  // Close-up presets for judging detail: `?cam=shore|rocks|water|eye|surf`.
+  // `eye` and `surf` stand at the water's own level, which is the only place a
+  // defect in the SHAPE of the sheet can be seen at all — from above it hides
+  // behind the surface it deforms.
   const presets: Record<string, [THREE.Vector3, THREE.Vector3]> = {
     shore: [new THREE.Vector3(1.8, 2.4, 6.5), new THREE.Vector3(0.2, -0.3, 1.5)],
     rocks: [new THREE.Vector3(-5.5, 3.0, 0.5), new THREE.Vector3(-2.5, -0.4, -3.8)],
+    eye: [new THREE.Vector3(-2.2, 0.08, 4.6), new THREE.Vector3(1.6, 0.02, 0.2)],
+    surf: [new THREE.Vector3(-0.6, 0.12, 3.4), new THREE.Vector3(2.6, 0.06, -0.6)],
     water: [new THREE.Vector3(-2.0, 3.5, 7.5), new THREE.Vector3(-1.5, -0.6, 1.5)],
     // Materials: the nearest trunk at arm's length, and the crown fronds with the
     // undergrowth against the sun.
@@ -77,7 +82,18 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
     // lobe and the shadow-carved shafts are only visible from here.
     sunward: [new THREE.Vector3(-6.0, 1.5, -7.5), new THREE.Vector3(3.0, 4.0, 0.0)],
   };
-  const preset = presets[new URLSearchParams(window.location.search).get('cam') ?? ''];
+  // `?camPos=x,y,z&camTarget=x,y,z` puts the eye anywhere, for a defect a preset misses.
+  const search = new URLSearchParams(window.location.search);
+  const triple = (key: string) => {
+    const raw = search.get(key)?.split(',').map(Number);
+    return raw?.length === 3 && raw.every(Number.isFinite) ? new THREE.Vector3(raw[0], raw[1], raw[2]) : null;
+  };
+  const free = triple('camPos');
+  if (free) {
+    camera.position.copy(free);
+    controls.target.copy(triple('camTarget') ?? new THREE.Vector3(0, 0, 0));
+  }
+  const preset = presets[search.get('cam') ?? ''];
   if (preset) {
     camera.position.copy(preset[0]);
     controls.target.copy(preset[1]);

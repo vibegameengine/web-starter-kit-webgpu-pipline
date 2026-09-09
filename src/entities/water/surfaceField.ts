@@ -1,5 +1,5 @@
 import * as THREE from 'three/webgpu';
-import { Fn, float, texture, uniform, uv, vec2, vec3, vec4 } from 'three/tsl';
+import { Fn, clamp, float, min, smoothstep, texture, uniform, uv, vec2, vec3, vec4 } from 'three/tsl';
 
 /**
  * The free surface, baked once per frame into one texture over the slab
@@ -82,11 +82,19 @@ export class SurfaceField {
       const etaB = at(vec2(0.0, h.negate()));
       const etaF = at(vec2(0.0, h));
       const simSlope = vec2(etaR.sub(etaL), etaF.sub(etaB)).div(h.mul(2.0));
-      // Wind waves ride on it; the rim seals both to the still-water line.
+      // Wind waves ride on it, but no wave is taller than the water carrying it:
+      // a wave breaks past H ≈ 0.4 h (Miche/McCowan), so on the run-up's millimetres
+      // the ripples are millimetres too. Judged on the film's real depth, not the
+      // still-water one — that was letting 5 cm ripples stand on a 1 mm sheet at the
+      // shoreline, one spike per wavelength, and they are the teeth along the beach.
+      const depth = film(xz) as F;
       const w = wind(xz) as V3;
-      const eta = etaC.sub(level).add(w.x.min(float(windCap))).mul(mask);
-      const slope = simSlope.add(w.yz).mul(mask);
-      return vec4(eta, slope.x, slope.y, film(xz) as F);
+      const cap = min(float(windCap), depth.mul(0.4));
+      const rise = clamp(w.x, cap.negate(), cap);
+      const alive = smoothstep(0.0, 0.05, depth);
+      const eta = etaC.sub(level).add(rise).mul(mask);
+      const slope = simSlope.add(w.yz.mul(alive)).mul(mask);
+      return vec4(eta, slope.x, slope.y, depth);
     })();
     this.quad = new THREE.QuadMesh(material);
   }

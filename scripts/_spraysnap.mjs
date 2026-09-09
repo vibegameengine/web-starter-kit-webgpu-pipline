@@ -10,11 +10,11 @@ const browser = await chromium.launch({ channel: 'chrome', headless: true, args:
 const page = await browser.newPage({ viewport: { width: 1600, height: 900 } });
 page.on('pageerror', e => console.log('pageerror', String(e).slice(0, 300)));
 await page.goto(`http://127.0.0.1:5188/?scene=beach&hud=0&mode=surfel&bake=0&cam=${cam}&sprayTest=${arg('--test', '0')}`);
-await page.waitForFunction(() => !!window.__water && document.querySelector('#loading-overlay')?.hidden, null, { timeout: 240000 });
+await page.waitForFunction(() => !!window.__lagoon && document.querySelector('#loading-overlay')?.hidden, null, { timeout: 240000 });
 await page.waitForTimeout(3000);
 let best = 0;
 for (let i = 0; i < 120; i++) {
-  const { alive } = await page.evaluate(() => window.__water.sprayStats());
+  const { alive } = await page.evaluate(() => window.__lagoon.sprayStats());
   best = Math.max(best, alive);
   if (alive >= min) { console.log('alive', alive, 'at poll', i); break; }
   await page.waitForTimeout(150);
