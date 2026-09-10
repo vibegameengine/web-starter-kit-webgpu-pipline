@@ -1,4 +1,4 @@
-// @ts-nocheck -- vendored from jure/webgiya; kept byte-compatible so upstream fixes can be re-applied.
+// @ts-nocheck -- based on jure/webgiya, with pinned/static ownership in the lifecycle.
 // src/surfelAgePass.ts
 
 import * as THREE from 'three/webgpu';
@@ -16,6 +16,7 @@ import {
   max,
   min,
   abs,
+  Loop,
 } from 'three/tsl';
 import { SurfelStruct, type SurfelPool } from './surfelPool';
 import {
@@ -27,6 +28,8 @@ import {
   SURFEL_KILL_SIGNAL,
   SURFEL_TTL,
   MAX_SURFELS_PER_CELL,
+  RESOLVE_CELL_SCAN_CAP,
+  OFFSETS_AND_LIST_START,
 } from './constants';
 import type { SurfelHashGrid } from './surfelHashGrid';
 import {
@@ -36,6 +39,8 @@ import {
   snap_to_surfel_grid_origin,
 } from './surfelHashGrid';
 import type { SurfelFindMissingPass } from './surfelFindMissingPass';
+import { previousReceiverPosition } from './surfelMotion';
+import { bindSurfelAnchors } from './surfelAnchors';
 
 export type SurfelAgePass = {
   run: (
@@ -45,13 +50,18 @@ export type SurfelAgePass = {
     grid: SurfelHashGrid,
     prevCameraPos: THREE.Vector3,
     indirectAttr: THREE.IndirectStorageBufferAttribute,
+    options?: { hybridLive?: boolean; motion?: any },
   ) => void;
 };
 
 export function createSurfelAgePass(): SurfelAgePass {
   let computeNode: THREE.ComputeNode | null = null;
+  let lastAnchorAttr = null;
+  let lastMotionObjects = null;
   const U_PREV_CAM_POS = uniform(new THREE.Vector3());
   const U_PREV_GRID_ORIGIN = uniform(new THREE.Vector3());
+  const U_HYBRID_LIVE = uniform(0);
+  const U_MOTION = uniform(0);
 
   function run(
     renderer: THREE.WebGPURenderer,
@@ -60,7 +70,10 @@ export function createSurfelAgePass(): SurfelAgePass {
     grid: SurfelHashGrid,
     prevCameraPos: THREE.Vector3,
     indirectAttr: THREE.IndirectStorageBufferAttribute,
+    options: { hybridLive?: boolean; motion?: any } = {},
   ) {
+    U_HYBRID_LIVE.value = options.hybridLive ? 1 : 0;
+    U_MOTION.value = options.motion?.active ? 1 : 0;
     const surfelAttr = pool.getSurfelAttr();
     const poolAlloc = pool.getPoolAllocAtomic();
     const poolMax = pool.getPoolMaxAtomic();
@@ -85,9 +98,16 @@ export function createSurfelAgePass(): SurfelAgePass {
 
     const capacity = surfelAttr.count;
 
+    if (lastAnchorAttr !== pool.getAnchorAttr() || lastMotionObjects !== options.motion?.objects) {
+      lastMotionObjects = options.motion?.objects;
+      computeNode?.dispose(); computeNode = null; lastAnchorAttr = pool.getAnchorAttr();
+    }
+
     if (!computeNode) {
       const poolStore = storage(poolAttr, 'int', capacity);
       const surfelStore = storage(surfelAttr, SurfelStruct, capacity);
+      const anchors = bindSurfelAnchors(pool);
+      const objects = options.motion?.objects;
       const offsetsAndListStore = storage(
         offsetsAndListAttr,
         'int',
@@ -131,7 +151,11 @@ export function createSurfelAgePass(): SurfelAgePass {
 
               // --- Calculate Rent (Crowding) ---
               const posb = surfel.get('posb');
-              const pRel = posb.xyz.sub(U_PREV_GRID_ORIGIN);
+              const anchor = anchors.position(idx);
+              const anchorNormal = anchors.normal(idx);
+              const owner = anchorNormal.w.equal(posb.w).and(U_MOTION.greaterThan(0.5)).select(anchor.w, float(0));
+              const previousPos = objects ? previousReceiverPosition(posb.xyz, owner, objects) : posb.xyz;
+              const pRel = previousPos.sub(U_PREV_GRID_ORIGIN);
               const gridCoord = surfel_pos_to_grid_coord(pRel);
               const c4 = surfel_grid_coord_to_c4(gridCoord);
               const hashVal = surfel_grid_c4_to_hash(c4);
@@ -139,7 +163,26 @@ export function createSurfelAgePass(): SurfelAgePass {
 
               const start = offsetsAndListStore.element(cellIdx);
               const end = offsetsAndListStore.element(cellIdx.add(1));
-              const count = end.sub(start);
+              const count = end.sub(start).toVar();
+              If(U_HYBRID_LIVE.greaterThan(0.5), () => {
+                // Only interchangeable samples compete for density. Another rigid
+                // receiver (or its opposite-facing surface) cannot cover this one.
+                // Charging its population as rent can retire an entire visible
+                // patch after FindMissing has already declared it covered.
+                const scanned = min(count, int(RESOLVE_CELL_SCAN_CAP)).toVar();
+                count.assign(0);
+                Loop(scanned, ({ i }) => {
+                  const sid = offsetsAndListStore.element(int(OFFSETS_AND_LIST_START).add(start).add(i));
+                  const neighbour = surfelStore.element(sid);
+                  const neighbourAnchor = anchors.position(sid);
+                  const neighbourOwner = anchors.normal(sid).w.equal(neighbour.get('posb').w)
+                    .and(U_MOTION.greaterThan(0.5)).select(neighbourAnchor.w, float(0));
+                  // The grid is the pre-economy membership snapshot. Do not test
+                  // age < TTL here: neighbouring threads retire in this same pass.
+                  If(neighbour.get('age').greaterThanEqual(int(0)).and(neighbourOwner.equal(owner))
+                    .and(neighbour.get('normal').dot(surfel.get('normal')).greaterThan(0.8)), () => { count.addAssign(1); });
+                });
+              });
 
               const SAFE_CAP = int(MAX_SURFELS_PER_CELL_FOR_KEEP_ALIVE); // e.g. 32
 

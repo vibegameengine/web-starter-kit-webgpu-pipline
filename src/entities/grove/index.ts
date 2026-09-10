@@ -28,26 +28,57 @@ export interface Grove {
   leafCount: number;
 }
 
-function buildSkirt(field: GroveField, segments = 96): THREE.BufferGeometry {
+const SKIRT_ROWS = 12;
+const SKIRT_BULGE = 0.34;
+const SKIRT_TUCK = 0.55;
+
+function rimPoint(field: GroveField, side: number, t: number): THREE.Vector3 {
   const half = field.half;
+  const s = -half + t * 2 * half;
+  if (side === 0) return new THREE.Vector3(s, 0, half);
+  if (side === 1) return new THREE.Vector3(half, 0, half - t * 2 * half);
+  if (side === 2) return new THREE.Vector3(half - t * 2 * half, 0, -half);
+  return new THREE.Vector3(-half, 0, -half + t * 2 * half);
+}
+
+function outwardOf(side: number): THREE.Vector3 {
+  if (side === 0) return new THREE.Vector3(0, 0, 1);
+  if (side === 1) return new THREE.Vector3(1, 0, 0);
+  if (side === 2) return new THREE.Vector3(0, 0, -1);
+  return new THREE.Vector3(-1, 0, 0);
+}
+
+function skirtVertex(field: GroveField, side: number, t: number, v: number): THREE.Vector3 {
+  const base = rimPoint(field, side, t);
+  const rim = field.height(base.x, base.z);
+  const y = rim + (field.bottom - rim) * (v * v * 0.25 + v * 0.75);
+  const n = field.noise;
+  const cobble = n.ridged3(base.x * 0.9 + 5, y * 1.1, base.z * 0.9, 3);
+  const lumps = n.fbm3(base.x * 1.7, y * 1.9 + 7, base.z * 1.7, 3);
+  const rounded = Math.max(0, Math.min(1, (cobble - 0.45) * 2.4));
+  const shoulder = Math.min(1, Math.max(0, (rim - y) / 0.5));
+  const tuck = SKIRT_TUCK * v * v * v;
+  const bulge = shoulder * (0.05 * lumps + SKIRT_BULGE * rounded * (0.6 + 0.4 * lumps));
+  const outward = outwardOf(side).multiplyScalar(bulge - tuck);
+  return new THREE.Vector3(base.x + outward.x, y, base.z + outward.z);
+}
+
+function buildSkirt(field: GroveField, columns = 128): THREE.BufferGeometry {
   const positions: number[] = [];
-  const rim = (t: number, side: number): THREE.Vector3 => {
-    const s = -half + t * 2 * half;
-    const point = side === 0 ? new THREE.Vector3(s, 0, half)
-      : side === 1 ? new THREE.Vector3(half, 0, half - t * 2 * half)
-      : side === 2 ? new THREE.Vector3(half - t * 2 * half, 0, -half)
-      : new THREE.Vector3(-half, 0, -half + t * 2 * half);
-    point.y = field.height(point.x, point.z);
-    return point;
-  };
   for (let side = 0; side < 4; side++) {
-    for (let i = 0; i < segments; i++) {
-      const a = rim(i / segments, side);
-      const b = rim((i + 1) / segments, side);
-      const aLow = new THREE.Vector3(a.x, field.bottom, a.z);
-      const bLow = new THREE.Vector3(b.x, field.bottom, b.z);
-      positions.push(a.x, a.y, a.z, aLow.x, aLow.y, aLow.z, b.x, b.y, b.z);
-      positions.push(b.x, b.y, b.z, aLow.x, aLow.y, aLow.z, bLow.x, bLow.y, bLow.z);
+    for (let c = 0; c < columns; c++) {
+      for (let r = 0; r < SKIRT_ROWS; r++) {
+        const t0 = c / columns;
+        const t1 = (c + 1) / columns;
+        const v0 = r / SKIRT_ROWS;
+        const v1 = (r + 1) / SKIRT_ROWS;
+        const a = skirtVertex(field, side, t0, v0);
+        const b = skirtVertex(field, side, t1, v0);
+        const d = skirtVertex(field, side, t0, v1);
+        const e = skirtVertex(field, side, t1, v1);
+        positions.push(a.x, a.y, a.z, d.x, d.y, d.z, b.x, b.y, b.z);
+        positions.push(b.x, b.y, b.z, d.x, d.y, d.z, e.x, e.y, e.z);
+      }
     }
   }
   const geometry = new THREE.BufferGeometry();
@@ -59,7 +90,8 @@ function buildSkirt(field: GroveField, segments = 96): THREE.BufferGeometry {
 }
 
 function buildUnderside(field: GroveField): THREE.BufferGeometry {
-  const geometry = new THREE.PlaneGeometry(2 * field.half, 2 * field.half, 1, 1);
+  const width = 2 * (field.half - SKIRT_TUCK);
+  const geometry = new THREE.PlaneGeometry(width, width, 1, 1);
   geometry.rotateX(Math.PI / 2);
   geometry.translate(0, field.bottom, 0);
   return geometry;

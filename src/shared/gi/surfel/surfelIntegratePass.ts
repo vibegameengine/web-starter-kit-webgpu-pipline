@@ -79,7 +79,7 @@ export type SurfelIntegratePass = {
    * fetch against a hash-grid walk of up to 32 entries. Changing the texture rebuilds
    * the kernel, so hand it a stable object.
    */
-  setBakedAtlas: (texture: THREE.Texture | null) => void;
+  setBakedAtlas: (texture: THREE.Texture | null, intensity?: unknown) => void;
   /**
    * `scene` rather than a light: the tracer reads every analytic light in the graph out
    * of the storage buffer `sceneLights.ts` refreshes here. It used to take one
@@ -619,6 +619,8 @@ export function createSurfelIntegratePass(
 ): SurfelIntegratePass {
   let computeNode: THREE.ComputeNode | null = null;
   let bakedAtlas: THREE.Texture | null = null;
+  /** @important The raster multiplies the atlas by this; a bounce ray must use the same gain. */
+  let bakedAtlasIntensity: unknown = null;
   let lastSchedule = null;
 
   // Uniforms
@@ -961,7 +963,11 @@ export function createSurfelIntegratePass(
           dynBounds: vec4f,
           diffuseLodScale: f32,
           medium: vec4f,
-        ) -> void {
+${bakedAtlas ? `          bakeUvTex: texture_2d<f32>,
+          atlasTex: texture_2d<f32>,
+          atlasSampler: sampler,
+          atlasIntensity: f32,
+` : ''}        ) -> void {
           let index = instanceIndex;
           // let total = atomicLoad(&poolMax[0]);
           // if (i32(index) >= total) { return; }
@@ -1247,11 +1253,49 @@ export function createSurfelIntegratePass(
                   emissiveBase, emissiveScale
                 );
 
-                // A secondary bounce reads the surfel cache, static or dynamic alike.
-                // It used to read the virtual lightmap's pages at static hits, with a
-                // hit-cone LOD and a residency vote; that machinery is gone (see
-                // commit 34de65e) because the atlas is resident in full.
-                var gi = lookupSurfelGI(hitPoint, hitNormal, camPos, gridOrigin, readOffset, occParams, lightU);
+                // @important A secondary bounce takes its light from the baked atlas when the hit
+                // is on static geometry the unwrap gave a chart, and from the surfel
+                // cache otherwise: one texture fetch against a hash-grid walk of up to
+                // 32 entries.
+                //
+                // The two sources are NOT measured equal, and nothing here should be
+                // read as claiming they are. On the beach at cam=leaves, atlasHits on
+                // against off moved 4942 pixels past 10/255 (max 74) where two
+                // identical runs of the same pose moved 1484 (max 29). The leading
+                // suspect is the atlas itself rather than this branch: the saved bake
+                // predates both the van and the switch to sunIntensity 'environment',
+                // and only a hand deletion re-bakes it. Re-measure after a forced
+                // re-bake (?bakeCache=0) before blaming the read.
+                //
+                // The fallback is not a rare corner. Palm and shrub leaves, the shrub
+                // stems and the island's underside all set userData.lightmap = false
+                // and reach the BVH with bakeUv at the -1 sentinel, as do the cluster
+                // proxy triangles, so on the beach most of what a ray can hit still
+                // walks the cache.
+                var gi = vec3f(0.0);
+${bakedAtlas ? `                var fromAtlas = false;
+                if (!hit.isDynamic) {
+                  // uv1 lives in a texture rather than a fifteenth storage buffer:
+                  // vertex i sits at (i % width, i / width), and -1 in either channel
+                  // is the sentinel for a vertex the unwrap refused.
+                  let w = i32(textureDimensions(bakeUvTex).x);
+                  let ia = i32(hit.indices.x); let ib = i32(hit.indices.y); let ic = i32(hit.indices.z);
+                  let a = textureLoad(bakeUvTex, vec2i(ia % w, ia / w), 0).xy;
+                  let b = textureLoad(bakeUvTex, vec2i(ib % w, ib / w), 0).xy;
+                  let c = textureLoad(bakeUvTex, vec2i(ic % w, ic / w), 0).xy;
+                  fromAtlas = all(a >= vec2f(0.0)) && all(b >= vec2f(0.0)) && all(c >= vec2f(0.0));
+                  if (fromAtlas) {
+                    let bc = hit.barycoord;
+                    let atlasUv = a * bc.x + b * bc.y + c * bc.z;
+                    // @important The same gain the raster applies (applyLightmap): without it the
+                    // knob dims what the eye sees and leaves the bounce carrying the
+                    // undimmed value, and one physical quantity becomes two.
+                    gi = textureSampleLevel(atlasTex, atlasSampler, atlasUv, 0.0).rgb * atlasIntensity;
+                  }
+                }
+                if (!fromAtlas) { gi = lookupSurfelGI(hitPoint, hitNormal, camPos, gridOrigin, readOffset, occParams, lightU); }
+` : `                gi = lookupSurfelGI(hitPoint, hitNormal, camPos, gridOrigin, readOffset, occParams, lightU);
+`}
                 bounceLi += gi * hitAlbedo * giFromIndirect;
               } else {
                 // Basic Sky
@@ -1428,6 +1472,14 @@ export function createSurfelIntegratePass(
         emissiveBase: U_GI_EMISSIVE_BASE,
         emissiveScale: U_GI_EMISSIVE_SCALE,
         medium: U_GI_MEDIUM,
+        // Only bound when the atlas exists; without it the kernel has no such
+        // parameters and every hit walks the surfel cache.
+        ...(bakedAtlas ? {
+          bakeUvTex: texture(bvh.lightmapUvTexture),
+          atlasTex: texture(bakedAtlas),
+          atlasSampler: sampler(bakedAtlas),
+          atlasIntensity: bakedAtlasIntensity ?? uniform(1),
+        } : {}),
         camPos: U_CAM_POS,
         gridOrigin: U_GRID_ORIGIN,
         blueNoiseTex: blueNoiseTexN,
@@ -1454,7 +1506,8 @@ export function createSurfelIntegratePass(
   return {
     run,
     invalidate: () => { computeNode?.dispose(); computeNode = null; },
-    setBakedAtlas: (value: THREE.Texture | null) => {
+    setBakedAtlas: (value: THREE.Texture | null, intensity?: unknown) => {
+      bakedAtlasIntensity = intensity ?? bakedAtlasIntensity;
       if (value === bakedAtlas) return;
       bakedAtlas = value;
       computeNode?.dispose();

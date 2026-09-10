@@ -115,12 +115,12 @@ export const bvhIntersectFirstHitBudget = wgslFn( /* wgsl */ `
 
 		bestHit.didHit = false;
 		bestHit.dist = INFINITY;
+		bestHit.exhausted = false;
 
 		loop {
 
 			if ( pointer < 0 || pointer >= i32( BVH_STACK_DEPTH ) ) { break; }
-			if ( visited >= maxNodes ) { break; }
-			visited = visited + 1u;
+			if ( visited >= maxNodes ) { bestHit.exhausted = true; break; }
 
 			let currNodeIndex = stack[ pointer ];
 			let node = bvh.value[ currNodeIndex ];
@@ -129,7 +129,12 @@ export const bvhIntersectFirstHitBudget = wgslFn( /* wgsl */ `
 
 			var boundsHitDistance: f32 = 0.0;
 
+			// A node culled by its bounds is not a visit: it costs one box test, not the
+			// descent the ceiling is meant to bound. Counting it made the real budget an
+			// unknown fraction of the number asked for.
 			if ( ! intersectsBounds( ray, node.bounds, &boundsHitDistance ) || boundsHitDistance > bestHit.dist ) { continue; }
+
+			visited = visited + 1u;
 
 			let boundsInfox = node.splitAxisOrTriangleCount;
 			let boundsInfoy = node.rightChildOrTriangleOffset;
@@ -139,7 +144,15 @@ export const bvhIntersectFirstHitBudget = wgslFn( /* wgsl */ `
 			if ( isLeaf ) {
 
 				let localHit = intersectTriangles( boundsInfoy, boundsInfox & 0x0000ffffu, ray );
-				if ( localHit.didHit && localHit.dist < bestHit.dist ) { bestHit = localHit; }
+				// Field by field, not a whole-struct assignment: intersectTriangles never sets
+				// the exhausted flag, so copying its result over bestHit would erase a ceiling that
+				// had already been reached. Today WGSL zero-initialises it and the two agree
+				// by luck; this does not depend on that.
+				if ( localHit.didHit && localHit.dist < bestHit.dist ) {
+					let wasExhausted = bestHit.exhausted;
+					bestHit = localHit;
+					bestHit.exhausted = wasExhausted;
+				}
 
 			} else {
 

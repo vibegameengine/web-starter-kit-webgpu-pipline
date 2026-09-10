@@ -2,8 +2,11 @@ import GUI from 'lil-gui';
 
 import { initRenderer } from '../shared/render/index.ts';
 import { createLightingPipeline, type SceneHost } from '../features/lighting-pipeline/index.ts';
-import { createBeachScene, createCornellScene, createForestScene, populateCornell } from '../widgets/world/index.ts';
-import { addGuiSettingsSave, applyGuiSettings, guiSettingsApply, loadGuiSettings } from './guiSettings.ts';
+import { createRenderPipeline } from '../features/render-pipeline/index.ts';
+import { staticInteriorVolume } from '../shared/gi/probes/index.ts';
+import { createBeachScene, createCorridorScene, createCornellScene, createForestScene, populateCornell } from '../widgets/world/index.ts';
+import { applyGuiSettings, loadGuiSettings, settingsProfile, settingsSceneName } from './guiSettings.ts';
+import { addGuiSettingsControls } from './guiSettingsPanel.ts';
 
 const loadingOverlay = document.querySelector<HTMLElement>('#loading-overlay');
 const loadingMessage = document.querySelector<HTMLElement>('#loading-message');
@@ -61,30 +64,35 @@ async function boot(): Promise<void> {
     (renderer.inspector as unknown as { domElement?: HTMLElement }).domElement?.style.setProperty('display', 'none');
   }
 
-  // The panel's saved state (`config/gui-settings.json`) replaces the code defaults;
-  // it is applied once before the bake (the sun) and once after the panel is complete.
-  const saved = guiSettingsApply(params) ? await loadGuiSettings() : null;
+  const settingsScene = settingsSceneName(params);
+  const profile = settingsProfile(params);
+  const saved = await loadGuiSettings(settingsScene, profile);
   const ui = { setLoading, clearLoading, showError, showChrome, applySavedSettings: (target: GUI) => applyGuiSettings(target, saved) };
-  const pipeline = await createLightingPipeline(renderer, ui);
+  const pipeline = params.get('pipeline') === 'legacy'
+    ? await createLightingPipeline(renderer, ui)
+    : await createRenderPipeline(renderer, ui);
 
   setLoading('Building scene');
   let host: SceneHost;
   if (params.get('scene') === 'forest') {
     const forest = await createForestScene(renderer);
     host = { ...forest, skyIsBackground: false, moverByDefault: false, sunIntensity: 'environment' };
+  } else if (params.get('scene') === 'corridor') {
+    const corridor = await createCorridorScene(renderer);
+    host = { ...corridor, skyIsBackground: true, moverByDefault: false, sunIntensity: 'environment', interiorVolumes: [staticInteriorVolume(corridor.scene)] };
   } else if (params.get('scene') === 'beach') {
     const beach = await createBeachScene(renderer, pipeline.envTexture);
-    host = { ...beach, skyIsBackground: false, moverByDefault: false, sunIntensity: 'environment' };
+    host = { ...beach, skyIsBackground: false, moverByDefault: false, sunIntensity: 'environment', reflections: { denoisePasses: 1 } };
   } else {
     const cornell = createCornellScene(renderer);
     setLoading('Building Cornell box');
     populateCornell(cornell.scene, cornell.sun);
-    host = { ...cornell, skyIsBackground: true, moverByDefault: true };
+    host = { ...cornell, skyIsBackground: true, moverByDefault: true, interiorVolumes: [staticInteriorVolume(cornell.scene)] };
   }
 
   await pipeline.run(host, gui, ui);
   applyGuiSettings(gui, saved);
-  addGuiSettingsSave(gui, ui);
+  addGuiSettingsControls(gui, settingsScene, profile, ui);
 }
 
 boot().catch(showError);

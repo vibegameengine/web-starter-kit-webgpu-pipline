@@ -28,7 +28,8 @@ export interface ForestScene {
 }
 
 const CAMERA_PRESETS: Record<string, [THREE.Vector3, THREE.Vector3]> = {
-  hero: [new THREE.Vector3(-16.0, 12.5, 19.0), new THREE.Vector3(0.0, 1.0, -0.8)],
+  hero: [new THREE.Vector3(-17.0, 12.0, 20.5), new THREE.Vector3(0.0, 0.4, -0.6)],
+  wide: [new THREE.Vector3(-16.0, 12.5, 19.0), new THREE.Vector3(0.0, 1.0, -0.8)],
   trail: [new THREE.Vector3(3.4, 2.0, 5.4), new THREE.Vector3(1.6, 0.6, -1.8)],
   stream: [new THREE.Vector3(-0.6, 2.2, 3.0), new THREE.Vector3(-3.0, 0.5, -1.6)],
   ledge: [new THREE.Vector3(0.4, 1.8, -0.4), new THREE.Vector3(-3.4, 0.6, -2.6)],
@@ -37,13 +38,10 @@ const CAMERA_PRESETS: Record<string, [THREE.Vector3, THREE.Vector3]> = {
 };
 
 const SPRUCES = [
-  { x: 4.2, z: -2.6, height: 9.5, seed: 11 },
-  { x: 3.0, z: -4.8, height: 8.0, seed: 12 },
-  { x: 5.2, z: -5.2, height: 7.0, seed: 13 },
-  { x: -0.6, z: -5.4, height: 6.2, seed: 14 },
-  { x: -4.4, z: -5.0, height: 5.4, seed: 15 },
-  { x: 1.4, z: -3.2, height: 4.4, seed: 16 },
-  { x: -5.0, z: -2.2, height: 3.6, seed: 17 },
+  { x: 4.4, z: -2.2, height: 9.0, seed: 11 },
+  { x: 3.2, z: -5.0, height: 7.6, seed: 12 },
+  { x: -4.6, z: -4.6, height: 4.6, seed: 15 },
+  { x: -3.0, z: -5.6, height: 3.4, seed: 16 },
 ];
 
 const BOULDERS = [
@@ -58,13 +56,17 @@ const BOULDERS = [
 ];
 
 const BACKGROUND_PINES = [
-  { x: -5.4, z: -5.6, height: 6.4, seed: 31 },
-  { x: -2.6, z: -6.0, height: 7.2, seed: 32 },
-  { x: 0.8, z: -6.1, height: 8.1, seed: 33 },
-  { x: 5.8, z: -3.4, height: 6.8, seed: 34 },
-  { x: 5.9, z: 0.6, height: 5.6, seed: 35 },
-  { x: -5.8, z: 0.4, height: 5.2, seed: 36 },
+  { x: 0.6, z: -6.0, height: 8.4, seed: 33 },
+  { x: 5.9, z: -4.6, height: 7.0, seed: 34 },
 ];
+
+const DISTANT_TEMPLATE_HEIGHT = 12;
+const DISTANT_STAND_COUNT = 26;
+const DISTANT_STAND_NEAR = 30.0;
+const DISTANT_STAND_FAR = 75.0;
+const DISTANT_STAND_SINK = 0.4;
+const DISTANT_STAND_BEARING = -0.89;
+const DISTANT_STAND_SPREAD = 0.42;
 
 const SCATTER_COUNT = 90;
 const SCATTER_MIN_HEIGHT = 0.25;
@@ -131,7 +133,7 @@ function buildStreamRibbon(field: GroveField, stream: StreamMaterial, samples = 
   const positions: number[] = [];
   const halfWidth = field.streamHalfWidth * 1.15;
   const surface = (p: THREE.Vector2) => field.streamSurface(p.x, p.y);
-  const rim = field.half - 0.25;
+  const rim = field.half - 0.7;
   for (let i = 0; i < samples; i++) {
     const a = field.streamCentre(i / samples);
     const b = field.streamCentre((i + 1) / samples);
@@ -152,6 +154,23 @@ function buildStreamRibbon(field: GroveField, stream: StreamMaterial, samples = 
   mesh.name = 'groveStream';
   mesh.receiveShadow = true;
   return mesh;
+}
+
+function distantStand(variants: EzPine[]): THREE.Group {
+  const group = new THREE.Group();
+  group.name = 'distantStand';
+  const random = seededRandom(9091);
+  for (let i = 0; i < DISTANT_STAND_COUNT; i++) {
+    const angle = DISTANT_STAND_BEARING + (random() * 2 - 1) * DISTANT_STAND_SPREAD;
+    const distance = DISTANT_STAND_NEAR + random() * (DISTANT_STAND_FAR - DISTANT_STAND_NEAR);
+    const height = 11 + random() * 10;
+    const plant = cloneEzPlant(variants[i % variants.length]);
+    plant.scale.setScalar(height / DISTANT_TEMPLATE_HEIGHT);
+    plant.position.set(Math.cos(angle) * distance, -DISTANT_STAND_SINK - random() * 1.5, Math.sin(angle) * distance);
+    plant.rotation.y = random() * Math.PI * 2;
+    group.add(plant);
+  }
+  return group;
 }
 
 function scatterUndergrowth(field: GroveField, variants: EzPine[]): THREE.Group {
@@ -207,6 +226,12 @@ function populate(scene: THREE.Scene, field: GroveField, maps: ForestMaps): void
     bush.group.position.set(spec.x, field.height(spec.x, spec.z) - 0.02, spec.z);
     undergrowth.add(bush.group);
   }
+
+  const distantVariants = ['Pine Large', 'Pine Medium'].map((preset, index) =>
+    createEzPine({ seed: 900 + index, height: DISTANT_TEMPLATE_HEIGHT, preset: preset as EzPreset, bakeIntoLightmap: false }));
+  const distant = distantStand(distantVariants);
+  scene.add(distant);
+  applyMobility(distant, Mobility.Static);
 
   const variants = ['Bush 1', 'Bush 2', 'Bush 3'].map((preset, index) =>
     createEzPine({ seed: 500 + index, height: SCATTER_MAX_HEIGHT, preset: preset as EzPreset, bakeIntoLightmap: false }));
@@ -275,20 +300,20 @@ export async function createForestScene(renderer: THREE.WebGPURenderer): Promise
 function forestMist(field: GroveField): Partial<VolumetricFogSettings> {
   return {
     enabled: true,
-    density: 0.02,
-    baseHeight: 0.1,
-    heightFalloff: 0.32,
-    center: new THREE.Vector3(0, 2.5, -1.0),
-    halfExtents: new THREE.Vector3(field.half + 1.5, 6.5, field.half + 1.5),
-    softness: 4,
-    sunIntensity: 3,
-    anisotropy: 0.72,
-    ambientIntensity: 1.0,
+    density: 0.011,
+    baseHeight: -1.6,
+    heightFalloff: 0.3,
+    center: new THREE.Vector3(0, 3.0, -6.0),
+    halfExtents: new THREE.Vector3(field.half + 60, 18, field.half + 60),
+    softness: 8,
+    sunIntensity: 16,
+    anisotropy: 0.82,
+    ambientIntensity: 0.55,
     noiseStrength: 0.6,
     noiseScale: 0.22,
     windSpeed: 0.35,
     windDirection: 30,
-    near: 0.5,
-    far: 70,
+    near: 9.0,
+    far: 90,
   };
 }

@@ -17,7 +17,7 @@ import {
   velocity,
 } from 'three/tsl';
 import { bakedIndirect } from '../gi/bake/applyLightmap.ts';
-import { DFGLUT, getViewPosition, cameraProjectionMatrixInverse, normalize, renderOutput, hash, screenCoordinate, luminance, cameraNear, cameraFar } from 'three/tsl';
+import { DFGLUT, getViewPosition, cameraProjectionMatrixInverse, cameraWorldMatrix, normalize, renderOutput, hash, screenCoordinate, luminance, metalness, roughness, cameraNear, cameraFar } from 'three/tsl';
 import { MotionBlur } from './motionBlur.ts';
 import { fxaa } from 'three/addons/tsl/display/FXAANode.js';
 import { bloom } from 'three/addons/tsl/display/BloomNode.js';
@@ -74,6 +74,7 @@ export const SplitView = {
   BentNormal: 'bentNormal',
   /** Traced specular radiance before the BRDF weight. */
   Reflections: 'reflections',
+  Baked: 'baked',
 } as const;
 export type SplitView = (typeof SplitView)[keyof typeof SplitView];
 
@@ -92,50 +93,16 @@ export interface FrameGraphOptions {
   antialiasing?: Antialiasing;
 }
 
-/**
- * Elderwood frame graph.
- *
- * ```
- * scene pass → MRT( HDR | albedo | view normal | velocity | depth )
- *            → composite( direct + indirect × albedo )      ← surfel GI resolve
- *            → FXAA
- * ```
- *
- * The composite is rebuilt on demand rather than once at construction, because the
- * GI resolve target is created lazily and replaced on resize — the same reason
- * webgiya rebuilds its composite material.
- *
- * Slots still to fill, in UE order (docs/ue-pipeline-study-and-plan.md §3.4):
- *   Phase 1  cached static/dynamic cascade shadows, feeding the base pass
- *   Phase 4  froxel fog is in (`setAtmosphere`, shared/render/atmosphere); sky LUT and
- *            aerial perspective wait for a scene with a sky
- *   Phase 5  bloom → exposure → grade → grain, and TRAA in place of FXAA
- */
 export class FrameGraph {
   readonly post: THREE.PostProcessing;
   readonly scenePass: ReturnType<typeof pass>;
 
   giMode: GiMode;
   readonly indirectIntensity = uniform(1);
-  /** Suppress realtime GI only on receivers already lit by the baked atlas. */
-  /**
-   * 1 while an atlas is published: a pixel whose receiver is baked (alpha of the
-   * albedo attachment) then keeps the atlas's light and does NOT also get the live
-   * indirect on top. Collapsing the three lighting modes into one path deleted the
-   * only place this was set and left it at 0, which adds both to every static
-   * surface — invisible only while the pool is empty and the live term is near zero.
-   */
+  /* @important 1 while an atlas is published: a baked receiver (albedo alpha) keeps the atlas light and
+     does not get the live indirect on top; the mode collapse once left this at 0 and doubled every
+     static surface. */
   readonly hybridReceivers = uniform(0);
-  /**
-   * Where the divider sits, `?splitAt=` overriding the half-and-half default.
-   *
-   * Read here rather than threaded through the composition root for the reason
-   * `surfel/knobs.ts` gives at length, and it earns its keep immediately: `?splitAt=0`
-   * turns the split view into a full-frame view of one buffer, which is the only way to
-   * diff a buffer against itself under an ablation without the beauty pass's own
-   * differences sitting in the same image. Half a frame of specular cannot answer a
-   * question about the other half.
-   */
   splitPosition = FrameGraph.readSplitAt();
   private splitView: SplitView = SplitView.Off;
   /** Supplied by the app once the GI cache exists; see gi/cacheAtlas.ts. */
@@ -154,26 +121,8 @@ export class FrameGraph {
   readonly overlayPass: ReturnType<typeof pass> | null = null;
   private readonly overlayCamera: THREE.PerspectiveCamera | null = null;
   private readonly camera: THREE.PerspectiveCamera;
-  /**
-   * Called whenever the composite is rebuilt, with the textures an overlay material
-   * reads: the composited scene colour (a render-to-texture of the beauty node) and the
-   * scene pass depth. Both change identity on rebuild and resize, hence a callback.
-   */
   onScreenTextures: ((color: THREE.Texture, depth: THREE.Texture, normal: THREE.Texture) => void) | null = null;
-  /**
-   * Participating medium over the finished composite: `(colour, rawDepth) => colour`,
-   * evaluated in linear HDR after the overlay and before AA. The depth is the nearest
-   * of the scene and overlay passes, so water is fogged at its own surface. Null = off,
-   * and nothing of it remains in the shader.
-   */
   private atmosphere: ((beauty: TslNode, depth: TslNode) => TslNode) | null = null;
-  /**
-   * Veiling glare: a zero-threshold bloom of the whole HDR frame mixed in by a small
-   * fraction, after the fog and before AA. Not a "bright things glow" effect — it is the
-   * fraction of every pixel's light that a lens and an eye scatter over their
-   * neighbours, which is what takes the cut-out hardness off edges between differently
-   * lit surfaces. Energy conserving. Both knobs are uniforms; null drops the stage.
-   */
   private glare: { strength: THREE.UniformNode<number>; radius: THREE.UniformNode<number> } | null = null;
   private antialiasing: Antialiasing;
   /** Scene-referred exposure multiplier (a GPU value from the meter), applied after AA, before tone mapping. Null = 1. */
@@ -194,11 +143,12 @@ export class FrameGraph {
   private contact: { sample: (uv: TslNode) => TslNode; intensity: THREE.UniformNode<number> } | null = null;
   /**
    * Reflection reader: `(screenUV) => vec4(radiance, confidence)`, the G-buffer's
-   * (F0, roughness) texture it is weighted with, and the strength. The specular term is
+   * strength; F0 and roughness come from the scene G-buffer. The specular term is
    * added on top of the composite: materials here carry no environment specular of
    * their own, so nothing is counted twice.
    */
-  private reflections: { sample: (uv: TslNode) => TslNode; specular: THREE.Texture; intensity: THREE.UniformNode<number> } | null = null;
+  private reflections: { sample: (uv: TslNode) => TslNode; intensity: THREE.UniformNode<number> } | null = null;
+  private probeRadiance: ((worldPosition: TslNode, direction: TslNode) => TslNode) | null = null;
   /** Owns the jitter and the history; idle unless the mode is `taa`. */
   readonly taa: TemporalAANode;
 
@@ -237,19 +187,8 @@ export class FrameGraph {
       mrt({
         output: output,
         albedo: vec4(diffuseColor.rgb, bakedReceiver),
-        // The spare channels carry the lightmap's radiance (albedo x baked irradiance)
-        // so contact occlusion can take it back out of the scene colour later.
-        normal: vec4(normalView, bakedIndirect.r),
-        velocity: vec4(velocity, bakedIndirect.g, bakedIndirect.b),
-        // NO metalness/roughness attachment here, though this is where it belongs.
-        // Four RGBA16F attachments is 32 bytes per sample, which is exactly
-        // `maxColorAttachmentBytesPerSample` on this adapter; a fifth of any format
-        // fails validation and invalidates the whole command buffer. The reflection
-        // pass therefore rasterises its own half-resolution material buffer. Shrinking
-        // `velocity` to RG16F would free the room, but the per-attachment format of a
-        // PassNode MRT is not addressable without reaching into its private texture
-        // map, and a half-res raster of a scene that has no glossy material in it is
-        // skipped entirely.
+        normal: vec4(normalView, luminance(bakedIndirect)),
+        velocity: vec4(velocity, metalness, roughness),
       }),
     );
     this.scenePass = scenePass;
@@ -338,10 +277,21 @@ export class FrameGraph {
     this.needsComposite = true;
   }
 
+  private bakedIndirectNode(): TslNode {
+    const albedo = this.scenePass.getTextureNode('albedo').rgb;
+    return albedo.mul(this.scenePass.getTextureNode('normal').a.div(luminance(albedo).max(1e-3)));
+  }
+
   /** Installs or removes the traced-reflection reader; the composite is rebuilt. */
-  setReflections(reader: { sample: (uv: TslNode) => TslNode; specular: THREE.Texture; intensity: THREE.UniformNode<number> } | null): void {
+  setReflections(reader: { sample: (uv: TslNode) => TslNode; intensity: THREE.UniformNode<number> } | null): void {
     if (reader === this.reflections) return;
     this.reflections = reader;
+    this.needsComposite = true;
+  }
+
+  setProbeRadiance(sampler: ((worldPosition: TslNode, direction: TslNode) => TslNode) | null): void {
+    if (sampler === this.probeRadiance) return;
+    this.probeRadiance = sampler;
     this.needsComposite = true;
   }
 
@@ -444,9 +394,9 @@ export class FrameGraph {
       // the contact bent-cone occlusion (Lagarde's form, as three applies it to
       // environment specular) so reflections do not leak into crevices.
       const r = this.reflections.sample(screenUV as unknown as TslNode) as ReturnType<typeof vec4>;
-      const spec = texture(this.reflections.specular, screenUV);
-      const f0 = spec.rgb;
-      const rough = spec.a.clamp(0.02, 1);
+      const material = this.scenePass.getTextureNode('velocity');
+      const f0 = mix(vec3(0.04), this.scenePass.getTextureNode('albedo').rgb, material.b);
+      const rough = material.a.clamp(0.02, 1);
       const depthNode = this.scenePass.getTextureNode('depth');
       const viewPos = getViewPosition(screenUV, depthNode, cameraProjectionMatrixInverse);
       const nView = normalize(this.scenePass.getTextureNode('normal').rgb);
@@ -459,18 +409,20 @@ export class FrameGraph {
         const aoExp = rough.mul(-16).sub(1).exp2();
         so = (occlusion as ReturnType<typeof float>).sub(aoNV.pow(aoExp).oneMinus()).clamp() as unknown as TslNode;
       }
-      const specularLight = r.rgb.mul(brdf).mul(so).mul(r.a).mul(this.reflections.intensity).toInspector('Reflections / Specular');
+      let radiance: TslNode = r.rgb.mul(r.a);
+      if (this.probeRadiance) {
+        const worldPos = cameraWorldMatrix.mul(vec4(viewPos, 1)).xyz;
+        const nWorld = normalize(cameraWorldMatrix.mul(vec4(nView, 0)).xyz);
+        const viewDir = normalize(worldPos.sub(cameraWorldMatrix[3].xyz));
+        const reflected = viewDir.sub(nWorld.mul(viewDir.dot(nWorld).mul(2)));
+        const rough = vec3(this.probeRadiance(worldPos as unknown as TslNode, reflected as unknown as TslNode)).toInspector('Reflections / Probe fallback');
+        radiance = (radiance as ReturnType<typeof vec3>).add(rough.mul(float(1).sub(r.a)));
+      }
+      const specularLight = vec3(radiance).mul(brdf).mul(so).mul(this.reflections.intensity).toInspector('Reflections / Specular');
       beauty = vec4(vec3(beauty).add(specularLight), vec4(beauty).a) as unknown as TslNode;
     }
     if (occlusion) {
-      // The lightmap's contribution rides inside the scene colour; the G-buffer carries
-      // it again in the spare channels (normal.a, velocity.ba) so it can be occluded here
-      // without touching the direct term: colour − baked · (1 − visibility).
-      const baked = vec3(
-        this.scenePass.getTextureNode('normal').a,
-        this.scenePass.getTextureNode('velocity').b,
-        this.scenePass.getTextureNode('velocity').a,
-      );
+      const baked = this.bakedIndirectNode();
       beauty = vec4(vec3(beauty).sub(baked.mul(float(1).sub(occlusion))), vec4(beauty).a) as unknown as TslNode;
     }
 
@@ -573,7 +525,10 @@ export class FrameGraph {
         right = this.color;
         break;
       case SplitView.Albedo:
-        right = this.albedoTexture ? texture(this.albedoTexture, screenUV) : null;
+        right = this.albedoTexture ? texture(this.albedoTexture, screenUV) : vec4(this.scenePass.getTextureNode('albedo').rgb, 1);
+        break;
+      case SplitView.Baked:
+        right = vec4(this.bakedIndirectNode(), 1);
         break;
       case SplitView.Normal:
         right = vec4(

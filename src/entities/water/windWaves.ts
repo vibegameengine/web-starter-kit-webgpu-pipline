@@ -1,6 +1,7 @@
 import * as THREE from 'three/webgpu';
 import {
   Fn,
+  Loop,
   cos,
   float,
   sin,
@@ -29,6 +30,7 @@ import { seededRandom } from '../../shared/lib/noise.ts';
  * statistics at the price of O(N) per vertex/pixel, which at N=48 is cheap here.
  */
 export interface WindWaveOptions {
+  referenceDepth?: number;
   /** Wind speed at 10 m, m/s (fetch-limited JONSWAP). */
   windSpeed?: number;
   /** Direction the wind blows toward, radians in the xz plane (0 = +x). */
@@ -80,6 +82,7 @@ export class WindWaves {
   constructor(options: WindWaveOptions = {}) {
     this.options = {
       windSpeed: 4.5,
+      referenceDepth: 1.2,
       windDirection: Math.atan2(-0.4, 0.9),
       fetch: 800,
       components: 48,
@@ -111,6 +114,11 @@ export class WindWaves {
 
   private sample(): void {
     const { windSpeed, windDirection, fetch, components, seed, gain, minWavelength } = this.options;
+    if (windSpeed <= 0.05) {
+      for (const parameter of this.params) parameter.set(0, 0, 0, 0);
+      this.tailSlopeVariance = 0;
+      return;
+    }
     let tail = 0;
     const random = seededRandom(seed);
 
@@ -119,7 +127,7 @@ export class WindWaves {
     const omegaPeak = 22 * (GRAVITY / windSpeed) * xTilde ** -0.33;
     const alpha = 0.076 * xTilde ** -0.22;
     // Reference depth for the TMA correction: a lagoon, not the open sea.
-    const hRef = 1.2;
+    const hRef = this.options.referenceDepth;
 
     // Sample ω log-uniformly between 0.6 ωp and 6 ωp (5 cm .. metres), θ from cos².
     const omegaMin = omegaPeak * 0.6;
@@ -174,8 +182,8 @@ export class WindWaves {
     const height = float(0.0).toVar();
     const slopeX = float(0.0).toVar();
     const slopeZ = float(0.0).toVar();
-    const shoal = float(1.2).div(h).pow(0.25).min(float(2.2));
-    for (let i = 0; i < this.count; i++) {
+    const shoal = float(this.options.referenceDepth).div(h).pow(0.25).min(float(2.2));
+    Loop(this.count, ({ i }) => {
       const c = this.paramsNode.element(float(i)) as unknown as ReturnType<typeof vec4>;
       const phase0 = this.phasesNode.element(float(i)) as unknown as ReturnType<typeof float>;
       const kDeep = sqrt(c.x.mul(c.x).add(c.y.mul(c.y)));
@@ -188,7 +196,7 @@ export class WindWaves {
       const d = cos(theta).mul(a).mul(k);
       slopeX.addAssign(d.mul(dir.x));
       slopeZ.addAssign(d.mul(dir.y));
-    }
+    });
     return vec3(height, slopeX, slopeZ);
   });
 }

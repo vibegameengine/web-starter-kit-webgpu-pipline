@@ -42,6 +42,9 @@ export class WorkerWaterSim implements WaterSim {
   readonly manning = uniform(0.025);
   /** Resolves when the worker's device is up and its preroll is done. */
   readonly ready: Promise<void>;
+  readonly firstFieldReady: Promise<void>;
+  readonly bootTimings: Record<string, number> = {};
+  private readonly createdAt = performance.now();
 
   private readonly worker: Worker;
   private readonly half: number;
@@ -77,20 +80,26 @@ export class WorkerWaterSim implements WaterSim {
     this.worker = new Worker(new URL('./simWorker.ts', import.meta.url), { type: 'module', name: 'waterSim' });
     this.worker.onerror = (event) => console.error('[waterSim worker]', event.message);
     let resolveReady: () => void = () => {};
+    let resolveFirstField: () => void = () => {};
     this.ready = new Promise<void>((resolve) => { resolveReady = resolve; });
-    this.worker.onmessage = (event: MessageEvent<WaterSimResponse>) => this.receive(event.data, resolveReady);
+    this.firstFieldReady = new Promise<void>((resolve) => { resolveFirstField = resolve; });
+    this.worker.onmessage = (event: MessageEvent<WaterSimResponse>) => this.receive(event.data, resolveReady, resolveFirstField);
     void this.launch(options);
   }
 
-  private receive(message: WaterSimResponse, resolveReady: () => void): void {
+  private receive(message: WaterSimResponse, resolveReady: () => void, resolveFirstField: () => void): void {
     if (message.type === 'field') {
+      if (this.cost.fields === 0) this.bootTimings.firstField = performance.now() - this.createdAt;
       // Only the newest field is worth uploading; a frame the renderer never drew
       // goes straight back to the worker as a spare buffer.
       if (this.pending) this.worker.postMessage({ type: 'recycle', field: this.pending } satisfies WaterSimRequest, [this.pending.buffer]);
       this.pending = message.field;
       this._simTime = message.simTime;
       this.cost = { ...message.cost, fields: this.cost.fields + 1 };
+      resolveFirstField();
     } else if (message.type === 'ready') {
+      Object.assign(this.bootTimings, message.bootTimings);
+      this.bootTimings.workerReady = performance.now() - this.createdAt;
       this._simTime = message.simTime;
       resolveReady();
     } else if (message.type === 'read') {
@@ -113,6 +122,7 @@ export class WorkerWaterSim implements WaterSim {
       swellPeriod: options.swellPeriod, manning: this.manning.value as number, swellDirection: options.swellDirection,
     };
     this.worker.postMessage({ type: 'init', init } satisfies WaterSimRequest, [init.canvas, bathymetry.buffer]);
+    this.bootTimings.bathymetryReadback = performance.now() - this.createdAt;
   }
 
   setSwellDirection(radians: number): void {

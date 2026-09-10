@@ -38,6 +38,10 @@ export const intersectionResultStruct = wgsl( /* wgsl */`
 		barycoord: vec3f,
 		side: f32,
 		dist: f32,
+		// True when a budgeted traversal stopped on its node ceiling instead of
+		// finishing. 'didHit' is then false because nothing was found, not because
+		// nothing is there, and a caller must not treat it as empty space.
+		exhausted: bool,
 	};
 ` );
 

@@ -102,7 +102,7 @@ export type WaterSimRequest =
 
 /** Worker → main thread. */
 export type WaterSimResponse =
-  | { type: 'ready'; simTime: number }
+  | { type: 'ready'; simTime: number; bootTimings?: Record<string, number> }
   | { type: 'field'; field: Uint16Array; simTime: number; cost: WaterSimCost }
   | { type: 'read'; id: number; value: unknown }
   | { type: 'error'; message: string };

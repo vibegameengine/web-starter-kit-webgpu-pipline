@@ -15,6 +15,7 @@ import { giLightConsts, giOccluded, giSampleLight, giShadeHit, giVisibility } fr
 import { envEquirectUV, sampleDiffuseArray } from '../surfel/surfelIntegratePass.ts';
 import { giLightsTexture, U_GI_LIGHT_COUNT, U_GI_LIGHT_SAMPLES, U_GI_MEDIUM } from '../surfel/sceneLights.ts';
 import type { ContactBVHBundle } from '../contact/contactBvh.ts';
+import { ReflectionDenoiser } from './reflectionDenoise.ts';
 
 export interface ReflectionSettings {
   enabled: boolean;
@@ -34,20 +35,10 @@ export interface ReflectionSettings {
    * a 15.2 ms frame per trace.
    */
   traceInterval: number;
-  /**
-   * Nodes one reflection ray may visit in the static BVH before it gives up and
-   * takes the environment instead. 0 removes the ceiling.
-   *
-   * Traversal cost per ray is unbounded, and it is what makes this pass spike:
-   * measured on the beach 2026-09-09 over 506 frames, 3.18 ms on the median frame
-   * against 7.75 / 9.73 / 10.76 ms on three of them — same rays, same budget,
-   * different random directions. The ceiling turns that tail into a fixed worst
-   * case and pays for it with the rays that hit the limit: they reflect the sky
-   * instead of the geometry they would have found.
-   */
   rayNodeBudget: number;
   /** Screen-trace steps before the ray is handed to the BVH. */
   screenSteps: number;
+  denoisePasses: number;
 }
 
 export const DEFAULT_REFLECTION_SETTINGS: Readonly<ReflectionSettings> = {
@@ -59,8 +50,9 @@ export const DEFAULT_REFLECTION_SETTINGS: Readonly<ReflectionSettings> = {
   intensity: 1,
   resolutionScale: 0.5,
   traceInterval: 2,
-  rayNodeBudget: 192,
+  rayNodeBudget: 0,
   screenSteps: 40,
+  denoisePasses: 2,
 };
 
 /** Per pixel `(radiance.rgb, confidence)`; two buffers alternate by `parity`. */
@@ -100,6 +92,7 @@ const KERNEL = /* wgsl */ `
     depthTex: texture_depth_2d,
     normalTex: texture_2d<f32>,
     specTex: texture_2d<f32>,
+    albedoTex: texture_2d<f32>,
     colorTex: texture_2d<f32>,
     colorSampler: sampler,
     blueNoiseTex: texture_2d<f32>,
@@ -138,14 +131,14 @@ const KERNEL = /* wgsl */ `
     let depth = textureLoad( depthTex, gpx, 0 );
     var out = vec4f( 0.0 );
 
-    let spec = textureLoad( specTex, gpx, 0 );
-    let roughness = clamp( spec.a, 0.02, 1.0 );
-    let f0 = spec.rgb;
+    let material = textureLoad( specTex, gpx, 0 );
+    let roughness = clamp( material.a, 0.02, 1.0 );
+    let f0 = mix( vec3f( 0.04 ), textureLoad( albedoTex, gpx, 0 ).rgb, material.b );
     if ( depth < 1.0 && roughness <= maxRoughness && max( f0.r, max( f0.g, f0.b ) ) > 0.005 ) {
       let viewPos = reflViewPosAt( depthTex, projInv, gpx, gsize );
       let worldPos = ( camWorld * vec4f( viewPos, 1.0 ) ).xyz;
       let camPos = camWorld[ 3 ].xyz;
-      let n = normalize( textureLoad( normalTex, gpx, 0 ).xyz * 2.0 - 1.0 );
+      let n = normalize( ( camWorld * vec4f( textureLoad( normalTex, gpx, 0 ).xyz, 0.0 ) ).xyz );
       let v = normalize( camPos - worldPos );
 
       // GGX half-vector sample (Walter 2007), one per cell per frame; the history
@@ -274,6 +267,13 @@ const shadeReflectionHit = wgslFn(
     envTex: texture_2d<f32>, envSampler: sampler, envIntensity: f32,
     dynTrace: f32, dynBounds: vec4f, ambient: vec3f, rnd: f32
   ) -> vec3f {
+    // Empty-handed AND out of budget: the ray found nothing because it stopped
+    // looking, not because the sky is there. Substituting the environment would
+    // paint geometry over with sky and ADD energy, so it returns the flat ambient
+    // instead - dim and wrong in the same direction as a miss deeper in the scene,
+    // rather than a bright hole. An exhausted ray that DID find a surface shades it
+    // normally: that surface is real, it is only not guaranteed to be the nearest.
+    if ( hit.exhausted && !hit.didHit ) { return ambient; }
     if ( !hit.didHit ) {
       let uv = envEquirectUV( ray.direction );
       return textureSampleLevel( envTex, envSampler, uv, 2.0 ).rgb * envIntensity;
@@ -300,8 +300,8 @@ const shadeReflectionHit = wgslFn(
  * reprojected, depth-tested history integrates the lobe; the composite applies the
  * split-sum specular BRDF (three's DFG LUT) and the contact bent-cone occlusion.
  *
- * Runs in the frame loop after the GI and contact passes on the GI G-buffer, whose
- * third attachment carries (specularColor, roughness).
+ * Runs in the frame loop after the GI and contact passes on the scene G-buffer
+ * (view-space normal; metalness and roughness in the velocity attachment).
  */
 export class ReflectionPass {
   private static allocations = 0;
@@ -313,6 +313,7 @@ export class ReflectionPass {
   private readNodes: THREE.StorageBufferNode[] | null = null;
   private readerObject: ReflectionReader | null = null;
   private kernel: THREE.ComputeNode | null = null;
+  private denoiser: ReflectionDenoiser | null = null;
   private sinceTrace = 0;
   private boundStatic: ContactBVHBundle | null = null;
   private boundDynamic: DynamicBVHBundle | null = null;
@@ -367,6 +368,7 @@ export class ReflectionPass {
 
   get reader(): ReflectionReader | null {
     if (!this.readNodes) return null;
+    if (this.settings.denoisePasses > 0 && this.denoiser) return this.denoiser.reader;
     if (!this.readerObject) {
       this.readerObject = { current: this.readNodes[0], previous: this.readNodes[1], parity: this.uParity, width: this.width, height: this.height };
     }
@@ -375,7 +377,7 @@ export class ReflectionPass {
 
   /**
    * Runs the pass. `color` is last frame's resolved colour (the TAA history), `spec`
-   * the GI G-buffer's (specularColor, roughness) attachment. Returns false when idle.
+   * the scene G-buffer's velocity attachment (metalness, roughness in ba), `albedo` its albedo. Returns false when idle.
    */
   update(
     staticBvh: ContactBVHBundle | null,
@@ -384,6 +386,7 @@ export class ReflectionPass {
     depth: THREE.Texture,
     normal: THREE.Texture,
     spec: THREE.Texture,
+    albedo: THREE.Texture,
     color: THREE.Texture,
     width: number,
     height: number,
@@ -397,7 +400,7 @@ export class ReflectionPass {
     if (staticBvh !== this.boundStatic || dynamicBvh !== this.boundDynamic || !this.kernel) {
       this.boundStatic = staticBvh;
       this.boundDynamic = dynamicBvh;
-      this.buildKernel(staticBvh, dynamicBvh, diffuseArray, depth, normal, spec, color);
+      this.buildKernel(staticBvh, dynamicBvh, diffuseArray, depth, normal, spec, albedo, color);
       this.historyValid = false;
     }
     this.colorNode!.value = color;
@@ -426,6 +429,7 @@ export class ReflectionPass {
     this.uEnvIntensity.value = envIntensity;
 
     this.renderer.compute(this.kernel);
+    if (this.settings.denoisePasses > 0 && this.denoiser) { this.denoiser.passes = this.settings.denoisePasses; this.denoiser.run(this.uParity.value); }
     this.prevViewProjection.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
     this.historyValid = true;
     this.frame++;
@@ -462,6 +466,7 @@ export class ReflectionPass {
     depth: THREE.Texture,
     normal: THREE.Texture,
     spec: THREE.Texture,
+    albedo: THREE.Texture,
     color: THREE.Texture,
   ): void {
     const fn = wgslFn(KERNEL, [
@@ -500,6 +505,7 @@ export class ReflectionPass {
       depthTex: texture(depth),
       normalTex: texture(normal),
       specTex: texture(spec),
+      albedoTex: texture(albedo),
       colorTex: (this.colorNode = texture(color)),
       colorSampler: (this.colorSamplerNode = sampler(color)),
       blueNoiseTex: texture(this.blueNoise),
@@ -530,6 +536,9 @@ export class ReflectionPass {
     })
       .compute(this.width * this.height)
       .setName('Reflections');
+    const [tracedA, tracedB, depthA, depthB] = this.buffers!;
+    if (this.denoiser && this.denoiser.width === this.width && this.denoiser.height === this.height) return;
+    this.denoiser = new ReflectionDenoiser(this.renderer, { traced: [tracedA, tracedB], depth: [depthA, depthB], normal, spec, width: this.width, height: this.height });
   }
 
   dispose(): void {
@@ -538,5 +547,6 @@ export class ReflectionPass {
     this.readNodes = null;
     this.readerObject = null;
     this.kernel = null;
+    this.denoiser = null;
   }
 }

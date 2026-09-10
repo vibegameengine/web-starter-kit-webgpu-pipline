@@ -12,6 +12,7 @@ type MatLike = THREE.Material & {
 };
 
 export type DiffuseArrayResult = {
+  dispose: () => void;
   diffuseArrayTex: THREE.Texture;
   materialIdByUUID: Map<string, number>;
   materialCount: number;
@@ -355,6 +356,7 @@ export function buildDiffuseArrayTexture(
 
   diffuseArrayTex.generateMipmaps = true;
   renderer.setRenderTarget(prevTarget, prevLayer, prevMip);
+  quad.geometry.dispose(); bakeMaterial.dispose(); whiteMap.dispose();
 
   // Mip chain adds a third; still an order of magnitude under one flat 1024 per material.
   const bytes = Math.round(layerCount * layerSize * layerSize * 4 * (4 / 3));
@@ -388,6 +390,7 @@ export function buildDiffuseArrayTexture(
   }
 
   return {
+    dispose: () => renderTarget.dispose(),
     diffuseArrayTex,
     materialIdByUUID,
     materialCount,

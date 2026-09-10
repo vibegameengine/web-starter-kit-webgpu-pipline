@@ -148,6 +148,8 @@ export class SurfelGI {
   private poolSaturationReported = false;
   private releasedBakePoolBytes = 0;
   private bakedAtlas: THREE.Texture | null = null;
+  /** @important The raster's gain on the atlas, so a bounce ray reads it at the same scale. */
+  private bakedAtlasIntensity: unknown = null;
   private dynamicMembershipChanged = false;
   private dynamicRevision = 0;
   bakedFeedbackEnabled = true;
@@ -164,8 +166,14 @@ export class SurfelGI {
    * change, and `giKnobs.dynamicSurfels` for the measurement.
    */
   private atlasPinned = false;
+
+  get staticPinned(): boolean { return this.atlasPinned; }
   /** Receiver-aware live coverage; legacy is retained for the focused regression check. */
   liveCoverage = true;
+
+  dynamicGi = giKnobs.dynamicGi();
+
+  unboundGi = giKnobs.unboundGi();
 
   readonly envTexture: THREE.DataTexture;
   /** The 128x128 LDR blue-noise tile (nearest, repeat), shared with screen-space filters. */
@@ -327,7 +335,7 @@ export class SurfelGI {
       const c = this.lightingControls;
       this.integrate.setEnvControls(c.envIntensity, c.envLod);
       this.integrate.setLeafTransmit(this.leafTransmitEnabled);
-      this.integrate.setBakedAtlas(this.bakedAtlas);
+      this.integrate.setBakedAtlas(this.bakedAtlas, this.bakedAtlasIntensity);
       this.integrate.setGiScales(c.fromDirect, c.fromIndirect);
       this.integrate.setAlbedoBoost(c.albedoBoost);
     }
@@ -538,17 +546,18 @@ export class SurfelGI {
    * reads its light from there instead of gathering the surfel cache at that point.
    * Survives a pool rebuild through `rebuildPoolBoundPasses`.
    */
-  useBakedAtlas(texture: THREE.Texture | null): void {
+  useBakedAtlas(texture: THREE.Texture | null, intensity?: unknown): void {
+    this.bakedAtlasIntensity = intensity ?? this.bakedAtlasIntensity;
     if (texture === this.bakedAtlas) return;
     this.bakedAtlas = texture;
-    this.integrate?.setBakedAtlas(texture);
+    this.integrate?.setBakedAtlas(texture, this.bakedAtlasIntensity);
     console.log(texture
       ? '[gi] rays read the baked atlas at unwrapped static hits'
       : '[gi] rays read the surfel cache at every hit');
   }
 
   get bakedTransportStats() {
-    return { enabled: false, releasedBakePoolBytes: this.releasedBakePoolBytes,
+    return { releasedBakePoolBytes: this.releasedBakePoolBytes,
       livePool: this.poolStats, uvBytes: this.bvh?.lightmapUvTexture.image.data?.byteLength ?? 0 };
   }
 
@@ -575,11 +584,14 @@ export class SurfelGI {
     if (this.rigidSurfels) this.pool.setAnchorStart(renderer, withSurfels ? data.count : 0);
     this.atlasPinned = true;
     this._frozen = false;
-    console.log(`[lightmap] restored ${data.count} pinned surfels; no integration`);
+    // @important Say what went into the pool, not what the file holds: they differ whenever withSurfels is false, and a log reading "restored 92361" beside an empty pool sends anyone debugging a dark surface to the wrong place.
+    console.log(withSurfels
+      ? `[lightmap] restored ${data.count} pinned surfels; no integration`
+      : `[lightmap] receiver ownership restored; ${data.count} saved surfels NOT loaded (?atlasSurfels=1 loads them)`);
   }
 
-  resize(renderer: THREE.WebGPURenderer): void {
-    this.gbuffer.resize(renderer);
+  resize(renderer: THREE.WebGPURenderer, scale?: number): void {
+    this.gbuffer.resize(renderer, scale);
   }
 
   /** True once the resolve pass has produced a texture to composite. */
@@ -677,14 +689,25 @@ export class SurfelGI {
     this._frozen = frozen;
   }
 
-  /**
-   * Runs the GI chain. Returns true when the output texture identity changed, which
-   * means the composite node must be rebuilt (it changes on resize).
-   *
-   * `staticOnly` restricts the G-Buffer to `Layer.GiStatic`, so surfels are neither
-   * spawned on movable geometry nor fed radiance from it. Used during the bake: a
-   * frozen cache must not contain a moving object's lighting frozen with it.
-   */
+  get bakeMachinery() {
+    return { pool: this.pool, grid: this.grid, integrate: this.integrate, integratorArgs: this.integratorArgs, bvh: this.bvh, dynamicBvh: this.dynamicBvh, integrationSchedule: this.integrationSchedule };
+  }
+
+  renderGBuffer(renderer: THREE.WebGPURenderer, scene: THREE.Scene, camera: THREE.PerspectiveCamera, layer: Layer = Layer.Default): void {
+    const previousTarget = renderer.getRenderTarget();
+    const previousBackground = scene.background;
+    const cameraLayers = camera.layers.mask;
+    scene.background = null;
+    camera.layers.set(layer);
+    renderer.setMRT(this.gbuffer.sceneMRT);
+    renderer.setRenderTarget(this.gbuffer.target);
+    renderer.render(scene, camera);
+    renderer.setRenderTarget(previousTarget);
+    renderer.setMRT(null);
+    camera.layers.mask = cameraLayers;
+    scene.background = previousBackground;
+  }
+
   update(
     renderer: THREE.WebGPURenderer,
     scene: THREE.Scene,
@@ -703,20 +726,7 @@ export class SurfelGI {
       this.dynamicMembershipChanged = false;
     }
 
-    // --- G-Buffer, offscreen -------------------------------------------------
-    const previousTarget = renderer.getRenderTarget();
-    const previousBackground = scene.background;
-    const cameraLayers = camera.layers.mask;
-
-    scene.background = null;
-    camera.layers.set(options.staticOnly ? Layer.GiStatic : 0);
-    renderer.setMRT(this.gbuffer.sceneMRT);
-    renderer.setRenderTarget(this.gbuffer.target);
-    renderer.render(scene, camera);
-    renderer.setRenderTarget(previousTarget);
-    renderer.setMRT(null);
-    camera.layers.mask = cameraLayers;
-    scene.background = previousBackground;
+    this.renderGBuffer(renderer, scene, camera, options.staticOnly ? Layer.GiStatic : Layer.Default);
 
     // --- surfel lifecycle (skipped once frozen) ------------------------------
     this.prepare.run(renderer, this.pool);
@@ -733,7 +743,8 @@ export class SurfelGI {
         this.pool,
         this.grid,
         this.prevCameraPos,
-        { hybridLive: this.atlasPinned && this.liveCoverage, motion: this.motion },
+        { hybridLive: this.atlasPinned && this.liveCoverage, motion: this.motion,
+          skipRigid: !this.dynamicGi, skipUnbound: !this.unboundGi },
       );
       this.dispatchArgs.run(renderer, this.pool);
 
@@ -774,7 +785,8 @@ export class SurfelGI {
       );
     }
 
-    this.resolve.run(renderer, camera, this.gbuffer, { skipPinned: this.atlasPinned });
+    this.resolve.run(renderer, camera, this.gbuffer,
+      { skipPinned: this.atlasPinned, skipRigid: !this.dynamicGi, skipUnbound: !this.unboundGi });
 
     this.reportGridOccupancy(renderer);
 
@@ -855,45 +867,12 @@ export class SurfelGI {
       .catch((error) => console.error('[gridstats] readback failed', error));
   }
 
-  /**
-   * Converges the cache against static geometry over a counted schedule, then freezes it.
-   *
-   * The schedule is the point. The old budget was wall-clock, and the objection to it
-   * that mattered was not jitter in how many views ran — that measured at ~1 %, and the
-   * cache it produced repeated to ~1 % too. It was that *spawning never stopped*. Every
-   * orbit view spawns wherever the last one lacked coverage, and the immortaliser pins
-   * whatever is alive when the clock runs out, so a longer sweep did not converge the
-   * cache, it thickened it: 23 views put 10,144 entries into the hash grid, 618 views put
-   * 41,809 into the same ~950 cells.
-   *
-   * Past a density, that cache cannot be read back deterministically at all.
-   * `surfelGIResolvePass` fetches at most `RESOLVE_FETCH_CAP` surfels out of the cell a
-   * pixel hashes into, and the grid fills a cell in whatever order its atomics retired —
-   * so a cell over the cap hands every frame a different subset, and a corner cell whose
-   * surfels face three different planes can hand back a subset that all weight to zero.
-   * At 618 views, 51.7 % of the grid sat in such cells and a wedge region flickered
-   * between 6 and 75 with the entire lifecycle frozen and the cache byte-identical. Seven
-   * captures of that flicker are what "the bake is non-deterministic" was measuring.
-   *
-   * So the loop is now two counted phases. `bakeSpawnViews` orbit views grow the
-   * population, then the population is held fixed and `bakeIntegrations` passes converge
-   * radiance with no G-Buffer, no find-missing, no ageing and no allocation — the same
-   * grid/args/integrate/swap loop `bakeLightmap` runs. Convergence stops costing density,
-   * which is what lets it run long enough to actually finish: 800 passes reach a wall
-   * value the old sweep only got to by quadrupling the surfel count. `?bakeclock=1` puts
-   * the old budget back, so this is an ablation rather than an argument.
-   *
-   * Growth is refused for the duration rather than handled. It replaces every pool buffer
-   * and the radiance in them does not survive, and whether it fires depends on where a
-   * periodic readback landed — a coin flip in the middle of a bake. `reportBakeOccupancy`
-   * says so afterwards instead.
-   *
-   * `?geoseed=1` replaces the spawn phase with area-sampled placement from the triangles
-   * the BVH holds; see the note on that knob for why it is off.
-   *
-   * Ray count is raised for the duration: convergence quality is paid for once here
-   * instead of every frame forever.
-   */
+  /* @important Counted phases, not a wall clock: a clock never stopped spawning, so 23 views put
+     10,144 entries into the hash grid and 618 views 41,809 into the same ~950 cells; past the
+     RESOLVE_FETCH_CAP density 51.7 % of cells returned a different subset every frame and a wedge
+     flickered 6..75 with the cache byte-identical. Spawn views, then hold the population and run
+     800 integrations; `?bakeclock=1` is the old budget as ablation. Pool growth is refused for
+     the duration because it discards the radiance. */
   async bake(
     renderer: THREE.WebGPURenderer,
     scene: THREE.Scene,

@@ -62,7 +62,7 @@ export function createBackdrop(options: BackdropOptions): THREE.Group {
   const shadow = select(valid, pool.mul(pool).mul(0.75), float(0.0));
 
   domeMaterial.colorNode = grade.add(vec3(grain)).mul(float(1.0).sub(shadow));
-  domeMaterial.mrtNode = mrt({ albedo: vec4(0.0), normal: vec4(0.0), velocity: vec4(0.0) });
+  domeMaterial.mrtNode = mrt({ albedo: vec4(0.0), normal: vec4(0.0, 0.0, 1.0, 0.0), velocity: vec4(0.0, 0.0, 0.0, 1.0) });
 
   const dome = new THREE.Mesh(new THREE.SphereGeometry(160, 48, 32), domeMaterial);
   dome.name = 'backdropDome';

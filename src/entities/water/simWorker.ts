@@ -168,8 +168,10 @@ const window1s = { at: 0, ticks: 0, step: 0, saturation: 0, simTime: 0 };
 const spare: Uint16Array[] = [];
 
 async function boot(init: WaterSimInit): Promise<void> {
+  const started = performance.now();
   renderer = new THREE.WebGPURenderer({ canvas: init.canvas as unknown as HTMLCanvasElement, antialias: false });
   await renderer.init();
+  const deviceReady = performance.now();
   sim = new ShallowWater({
     renderer, bathymetry: bedTexture(init.bathymetry, init.bathymetrySize), half: init.half,
     waterLevel: init.waterLevel, size: init.size, faceDepth: init.faceDepth,
@@ -181,11 +183,12 @@ async function boot(init: WaterSimInit): Promise<void> {
   saturation = new SandSaturation(renderer, init.size, sim.stateNode);
   sim.setSaturation(saturation.node.value as THREE.Texture);
   readback = new FieldReadback(renderer, init.size);
+  const prepared = performance.now();
   // The preroll is 6 s of water at a 1.5 ms step — 4000 sub-steps, 8000 quad
   // renders. On the main thread that was a second of boot nobody could use.
   sim.preroll(init.prerollSeconds);
   saturation.update(1 / 60);
-  post({ type: 'ready', simTime: sim.simTime });
+  post({ type: 'ready', simTime: sim.simTime, bootTimings: { device: deviceReady - started, setup: prepared - deviceReady, prerollSubmission: performance.now() - prepared } });
   lastTick = performance.now();
   schedule();
 }

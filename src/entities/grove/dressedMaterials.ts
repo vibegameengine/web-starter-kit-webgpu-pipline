@@ -34,6 +34,7 @@ const MOSS_REPEATS_PER_METRE = 0.9;
 const FLOOR_REPEATS_PER_METRE = 0.7;
 const GRANITE_REPEATS_PER_METRE = 0.5;
 const GRANITE_GROUND_GAIN = 0.45;
+const MOSS_GROUND_GAIN = 0.9;
 
 export const GROUND_AVERAGE_COLOR = new THREE.Color(0.17, 0.16, 0.09);
 export const BOULDER_AVERAGE_COLOR = new THREE.Color(0.34, 0.34, 0.32);
@@ -53,16 +54,19 @@ export function createDressedGroundMaterial(maps: ForestMaps): THREE.MeshStandar
 
   const cover = attribute('cover', 'vec3');
   const patch = mx_fractal_noise_float(positionWorld.mul(0.7), 3).mul(0.5).add(0.5);
-  const mossWeight = cover.x.mul(patch.mul(0.5).add(0.75));
-  const total = mossWeight.add(cover.y).add(cover.z).max(0.001);
+  const litter = smoothstep(0.45, 0.85, mx_fractal_noise_float(positionWorld.mul(0.35).add(11.0), 3).mul(0.5).add(0.5));
+  const mossWeight = cover.x.mul(patch.mul(0.5).add(0.75)).mul(litter.oneMinus().mul(0.75).add(0.25));
+  const litterWeight = cover.x.mul(litter).mul(0.45);
+  const total = mossWeight.add(litterWeight).add(cover.y).add(cover.z).max(0.001);
 
   const mossUv = planar(MOSS_REPEATS_PER_METRE);
   const floorUv = planar(FLOOR_REPEATS_PER_METRE);
   const graniteUv = planar(GRANITE_REPEATS_PER_METRE);
 
   const albedo = texture(maps.mossColor, mossUv).rgb
+    .mul(MOSS_GROUND_GAIN)
     .mul(mossWeight)
-    .add(texture(maps.floorColor, floorUv).rgb.mul(cover.y))
+    .add(texture(maps.floorColor, floorUv).rgb.mul(cover.y.add(litterWeight)))
     .add(texture(maps.graniteColor, graniteUv).rgb.mul(GRANITE_GROUND_GAIN).mul(cover.z))
     .div(total);
   const wetness = smoothstep(0.35, 0.9, cover.z.mul(cover.y.add(0.4)));
@@ -70,14 +74,14 @@ export function createDressedGroundMaterial(maps: ForestMaps): THREE.MeshStandar
 
   const roughness = texture(maps.mossRoughness, mossUv).r
     .mul(mossWeight)
-    .add(texture(maps.floorRoughness, floorUv).r.mul(cover.y))
+    .add(texture(maps.floorRoughness, floorUv).r.mul(cover.y.add(litterWeight)))
     .add(texture(maps.graniteRoughness, graniteUv).r.mul(cover.z))
     .div(total);
   material.roughnessNode = mix(roughness.mul(0.5).add(0.5), float(0.22), wetness);
 
   const normalTexture = texture(maps.mossNormal, mossUv).xyz
     .mul(mossWeight)
-    .add(texture(maps.floorNormal, floorUv).xyz.mul(cover.y))
+    .add(texture(maps.floorNormal, floorUv).xyz.mul(cover.y.add(litterWeight)))
     .add(texture(maps.graniteNormal, graniteUv).xyz.mul(cover.z))
     .div(total);
   material.normalNode = normalMap(normalTexture);

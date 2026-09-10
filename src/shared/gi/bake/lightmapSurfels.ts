@@ -387,7 +387,7 @@ export function createLightmapSurfels(pool: SurfelPool, size: number) {
         textureStore(
           lightmap,
           ivec2(tid.mod(int(size)), tid.div(int(size))),
-          vec4(v.xyz, float(1)),
+          v, // Preserve measured coverage for chart-local padding after readback.
         );
       })()
         .compute(texelCount)
@@ -475,5 +475,5 @@ export function createLightmapSurfels(pool: SurfelPool, size: number) {
     return seeded;
   }
 
-  return { lightmap, seed, writeAtlas, readStats, countSeeded };
+  return { lightmap, seed, writeAtlas, readStats, countSeeded, texelSurfel: texelSurfelAttr };
 }

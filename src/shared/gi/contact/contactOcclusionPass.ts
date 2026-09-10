@@ -128,7 +128,7 @@ const KERNEL = /* wgsl */ `
       // that does so hits the surface itself. Rays are generated around the geometric
       // normal from depth derivatives instead — the side with the smaller depth step,
       // so edges do not smear — oriented to agree with the shading normal.
-      let nShade = normalize( textureLoad( normalTex, gpx, 0 ).xyz * 2.0 - 1.0 );
+      let nShade = normalize( ( camWorld * vec4f( textureLoad( normalTex, gpx, 0 ).xyz, 0.0 ) ).xyz );
       let maxPx = vec2i( gsize ) - vec2i( 1 );
       let pL = viewPosAt( depthTex, projInv, max( gpx - vec2i( 1, 0 ), vec2i( 0 ) ), gsize );
       let pR = viewPosAt( depthTex, projInv, min( gpx + vec2i( 1, 0 ), maxPx ), gsize );

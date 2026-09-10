@@ -1,5 +1,6 @@
 import * as THREE from 'three/webgpu';
 import { Layer } from '../../world/index.ts';
+import type { LightmapRegion } from './chartPadding.ts';
 
 export interface LightmapChart {
   mesh: THREE.Mesh;
@@ -10,6 +11,9 @@ export interface LightmapChart {
 
 export interface LightmapLayout {
   charts: LightmapChart[];
+  regions: LightmapRegion[];
+  /** Highest mip whose downsampling blocks cannot cross chart rectangles. */
+  safeMip: number;
   /** Texels per atlas row/column. */
   gridSide: number;
   cellCount: number;
@@ -35,9 +39,6 @@ const REFUSE_METRES_PER_TEXEL = 0.5;
 
 /** Fraction of the atlas the packer aims to fill before it starts coarsening. */
 const TARGET_FILL = 0.78;
-
-/** Empty texels kept between neighbouring charts. */
-const CHART_GAP = 1;
 
 const _a = new THREE.Vector3();
 const _b = new THREE.Vector3();
@@ -84,9 +85,9 @@ interface ChartRequest {
  *
  * Every chart is laid out at ONE density (`metresPerTexel`), found by packing: start
  * from the density that would fill `TARGET_FILL` of the atlas and coarsen until the
- * shelf packer succeeds. Vertices are inset half a texel from the chart edge so a
- * bilinear fetch on the boundary lands on the chart's own texel centre and never reads
- * the gap.
+ * shelf packer succeeds. Rectangles are aligned to the coarsest supported mip;
+ * vertices stay inside its first/last texel centres. Chart-local padding then makes
+ * ordinary box-filtered mip levels safe without per-frame chart lookup tables.
  *
  *   NOT  — `InstancedMesh` has one `uv1` shared by every instance and a lightmap stores
  *          world-space radiance, so a shared chart would light every instance with the
@@ -97,12 +98,15 @@ interface ChartRequest {
  */
 export function assignLightmapUvs(
   scene: THREE.Scene,
-  options: { padding?: number; atlasSize?: number } = {},
+  options: { padding?: number; atlasSize?: number; filterMip?: number } = {},
 ): LightmapLayout {
   const { atlasSize = 512 } = options;
-  // Inset of the geometry from the chart edge, in texels. Half a texel is the minimum
-  // that keeps bilinear filtering inside the chart; anything smaller reads the gap.
-  const inset = Math.max(0.5, options.padding ?? 0.5);
+  const safeMip = options.filterMip ?? Math.log2(atlasSize / Math.min(128, atlasSize / 2));
+  if (!Number.isInteger(safeMip) || safeMip < 0 || safeMip > Math.log2(atlasSize) - 1) throw new Error('Invalid lightmap filter mip');
+  const alignment = 2 ** safeMip;
+  // At the coarsest mip a bilinear tap must still stay inside its own rectangle.
+  // Extra base-level separation also isolates the baker's 3x3 denoiser.
+  const inset = Math.max(1.5, alignment * .5, options.padding ?? 0);
 
   scene.updateMatrixWorld(true);
 
@@ -156,6 +160,8 @@ export function assignLightmapUvs(
     console.warn('[lightmap] nothing static could be charted; atlas will be empty');
     return {
       charts: [],
+      regions: [],
+      safeMip,
       gridSide: atlasSize,
       cellCount: 0,
       mappedArea: 0,
@@ -170,8 +176,8 @@ export function assignLightmapUvs(
   let packed = false;
   for (let attempt = 0; attempt < 40 && !packed; attempt++) {
     for (const chart of requests) {
-      chart.w = Math.max(1, Math.ceil(chart.extentU / metresPerTexel + 2 * inset));
-      chart.h = Math.max(1, Math.ceil(chart.extentV / metresPerTexel + 2 * inset));
+      chart.w = Math.max(2 * alignment, Math.ceil((chart.extentU / metresPerTexel + 2 * inset) / alignment) * alignment);
+      chart.h = Math.max(2 * alignment, Math.ceil((chart.extentV / metresPerTexel + 2 * inset) / alignment) * alignment);
     }
     packed = shelfPack(requests, atlasSize);
     if (!packed) metresPerTexel *= 1.07;
@@ -183,7 +189,7 @@ export function assignLightmapUvs(
   }
 
   // --- write uv1 ----------------------------------------------------------------
-  const perMesh = new Map<THREE.Mesh, { uv1: Float32Array; texels: number }>();
+  const perMesh = new Map<THREE.Mesh, { uv1: Float32Array; bounds: Float32Array; texels: number }>();
   const local = new THREE.Vector2();
 
   for (const chart of requests) {
@@ -191,7 +197,7 @@ export function assignLightmapUvs(
     const count = geometry.getAttribute('position').count;
     let entry = perMesh.get(chart.mesh);
     if (!entry) {
-      entry = { uv1: new Float32Array(count * 2), texels: 0 };
+      entry = { uv1: new Float32Array(count * 2), bounds: new Float32Array(count * 4), texels: 0 };
       perMesh.set(chart.mesh, entry);
     }
     entry.texels += chart.w * chart.h;
@@ -200,6 +206,8 @@ export function assignLightmapUvs(
     const spanV = Math.max(chart.h - 2 * inset, 1e-3);
     const scaleU = chart.extentU > 1e-6 ? spanU / chart.extentU : 0;
     const scaleV = chart.extentV > 1e-6 ? spanV / chart.extentV : 0;
+    const filterBounds = [(chart.x + alignment * .5) / atlasSize, (chart.y + alignment * .5) / atlasSize,
+      (chart.x + chart.w - alignment * .5) / atlasSize, (chart.y + chart.h - alignment * .5) / atlasSize];
 
     for (const vertex of chart.vertices) {
       chart.local(vertex, local);
@@ -207,6 +215,9 @@ export function assignLightmapUvs(
       const v = chart.y + inset + local.y * scaleV;
       entry.uv1[vertex * 2 + 0] = u / atlasSize;
       entry.uv1[vertex * 2 + 1] = v / atlasSize;
+      // Constant within each chart. All line-filter taps stay inside the
+      // coarsest mip's texel centres, including when only fallback is resident.
+      entry.bounds.set(filterBounds, vertex * 4);
     }
   }
 
@@ -214,6 +225,7 @@ export function assignLightmapUvs(
   let cursor = 0;
   for (const [mesh, entry] of perMesh) {
     mesh.geometry.setAttribute('uv1', new THREE.BufferAttribute(entry.uv1, 2));
+    mesh.geometry.setAttribute('lightmapBounds', new THREE.BufferAttribute(entry.bounds, 4));
     charts.push({ mesh, firstCell: cursor, cellCount: entry.texels });
     cursor += entry.texels;
   }
@@ -235,6 +247,8 @@ export function assignLightmapUvs(
 
   return {
     charts,
+    regions: requests.map(c => ({ x: c.x, y: c.y, width: c.w, height: c.h })),
+    safeMip,
     gridSide: atlasSize,
     cellCount: cursor,
     mappedArea,
@@ -380,13 +394,13 @@ function shelfPack(charts: ChartRequest[], side: number): boolean {
     if (chart.w > side || chart.h > side) return false;
     if (x + chart.w > side) {
       x = 0;
-      y += rowHeight + CHART_GAP;
+      y += rowHeight;
       rowHeight = 0;
     }
     if (y + chart.h > side) return false;
     chart.x = x;
     chart.y = y;
-    x += chart.w + CHART_GAP;
+    x += chart.w;
     rowHeight = Math.max(rowHeight, chart.h);
   }
   return true;

@@ -22,12 +22,15 @@ const originalEmission = new WeakMap<THREE.Material, THREE.Node | null>();
  */
 export const bakedIndirect = property('vec3', 'bakedIndirect');
 
+export function emissionBeforeLightmap(material: THREE.Material): THREE.Node | null | undefined {
+  return originalEmission.get(material);
+}
+
 /**
  * Routes the baked lightmap into every static material.
  *
- * Indirect light becomes `albedo × lightmap(uv1)` — a single texture fetch, with no
- * rays, no surfels and no per-frame work of any kind. That is the entire payoff of
- * baking, and the reason a static scene can be lit for free once the bake is done.
+ * Indirect light becomes `albedo × filtered lightmap(uv1)`. Static lighting is
+ * reused through texture lookups without running its light transport again.
  *
  * It is added through `emissiveNode` because that is the one slot in three's standard
  * material that accepts an arbitrary additive HDR term without fighting the built-in
@@ -37,7 +40,7 @@ export function applyLightmap(
   scene: THREE.Scene,
   lightmap: THREE.Texture,
   intensityUniform: ReturnType<typeof uniform>,
-  sampling?: { sample: (uv: THREE.Node) => THREE.Node },
+  sampling?: { sample: (uv: THREE.Node, bounds?: THREE.Node) => THREE.Node },
 ): number {
   const seen = new Set<THREE.Material>();
   let applied = 0;
@@ -105,7 +108,8 @@ export function applyLightmap(
       if (!originalEmission.has(material)) originalEmission.set(material, standard.emissiveNode ?? null);
       const existing = originalEmission.get(material);
       const lightmapUv = attribute('uv1', 'vec2');
-      const lighting = sampling ? sampling.sample(lightmapUv) : texture(lightmap, lightmapUv).rgb;
+      const bounds = mesh.geometry.getAttribute('lightmapBounds') ? attribute('lightmapBounds', 'vec4') : undefined;
+      const lighting = sampling ? sampling.sample(lightmapUv, bounds) : texture(lightmap, lightmapUv).rgb;
       const baked = vec3(lighting)
         .mul(albedo)
         .mul(intensityUniform)
@@ -118,6 +122,7 @@ export function applyLightmap(
         return baked;
       })();
       standard.emissiveNode = existing ? vec3(existing).add(published) : published;
+      standard.userData.lightmapApplied = true;
       standard.needsUpdate = true;
       applied++;
     }

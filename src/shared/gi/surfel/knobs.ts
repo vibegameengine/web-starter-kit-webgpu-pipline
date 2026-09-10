@@ -263,4 +263,13 @@ export const giKnobs = {
    * guess at from a build date.
    */
   dynamicSurfels: () => flag('dynsurfel', false),
+  // @important `?dynamicGi=0` stops the screen resolve reading surfels on rigid receiver pixels, so a mover keeps its direct light and shadow and loses only its surfel indirect. It answers "is a surfel worth its cost on dynamics" by picture. Cornell only: the beach reports movers 0, its ball being giExclude, so nothing there is dynamic to the GI.
+  dynamicGi: () => flag('dynamicGi', true),
+  // @important `?unboundGi=0` stops the screen resolve reading surfels on unbound receivers - everything the unwrap refused a chart, which on the beach is the palm and shrub leaves, the shrub stems and the island's underside, and anywhere else an InstancedMesh. That set is static, its light never changes, and it is the only thing the live chain serves on the beach (movers 0). Turning it off shows what the live half is actually paying for there.
+  unboundGi: () => flag('unboundGi', true),
+  /* @important `?giScale=` sizes the GI G-buffer, and with it the find-missing and resolve passes,
+     as a fraction of the screen. They run per screen pixel, which is why the whole unbaked receiver
+     class costs 3.6 ms at 720p and 48 ms of a 63 ms frame at 4K (2026-09-10, scripts/_4k_budget.mjs).
+     1 is the shipping resolution; the frame is not yet judged at anything less. */
+  giScale: () => Math.min(1, Math.max(0.25, num('giScale', 1))),
 };

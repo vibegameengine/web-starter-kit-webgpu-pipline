@@ -1,8 +1,20 @@
 import * as THREE from 'three/webgpu';
 import { positionLocal, sin, uniform, vec3, vertexColor } from 'three/tsl';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
-import { seededRandom } from '../../shared/lib/noise';
-import { leafTranslucency } from '../foliage/translucency.ts';
+import { createNoise, seededRandom } from '../../shared/lib/noise';
+import { installVertexMotion } from '../../shared/render/vertexMotion.ts';
+import {
+  LEAF_PRESETS,
+  buildLeafRamp,
+  mixBiochemistry,
+  sampleLeafRamp,
+  veinTint,
+  type LeafBiochemistry,
+  type LeafRamp,
+  type RGB,
+} from '../foliage/leafOptics.ts';
+import { createLeafMaterial } from '../foliage/leafMaterial.ts';
+import { buildLeafSurface, type LeafSurface, type Venation } from '../foliage/leafSurface.ts';
 
 /**
  * Tropical undergrowth shrub: a rosette of arching broad leaves and/or small
@@ -14,6 +26,8 @@ export interface ShrubOptions {
   /** Footprint radius in metres, 0.4..1.2. Leaves reach roughly this far out. */
   radius: number;
   kind?: 'broadleaf' | 'fan' | 'mixed';
+  /** Sky for the leaves' cuticle reflection and back-lit transmission. */
+  environment?: THREE.Texture;
 }
 
 export interface Shrub {
@@ -26,9 +40,6 @@ type Rng = () => number;
 const UP = new THREE.Vector3(0, 1, 0);
 const DEG = Math.PI / 180;
 
-const LEAF_BASE = new THREE.Color(0.10, 0.25, 0.06);
-const LEAF_TIP = new THREE.Color(0.45, 0.60, 0.12);
-const LEAF_OLD = new THREE.Color(0.52, 0.50, 0.10);
 const STEM_BASE = new THREE.Color(0.16, 0.12, 0.05);
 const STEM_TOP = new THREE.Color(0.20, 0.26, 0.07);
 
@@ -38,13 +49,16 @@ let loggedTriangles = false;
 class LeafBuilder {
   positions: number[] = [];
   colors: number[] = [];
+  transmittances: number[] = [];
   uvs: number[] = [];
   indices: number[] = [];
 
-  vertex(p: THREE.Vector3, c: THREE.Color, u: number, v: number): number {
+  /** `c` is the linear reflectance, `t` the linear transmittance (zero for a stem). */
+  vertex(p: THREE.Vector3, c: RGB, u: number, v: number, t: RGB = [0, 0, 0]): number {
     const id = this.positions.length / 3;
     this.positions.push(p.x, p.y, p.z);
-    this.colors.push(c.r, c.g, c.b);
+    this.colors.push(c[0], c[1], c[2]);
+    this.transmittances.push(t[0], t[1], t[2]);
     this.uvs.push(u, v);
     return id;
   }
@@ -58,6 +72,7 @@ class LeafBuilder {
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute('position', new THREE.Float32BufferAttribute(this.positions, 3));
     geometry.setAttribute('color', new THREE.Float32BufferAttribute(this.colors, 3));
+    geometry.setAttribute('transmittance', new THREE.Float32BufferAttribute(this.transmittances, 3));
     geometry.setAttribute('uv', new THREE.Float32BufferAttribute(this.uvs, 2));
     geometry.setIndex(this.indices);
     return geometry;
@@ -77,18 +92,45 @@ function smooth(t: number): number {
   return x * x * (3 - 2 * x);
 }
 
-/** Per-leaf colour ramp with +-15% variation and an occasional older, yellower leaf. */
-function leafPalette(rng: Rng): { base: THREE.Color; tip: THREE.Color } {
-  const variation = 1 + (rng() * 2 - 1) * 0.15;
-  const old = rng() < 0.12 ? 0.55 + rng() * 0.35 : 0;
-  const base = LEAF_BASE.clone().multiplyScalar(variation);
-  const tip = LEAF_TIP.clone().multiplyScalar(variation);
+/**
+ * Per-leaf optics: chlorophyll varies ±25% from leaf to leaf, the tip of a
+ * blade is younger tissue than its base, inner leaves are young, and one outer
+ * leaf in seven is an old one losing chlorophyll and browning.
+ */
+function leafRampFor(rng: Rng, kind: 'broad' | 'fan', youth: number): LeafRamp {
+  const variation = 1 + (rng() * 2 - 1) * 0.25;
+  const old = youth < 0.5 && rng() < 0.15 ? 0.55 + rng() * 0.35 : 0;
+  const mature = kind === 'fan' ? LEAF_PRESETS.fan : LEAF_PRESETS.broadleaf;
+  const young = kind === 'fan' ? mixBiochemistry(LEAF_PRESETS.fan, LEAF_PRESETS.broadleafYoung, 0.6) : LEAF_PRESETS.broadleafYoung;
+  const vary = (b: LeafBiochemistry): LeafBiochemistry => ({ ...b, Cab: b.Cab * variation, Car: b.Car * (0.9 + 0.1 * variation) });
+  // The rosette grows from the centre: the innermost leaves are the youngest.
+  let base = vary(mixBiochemistry(mature, young, youth * 0.65));
+  let tip = vary(mixBiochemistry(base, young, 0.5));
   if (old > 0) {
-    base.lerp(LEAF_OLD, old * 0.5);
-    tip.lerp(LEAF_OLD, old);
+    base = mixBiochemistry(base, LEAF_PRESETS.broadleafOld, old * 0.5);
+    tip = mixBiochemistry(tip, LEAF_PRESETS.broadleafOld, old);
   }
-  return { base, tip };
+  return buildLeafRamp(base, tip, 8);
 }
+
+/** Relief maps are shared by every shrub: they describe the species, not the plant. */
+const surfaceCache = new Map<Venation, LeafSurface>();
+function leafSurfaceFor(venation: Venation): LeafSurface {
+  let surface = surfaceCache.get(venation);
+  if (!surface) {
+    surface = buildLeafSurface({
+      venation,
+      width: venation === 'pinnate' ? 0.12 : 0.05,
+      length: venation === 'pinnate' ? 0.5 : 0.35,
+      noise: createNoise(venation === 'pinnate' ? 901 : 902),
+    });
+    surfaceCache.set(venation, surface);
+  }
+  return surface;
+}
+
+/** Vertices across a broad leaf blade. */
+const ACROSS = 5;
 
 interface BroadleafSpec {
   attach: THREE.Vector3;
@@ -101,8 +143,7 @@ interface BroadleafSpec {
   fold: number;
   twist: number;
   segments: number;
-  base: THREE.Color;
-  tip: THREE.Color;
+  ramp: LeafRamp;
 }
 
 /**
@@ -120,7 +161,6 @@ function buildBroadleaf(spec: BroadleafSpec): THREE.BufferGeometry {
   const side = new THREE.Vector3(-Math.sin(azimuth), 0, Math.cos(azimuth));
   const point = new THREE.Vector3();
   const mid = new THREE.Vector3();
-  const color = new THREE.Color();
   const rows = segments + 1;
 
   for (let r = 0; r < rows; r++) {
@@ -134,23 +174,23 @@ function buildBroadleaf(spec: BroadleafSpec): THREE.BufferGeometry {
     // Lateral droop: the two halves fold down; a small twist rocks the fold.
     const foldDrop = fold * halfWidth;
     const twistDrop = Math.sin(twist * t) * halfWidth * 0.35;
-    color.copy(spec.base).lerp(spec.tip, smooth(t * 1.1));
+    const optics = sampleLeafRamp(spec.ramp, smooth(t * 1.1));
 
-    for (let s = -1; s <= 1; s++) {
+    // Five vertices across: the halves curve down from the midrib rather than
+    // folding at a crease, so the shading does not read as two flat facets.
+    for (let k = 0; k < ACROSS; k++) {
+      const s = (k / (ACROSS - 1)) * 2 - 1;
       point.copy(mid).addScaledVector(side, s * halfWidth);
-      point.y -= Math.abs(s) * foldDrop + s * twistDrop;
+      point.y -= s * s * foldDrop + s * twistDrop;
       if (point.y < 0.012) point.y = 0.012;
-      // Rim of the blade catches a little more light.
-      const rim = Math.abs(s) * 0.08;
-      builder.vertex(point, color.clone().addScalar(rim), (s + 1) * 0.5, t);
+      builder.vertex(point, optics.R, (s + 1) * 0.5, t, optics.T);
     }
   }
 
   for (let r = 0; r < segments; r++) {
-    const a = r * 3;
-    const b = a + 3;
-    builder.quad(a, a + 1, b, b + 1);
-    builder.quad(a + 1, a + 2, b + 1, b + 2);
+    const a = r * ACROSS;
+    const b = a + ACROSS;
+    for (let k = 0; k < ACROSS - 1; k++) builder.quad(a + k, a + k + 1, b + k, b + k + 1);
   }
   return builder.build();
 }
@@ -165,8 +205,7 @@ interface FanSpec {
   bladeWidth: number;
   droop: number;
   fold: number;
-  base: THREE.Color;
-  tip: THREE.Color;
+  ramp: LeafRamp;
 }
 
 /**
@@ -189,7 +228,6 @@ function buildFan(spec: FanSpec): THREE.BufferGeometry {
   const bladeSide = new THREE.Vector3();
   const mid = new THREE.Vector3();
   const point = new THREE.Vector3();
-  const color = new THREE.Color();
   const rowsPerBlade = 4;
   const rowCount = rowsPerBlade + 1;
 
@@ -211,12 +249,12 @@ function buildFan(spec: FanSpec): THREE.BufferGeometry {
       // Blades fuse near the hub, are widest at about a third of their length, and end in a point.
       const halfWidth =
         bladeWidth * (0.72 + 0.28 * Math.sin(Math.PI * Math.pow(t, 0.7))) * (1 - t * t);
-      color.copy(spec.base).lerp(spec.tip, smooth(t * 1.05));
+      const optics = sampleLeafRamp(spec.ramp, smooth(t * 1.05));
       for (let s = -1; s <= 1; s++) {
         point.copy(mid).addScaledVector(bladeSide, s * halfWidth);
         point.addScaledVector(normal, -Math.abs(s) * fold * halfWidth);
         if (point.y < 0.012) point.y = 0.012;
-        builder.vertex(point, color.clone().addScalar(Math.abs(s) * 0.05), (s + 1) * 0.5, t);
+        builder.vertex(point, optics.R, (s + 1) * 0.5, t, optics.T);
       }
     }
 
@@ -252,7 +290,7 @@ function buildStem(from: THREE.Vector3, to: THREE.Vector3, radius: number): THRE
         .copy(ring === 0 ? from : to)
         .addScaledVector(tangent, Math.cos(a) * rr)
         .addScaledVector(bitangent, Math.sin(a) * rr);
-      builder.vertex(point, color, i / sides, ring);
+      builder.vertex(point, [color.r, color.g, color.b], i / sides, ring);
     }
   }
   for (let i = 0; i < sides; i++) {
@@ -283,6 +321,7 @@ export function createShrub(options: ShrubOptions): Shrub {
 
   const leafParts: THREE.BufferGeometry[] = [];
   const stemParts: THREE.BufferGeometry[] = [];
+  const ramps: LeafRamp[] = [];
   const crown = new THREE.Vector3();
   const attach = new THREE.Vector3();
   const goldenAngle = Math.PI * (3 - Math.sqrt(5));
@@ -312,7 +351,8 @@ export function createShrub(options: ShrubOptions): Shrub {
     // Inner leaves stand on taller petioles (bird-of-paradise habit), outer ones sprawl.
     const stemLength = radius * lerp(0.24, 0.34, u) * (0.85 + rng() * 0.3);
     const length = radius * lerp(0.98, 0.62, u) * (0.85 + rng() * 0.3);
-    const { base, tip } = leafPalette(rng);
+    const ramp = leafRampFor(rng, 'broad', u);
+    ramps.push(ramp);
 
     crown.set((rng() - 0.5) * 0.06 * scale, 0.02 + u * 0.06 * scale, (rng() - 0.5) * 0.06 * scale);
     attach.set(
@@ -333,8 +373,7 @@ export function createShrub(options: ShrubOptions): Shrub {
         fold: lerp(0.1, 0.32, rng()),
         twist: (rng() - 0.5) * 2.5,
         segments: 8,
-        base,
-        tip,
+        ramp,
       }),
     );
     stemParts.push(buildStem(crown.clone(), attach.clone(), 0.007 * scale));
@@ -349,7 +388,8 @@ export function createShrub(options: ShrubOptions): Shrub {
     const tilt = stemElev - lerp(30, 50, rng()) * DEG;
     const bladeLength = radius * lerp(0.5, 0.36, u) * (0.85 + rng() * 0.3);
     const blades = 12 + Math.floor(rng() * 7);
-    const { base, tip } = leafPalette(rng);
+    const ramp = leafRampFor(rng, 'fan', u * 0.5);
+    ramps.push(ramp);
 
     crown.set((rng() - 0.5) * 0.08 * scale, 0.02, (rng() - 0.5) * 0.08 * scale);
     attach.set(
@@ -369,8 +409,7 @@ export function createShrub(options: ShrubOptions): Shrub {
         bladeWidth: bladeLength * lerp(0.09, 0.115, rng()),
         droop: lerp(0.1, 0.3, rng()),
         fold: lerp(0.2, 0.5, rng()),
-        base,
-        tip,
+        ramp,
       }),
     );
     stemParts.push(buildStem(crown.clone(), attach.clone(), 0.009 * scale));
@@ -382,31 +421,44 @@ export function createShrub(options: ShrubOptions): Shrub {
   // --- Materials. The vertex colour carries the base-to-tip ramp; material.color is the
   // average so anything that only reads material.color (a ray tracer, a bake) stays plausible.
   const windTime = uniform(0);
-  const leafMaterial = new THREE.MeshStandardNodeMaterial({
-    color: LEAF_BASE.clone().lerp(LEAF_TIP, 0.5),
-    roughness: 0.45,
-    metalness: 0,
-    side: THREE.DoubleSide,
-    vertexColors: true,
+  const windTimePrev = uniform(0);
+  const meanR: RGB = [0, 0, 0];
+  let meanT = 0;
+  for (const ramp of ramps) {
+    meanR[0] += ramp.meanR[0] / ramps.length;
+    meanR[1] += ramp.meanR[1] / ramps.length;
+    meanR[2] += ramp.meanR[2] / ramps.length;
+    meanT += ramp.meanTLuminance / ramps.length;
+  }
+  const leafMaterial = createLeafMaterial({
+    surface: leafSurfaceFor(kind === 'fan' ? 'parallel' : 'pinnate'),
+    ior: 1.42,
+    meanReflectance: meanR,
+    meanTransmittance: meanT,
+    veinTint: veinTint(kind === 'fan' ? LEAF_PRESETS.fan : LEAF_PRESETS.broadleaf),
+    environment: options.environment,
+    name: `shrub-leaf-${kind}`,
   });
-  leafMaterial.colorNode = vertexColor();
-  // Waxy broad leaves: thicker than a frond, still not a wall to the GI tracer.
-  leafMaterial.userData.giTransmission = 0.35;
-  leafMaterial.emissiveNode = leafTranslucency(0.2);
   {
-    // Wind: sway grows with height above ground; two frequencies so it never reads as a metronome.
+    // Wind: sway grows with height above ground; two frequencies so it never reads as a
+    // metronome. A function of the wind clock so the motion vector can evaluate the
+    // previous frame's sway (vertexMotion.ts).
     const height = positionLocal.y;
     const phase = positionLocal.x.mul(2.3).add(positionLocal.z.mul(1.7));
-    const swayA = sin(windTime.mul(1.6).add(phase)).mul(height).mul(0.022);
-    const swayB = sin(windTime.mul(2.45).add(phase.mul(1.31)).add(1.7)).mul(height).mul(0.014);
-    leafMaterial.positionNode = positionLocal.add(vec3(swayA, swayB.mul(0.4), swayB));
+    const displaceAt = (t: ReturnType<typeof uniform>) => {
+      const swayA = sin(t.mul(1.6).add(phase)).mul(height).mul(0.022);
+      const swayB = sin(t.mul(2.45).add(phase.mul(1.31)).add(1.7)).mul(height).mul(0.014);
+      return vec3(swayA, swayB.mul(0.4), swayB);
+    };
+    installVertexMotion(leafMaterial, displaceAt, windTime, windTimePrev);
   }
 
+  // `colorNode` carries the vertex colour; `vertexColors: true` on top of it
+  // multiplied the colour in twice and painted the stems black.
   const stemMaterial = new THREE.MeshStandardNodeMaterial({
     color: STEM_BASE.clone().lerp(STEM_TOP, 0.5),
     roughness: 0.75,
     metalness: 0,
-    vertexColors: true,
   });
   stemMaterial.colorNode = vertexColor();
 
@@ -438,6 +490,7 @@ export function createShrub(options: ShrubOptions): Shrub {
   return {
     group,
     update(timeSec: number): void {
+      windTimePrev.value = windTime.value;
       windTime.value = timeSec;
     },
   };

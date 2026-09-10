@@ -2,6 +2,7 @@ import * as THREE from 'three/webgpu';
 import {
   Fn,
   If,
+  Loop,
   cos,
   dFdx,
   dFdy,
@@ -14,6 +15,7 @@ import {
   tan,
   textureLoad,
   uniform,
+  uniformArray,
   vec2,
   vec3,
 } from 'three/tsl';
@@ -74,6 +76,16 @@ function poissonDisc(count: number, seed: number): Array<[number, number]> {
 
 const SEARCH_TAPS = poissonDisc(16, 0x9e3779b9);
 const FILTER_TAPS = poissonDisc(32, 0x85ebca6b);
+/**
+ * The discs live in uniform arrays and are walked by a real WGSL loop. Written out tap
+ * by tap instead, this filter is inlined into the fragment shader of every material the
+ * sun reaches: measured 2026-09-09 on the beach, that unrolling was 3.3 MB of the 4.6 MB
+ * of WGSL the boot generates, and about 12 s of the 35 s it took to reach steady frames.
+ * Same taps, same arithmetic, one copy of the body.
+ */
+const tapArray = (taps: Array<[number, number]>) => uniformArray(taps.map(([x, y]) => new THREE.Vector2(x, y)));
+const SEARCH_TAP_UNIFORMS = tapArray(SEARCH_TAPS);
+const FILTER_TAP_UNIFORMS = tapArray(FILTER_TAPS);
 
 /**
  * Percentage-closer soft shadows for the sun, built on the receiver-plane filter.
@@ -131,11 +143,11 @@ export function softSunShadowFilter({ depthTexture, shadowCoord, shadow }: Shado
     const noiseTexel = ivec2(screenCoordinate.xy).mod(int(128));
     const angle = textureLoad(blueNoise, noiseTexel, 0).r.mul(Math.PI * 2);
     const rot = vec2(cos(angle), sin(angle)).toVar();
-    const rotate = (p: [number, number]) => vec2(
-      rot.x.mul(p[0]).sub(rot.y.mul(p[1])),
-      rot.y.mul(p[0]).add(rot.x.mul(p[1])),
+    const rotate = (p: N) => vec2(
+      rot.x.mul(p.x).sub(rot.y.mul(p.y)),
+      rot.y.mul(p.x).add(rot.x.mul(p.y)),
     );
-    const receiverAt = (offsetTexels: N, distanceTexels: number) => {
+    const receiverAt = (offsetTexels: N, distanceTexels: N) => {
       const correction = gradient.dot(offsetTexels.mul(texelUv));
       const limit = planeLimitPerTexel.mul(distanceTexels);
       return coord.z.add(correction.clamp(limit.negate(), limit));
@@ -150,14 +162,15 @@ export function softSunShadowFilter({ depthTexture, shadowCoord, shadow }: Shado
     const searchRadius = receiverDistance.mul(tanSun.mul(0.5)).div(texelWorld).clamp(1, MAX_SEARCH_TEXELS).toVar();
     const blockerSum = float(0).toVar();
     const blockerCount = float(0).toVar();
-    for (const p of SEARCH_TAPS) {
-      const offset = rotate(p).mul(searchRadius);
-      const dist = Math.hypot(p[0], p[1]) * MAX_SEARCH_TEXELS;
+    Loop(SEARCH_TAPS.length, ({ i }) => {
+      const p = SEARCH_TAP_UNIFORMS.element(i).toVar();
+      const offset = rotate(p).mul(searchRadius).toVar();
+      const dist = p.length().mul(MAX_SEARCH_TEXELS);
       const depth = load(offset);
       const blocked = depth.lessThan(receiverAt(offset, dist));
       blockerSum.addAssign(blocked.select(depth, float(0)));
       blockerCount.addAssign(blocked.select(float(1), float(0)));
-    }
+    });
 
     const result = float(1).toVar();
     If(blockerCount.greaterThan(0), () => {
@@ -175,12 +188,13 @@ export function softSunShadowFilter({ depthTexture, shadowCoord, shadow }: Shado
         // returns a fraction, not a bit, and the disc's residual grain drops by
         // roughly the same factor as the texel footprint the tap covers.
         const lit = float(0).toVar();
-        for (const p of FILTER_TAPS) {
-          const offset = rotate(p).mul(radius);
-          const dist = Math.hypot(p[0], p[1]) * MAX_RADIUS_TEXELS;
+        Loop(FILTER_TAPS.length, ({ i }) => {
+          const p = FILTER_TAP_UNIFORMS.element(i).toVar();
+          const offset = rotate(p).mul(radius).toVar();
+          const dist = p.length().mul(MAX_RADIUS_TEXELS);
           const pixel = coord.xy.mul(mapSize).sub(0.5).add(offset);
-          const base = pixel.floor();
-          const f = pixel.fract();
+          const base = pixel.floor().toVar();
+          const f = pixel.fract().toVar();
           const wx = [f.x.oneMinus(), f.x];
           const wy = [f.y.oneMinus(), f.y];
           for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++) {
@@ -188,9 +202,9 @@ export function softSunShadowFilter({ depthTexture, shadowCoord, shadow }: Shado
             const tap = base.add(vec2(x, y)).clamp(vec2(0), mapSize.sub(1));
             const depth = textureLoad(depthTexture, tap, 0).r;
             const weight = wx[x].mul(wy[y]);
-            lit.addAssign(receiverAt(cornerOffset, dist + 1).lessThanEqual(depth).select(weight, float(0)));
+            lit.addAssign(receiverAt(cornerOffset, dist.add(1)).lessThanEqual(depth).select(weight, float(0)));
           }
-        }
+        });
         result.assign(lit.div(FILTER_TAPS.length));
       });
     });

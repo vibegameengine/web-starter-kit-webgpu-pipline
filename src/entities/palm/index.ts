@@ -16,16 +16,20 @@
  *
  * Albedo convention (matches `applyLightmap.ts` and the ray tracer): the raster
  * shades `material.color * map` (or `colorNode`), and the tracer reads
- * `material.color` (times the map's mean) as the flat albedo. The bark map is
- * therefore normalised so its mean is 1.0 and `material.color` carries the true
- * average colour; the leaf material uses `colorNode = vertexColor()` and keeps the
- * average leaf colour in `material.color`.
+ * `material.color` (times the map's mean) as the flat albedo. The trunk map holds
+ * the real albedo and `material.color` carries only the mean cavity term; the leaf
+ * material uses `colorNode = vertexColor()` and keeps the average leaf colour in
+ * `material.color`.
  */
 import * as THREE from 'three/webgpu';
-import { attribute, positionLocal, positionWorld, sin, uniform, vec3, vertexColor } from 'three/tsl';
+import { attribute, normalMap, positionWorld, sin, texture, uniform, uv, vec3, vertexColor } from 'three/tsl';
 import * as BufferGeometryUtils from 'three/examples/jsm/utils/BufferGeometryUtils.js';
-import { leafTranslucency } from '../foliage/translucency.ts';
+import { LEAF_PRESETS, buildLeafRamp, mixBiochemistry, sampleLeafRamp, veinTint, type LeafRamp } from '../foliage/leafOptics.ts';
+import { createLeafMaterial } from '../foliage/leafMaterial.ts';
+import { buildLeafSurface, type LeafSurface } from '../foliage/leafSurface.ts';
+import { buildTrunkSurface } from './trunkSurface.ts';
 import { createNoise, seededRandom } from '../../shared/lib/noise';
+import { installVertexMotion } from '../../shared/render/vertexMotion.ts';
 
 export interface PalmOptions {
   seed: number;
@@ -33,6 +37,8 @@ export interface PalmOptions {
   height: number;
   /** Trunk lean in radians; default derived from the seed (0.1..0.35). */
   lean?: number;
+  /** Sky for the fronds' cuticle reflection and back-lit transmission. */
+  environment?: THREE.Texture;
 }
 
 export interface Palm {
@@ -54,7 +60,10 @@ const GOLDEN_ANGLE = 2.399963;
 interface Vert {
   p: THREE.Vector3;
   n: THREE.Vector3;
+  /** Linear reflectance. */
   c: RGB;
+  /** Linear transmittance; zero for wood. */
+  t: RGB;
   u: number;
   v: number;
   /** Wind weight, 0 at a frond base .. 1 at its tip. */
@@ -65,6 +74,7 @@ class MeshBuilder {
   private readonly pos: number[] = [];
   private readonly nor: number[] = [];
   private readonly col: number[] = [];
+  private readonly trans: number[] = [];
   private readonly uv: number[] = [];
   private readonly sway: number[] = [];
 
@@ -72,6 +82,7 @@ class MeshBuilder {
     this.pos.push(v.p.x, v.p.y, v.p.z);
     this.nor.push(v.n.x, v.n.y, v.n.z);
     this.col.push(v.c[0], v.c[1], v.c[2]);
+    this.trans.push(v.t[0], v.t[1], v.t[2]);
     this.uv.push(v.u, v.v);
     this.sway.push(v.s);
   }
@@ -93,15 +104,19 @@ class MeshBuilder {
     g.setAttribute('normal', new THREE.Float32BufferAttribute(this.nor, 3));
     g.setAttribute('uv', new THREE.Float32BufferAttribute(this.uv, 2));
     g.setAttribute('color', new THREE.Float32BufferAttribute(this.col, 3));
+    g.setAttribute('transmittance', new THREE.Float32BufferAttribute(this.trans, 3));
     g.setAttribute('sway', new THREE.Float32BufferAttribute(this.sway, 1));
     return g;
   }
 }
 
-const vert = (p: THREE.Vector3, n: THREE.Vector3, c: RGB, u: number, v: number, s: number): Vert => ({
+const NO_TRANSMISSION: RGB = [0, 0, 0];
+
+const vert = (p: THREE.Vector3, n: THREE.Vector3, c: RGB, u: number, v: number, s: number, t: RGB = NO_TRANSMISSION): Vert => ({
   p: p.clone(),
   n: n.clone(),
   c,
+  t,
   u,
   v,
   s,
@@ -110,7 +125,6 @@ const vert = (p: THREE.Vector3, n: THREE.Vector3, c: RGB, u: number, v: number, 
 const lerp = (a: number, b: number, t: number): number => a + (b - a) * t;
 const clamp01 = (x: number): number => Math.min(1, Math.max(0, x));
 const mixRGB = (a: RGB, b: RGB, t: number): RGB => [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t)];
-const scaleRGB = (a: RGB, k: number): RGB => [a[0] * k, a[1] * k, a[2] * k];
 
 // ---------------------------------------------------------------------------
 // Trunk
@@ -121,6 +135,9 @@ interface TrunkResult {
   /** Crown base: end point and tangent of the spine. */
   top: THREE.Vector3;
   topTangent: THREE.Vector3;
+  /** Arc length of the spine and the mean radius, metres: the surface's texel scale. */
+  length: number;
+  meanRadius: number;
 }
 
 function buildTrunk(height: number, lean: number, leanAz: number, rng: () => number, noise: ReturnType<typeof createNoise>): TrunkResult {
@@ -142,7 +159,8 @@ function buildTrunk(height: number, lean: number, leanAz: number, rng: () => num
   }
   const curve = new THREE.CatmullRomCurve3(points, false, 'centripetal');
   const lengthSegments = 32;
-  const radialSegments = 12;
+  // 24 around: at arm's length the silhouette must not read as a prism.
+  const radialSegments = 24;
   const arcLength = curve.getLength();
   const frames = curve.computeFrenetFrames(lengthSegments, false);
 
@@ -158,7 +176,7 @@ function buildTrunk(height: number, lean: number, leanAz: number, rng: () => num
   const b = new MeshBuilder();
   const rings: Vert[][] = [];
   const barkColor: RGB = [1, 1, 1];
-  const textureRepeatMetres = 0.6;
+  let radiusSum = 0;
   for (let i = 0; i <= lengthSegments; i++) {
     const t = i / lengthSegments;
     const centre = curve.getPointAt(t);
@@ -168,6 +186,7 @@ function buildTrunk(height: number, lean: number, leanAz: number, rng: () => num
     const dt = 1 / lengthSegments;
     const drds = (radiusAt(Math.min(1, t + dt)) - radiusAt(Math.max(0, t - dt))) / (2 * dt * arcLength);
     const ring: Vert[] = [];
+    radiusSum += radiusAt(t);
     for (let j = 0; j <= radialSegments; j++) {
       const a = (j / radialSegments) * TWO_PI;
       const radial = new THREE.Vector3().addScaledVector(normal, Math.cos(a)).addScaledVector(binormal, Math.sin(a));
@@ -175,7 +194,8 @@ function buildTrunk(height: number, lean: number, leanAz: number, rng: () => num
       const r = radiusAt(t) * wobble;
       const p = centre.clone().addScaledVector(radial, r);
       const n = radial.clone().addScaledVector(tangent, -drds).normalize();
-      ring.push(vert(p, n, barkColor, j / radialSegments, (t * arcLength) / textureRepeatMetres, 0));
+      // The surface textures cover the trunk once: u around, v = 0 at the base.
+      ring.push(vert(p, n, barkColor, j / radialSegments, t, 0));
     }
     rings.push(ring);
   }
@@ -204,91 +224,9 @@ function buildTrunk(height: number, lean: number, leanAz: number, rng: () => num
   // The trunk does not use vertex colours or sway; drop them so the lightmap
   // atlas packer and the BVH see a plain position/normal/uv mesh.
   geometry.deleteAttribute('color');
+  geometry.deleteAttribute('transmittance');
   geometry.deleteAttribute('sway');
-  return { geometry, top, topTangent };
-}
-
-// ---------------------------------------------------------------------------
-// Bark texture: 256x256 RGBA sRGB. Pale grey leaf-scar rings (one every 0.15 m)
-// with a dark groove under each, on a light warm grey-brown.
-// Returned with the map normalised to mean 1.0 and the true mean colour apart.
-// ---------------------------------------------------------------------------
-
-function linearToSrgb(x: number): number {
-  const c = clamp01(x);
-  return c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
-}
-
-function buildBarkTexture(noise: ReturnType<typeof createNoise>): { texture: THREE.DataTexture; mean: RGB } {
-  const size = 256;
-  const linear = new Float32Array(size * size * 3);
-  // Linear ≈ sRGB (0.55, 0.50, 0.42): a light, slightly warm grey.
-  const base: RGB = [0.24, 0.12, 0.035];
-  const ringsPerTile = 4;
-  for (let y = 0; y < size; y++) {
-    const v = y / size;
-    for (let x = 0; x < size; x++) {
-      const u = x / size;
-      // Tileable in u: sample noise on a circle so the seam closes.
-      const cu = Math.cos(u * TWO_PI);
-      const su = Math.sin(u * TWO_PI);
-      const warp = 0.045 * noise.noise3(cu * 1.5, su * 1.5, v * 4);
-      const ringPhase = (v + warp) * ringsPerTile;
-      const ringFrac = ringPhase - Math.floor(ringPhase);
-      // Leaf scar: a broad pale band (the old leaf base) with a dark groove
-      // just under it, then plain internode.
-      const band = Math.pow(clamp01(1 - Math.abs(ringFrac - 0.3) / 0.22), 0.6);
-      const groove = Math.pow(clamp01(1 - Math.abs(ringFrac - 0.06) / 0.07), 1.1);
-      const mottle = noise.fbm3(cu * 3, su * 3, v * 9, 4) * 0.12;
-      const fibre = noise.fbm3(cu * 16, su * 16, v * 2, 3) * 0.07;
-      const scar = band * 0.38 - groove * 0.6;
-      const k = 1 + mottle + fibre + scar;
-      // Scar bands are greyer (less warm) than the internodes.
-      const warmth = 1 + 0.08 * noise.noise3(cu * 2, su * 2, v * 3 + 7) - band * 0.1;
-      const i = (y * size + x) * 3;
-      linear[i] = base[0] * k * warmth;
-      linear[i + 1] = base[1] * k;
-      linear[i + 2] = base[2] * k * (2 - warmth);
-    }
-  }
-  const mean: RGB = [0, 0, 0];
-  for (let i = 0; i < linear.length; i += 3) {
-    mean[0] += linear[i];
-    mean[1] += linear[i + 1];
-    mean[2] += linear[i + 2];
-  }
-  const texels = size * size;
-  mean[0] /= texels;
-  mean[1] /= texels;
-  mean[2] /= texels;
-
-  // Normalise so mean(clamp(map)) == 1 per channel: the shader's color * map then
-  // averages to the true albedo, and the tracer's flat `material.color` agrees.
-  const gain: RGB = [1 / mean[0], 1 / mean[1], 1 / mean[2]];
-  for (let pass = 0; pass < 3; pass++) {
-    for (let ch = 0; ch < 3; ch++) {
-      let sum = 0;
-      for (let i = ch; i < linear.length; i += 3) sum += Math.min(1, linear[i] * gain[ch]);
-      gain[ch] *= texels / sum;
-    }
-  }
-  const data = new Uint8Array(size * size * 4);
-  for (let t = 0; t < texels; t++) {
-    data[t * 4] = Math.round(linearToSrgb(linear[t * 3] * gain[0]) * 255);
-    data[t * 4 + 1] = Math.round(linearToSrgb(linear[t * 3 + 1] * gain[1]) * 255);
-    data[t * 4 + 2] = Math.round(linearToSrgb(linear[t * 3 + 2] * gain[2]) * 255);
-    data[t * 4 + 3] = 255;
-  }
-  const texture = new THREE.DataTexture(data, size, size, THREE.RGBAFormat, THREE.UnsignedByteType);
-  texture.colorSpace = THREE.SRGBColorSpace;
-  texture.wrapS = THREE.RepeatWrapping;
-  texture.wrapT = THREE.RepeatWrapping;
-  texture.magFilter = THREE.LinearFilter;
-  texture.minFilter = THREE.LinearMipmapLinearFilter;
-  texture.generateMipmaps = true;
-  texture.anisotropy = 4;
-  texture.needsUpdate = true;
-  return { texture, mean };
+  return { geometry, top, topTangent, length: arcLength, meanRadius: radiusSum / (lengthSegments + 1) };
 }
 
 // ---------------------------------------------------------------------------
@@ -313,8 +251,9 @@ interface FrondParams {
   leafletLength: number;
   /** Widest leaflet, metres. */
   leafletWidth: number;
-  colorBase: RGB;
-  colorTip: RGB;
+  /** Leaf optics from the frond's base to its tip. */
+  ramp: LeafRamp;
+  /** Reflectance of the rachis (a petiole: wood, opaque). */
   rachisColor: RGB;
   rachisRadius: number;
   rng: () => number;
@@ -322,6 +261,7 @@ interface FrondParams {
 
 interface ColorStat {
   sum: RGB;
+  sumT: number;
   count: number;
 }
 
@@ -387,10 +327,11 @@ function buildFrond(params: FrondParams, stat: ColorStat): THREE.BufferGeometry 
   const upAt = (t: THREE.Vector3): THREE.Vector3 => new THREE.Vector3().crossVectors(side, t).normalize();
 
   const b = new MeshBuilder();
-  const addStat = (c: RGB, n: number): void => {
+  const addStat = (c: RGB, t: RGB, n: number): void => {
     stat.sum[0] += c[0] * n;
     stat.sum[1] += c[1] * n;
     stat.sum[2] += c[2] * n;
+    stat.sumT += (0.2126 * t[0] + 0.7152 * t[1] + 0.0722 * t[2]) * n;
     stat.count += n;
   };
 
@@ -403,7 +344,7 @@ function buildFrond(params: FrondParams, stat: ColorStat): THREE.BufferGeometry 
     const t = curve.tangent(s);
     const n2 = upAt(t);
     const r = lerp(params.rachisRadius, params.rachisRadius * 0.18, s);
-    const col = mixRGB(params.rachisColor, params.colorBase, s * 0.5);
+    const col = mixRGB(params.rachisColor, params.ramp.R[0], s * 0.5);
     const ring: Vert[] = [];
     for (let j = 0; j <= 4; j++) {
       const a = (j / 4) * TWO_PI + Math.PI / 4;
@@ -417,7 +358,7 @@ function buildFrond(params: FrondParams, stat: ColorStat): THREE.BufferGeometry 
       b.quad(rachisRings[i][j], rachisRings[i][j + 1], rachisRings[i + 1][j + 1], rachisRings[i + 1][j]);
     }
   }
-  addStat(params.rachisColor, rachisSegments * 8);
+  addStat(params.rachisColor, NO_TRANSMISSION, rachisSegments * 8);
 
   // Leaflets in pairs along the rachis, after a bare petiole. Each leaflet is a
   // lanceolate strip of three segments, folded along its midrib (Λ section), that
@@ -463,20 +404,22 @@ function buildFrond(params: FrondParams, stat: ColorStat): THREE.BufferGeometry 
         const half = w * rowW[r] * 0.5;
         const fold = half * 0.45;
         const tipMix = clamp01(Math.pow(k, 1.2) * 0.8 + frondTipMix * 0.3);
-        const col = scaleRGB(mixRGB(params.colorBase, params.colorTip, tipMix), 1 + leafletVar);
+        // `leafletVar` shifts the leaflet's age along the ramp: chlorophyll
+        // content, not brightness, is what varies between neighbouring leaflets.
+        const { R: col, T: trans } = sampleLeafRamp(params.ramp, clamp01(tipMix + leafletVar));
         const swayW = clamp01(s + 0.18 * k);
         if (half < 1e-4) {
-          rows.push([vert(p, nrm, col, 0.5, k, swayW)]);
+          rows.push([vert(p, nrm, col, 0.5, k, swayW, trans)]);
         } else {
           const nL = nrm.clone().multiplyScalar(half).addScaledVector(wDir, -fold).normalize();
           const nR = nrm.clone().multiplyScalar(half).addScaledVector(wDir, fold).normalize();
           rows.push([
-            vert(p.clone().addScaledVector(wDir, -half), nL, col, 0, k, swayW),
-            vert(p.clone().addScaledVector(nrm, fold), nrm, col, 0.5, k, swayW),
-            vert(p.clone().addScaledVector(wDir, half), nR, col, 1, k, swayW),
+            vert(p.clone().addScaledVector(wDir, -half), nL, col, 0, k, swayW, trans),
+            vert(p.clone().addScaledVector(nrm, fold), nrm, col, 0.5, k, swayW, trans),
+            vert(p.clone().addScaledVector(wDir, half), nR, col, 1, k, swayW, trans),
           ]);
         }
-        addStat(col, 3);
+        addStat(col, trans, 3);
       }
       for (let r = 0; r < rows.length - 1; r++) {
         const a = rows[r];
@@ -503,6 +446,15 @@ function triangleCount(geometry: THREE.BufferGeometry): number {
   return index ? index.count / 3 : geometry.getAttribute('position').count / 3;
 }
 
+/** Leaflet relief is a property of the species; one map serves every palm. */
+let frondSurfaceCache: LeafSurface | null = null;
+function frondSurface(): LeafSurface {
+  if (!frondSurfaceCache) {
+    frondSurfaceCache = buildLeafSurface({ venation: 'parallel', width: 0.07, length: 0.75, noise: createNoise(903) });
+  }
+  return frondSurfaceCache;
+}
+
 export function createPalm(options: PalmOptions): Palm {
   const seed = options.seed | 0;
   const height = THREE.MathUtils.clamp(options.height, 2, 8);
@@ -516,13 +468,24 @@ export function createPalm(options: PalmOptions): Palm {
 
   // Trunk ------------------------------------------------------------------
   const trunk = buildTrunk(height, lean, leanAz, rng, noise);
-  const bark = buildBarkTexture(noise);
-  const trunkMaterial = new THREE.MeshStandardNodeMaterial({
-    map: bark.texture,
-    roughness: 0.88,
-    metalness: 0,
-  });
-  trunkMaterial.color.setRGB(bark.mean[0], bark.mean[1], bark.mean[2], THREE.LinearSRGBColorSpace);
+  const surfaceStart = performance.now();
+  const bark = buildTrunkSurface({ height: trunk.length, radius: trunk.meanRadius, rng, noise });
+  const surfaceMs = performance.now() - surfaceStart;
+  // Wood is a dielectric (n ≈ 1.5 → F0 0.04, the standard material's default).
+  // The map is the real albedo. The raster shades `map · cavity`; a flat tracer
+  // reads `map · color` with `color = mean cavity`, so both agree on average
+  // (`userData.lightmapAlbedo` makes the bake use the raster's expression).
+  const trunkMaterial = new THREE.MeshStandardNodeMaterial({ map: bark.albedo, roughness: 1, metalness: 0 });
+  trunkMaterial.name = 'palm-trunk';
+  trunkMaterial.color.setRGB(bark.meanCavity, bark.meanCavity, bark.meanCavity, THREE.LinearSRGBColorSpace);
+  {
+    const roughnessCavity = texture(bark.roughnessCavity, uv());
+    const cavity = roughnessCavity.r;
+    trunkMaterial.colorNode = texture(bark.albedo, uv()).rgb.mul(cavity);
+    trunkMaterial.roughnessNode = roughnessCavity.g;
+    trunkMaterial.normalNode = normalMap(texture(bark.normal, uv()).xyz);
+    trunkMaterial.userData.lightmapAlbedo = true;
+  }
   const trunkMesh = new THREE.Mesh(trunk.geometry, trunkMaterial);
   trunkMesh.name = 'palmTrunk';
   trunkMesh.castShadow = true;
@@ -531,14 +494,12 @@ export function createPalm(options: PalmOptions): Palm {
 
   // Crown ------------------------------------------------------------------
   const crownBase = trunk.top.clone().addScaledVector(trunk.topTangent, 0.1);
-  const stat: ColorStat = { sum: [0, 0, 0], count: 0 };
+  const stat: ColorStat = { sum: [0, 0, 0], sumT: 0, count: 0 };
   const frondGeometries: THREE.BufferGeometry[] = [];
   const frondCount = 11 + Math.floor(rng() * 4);
   const spikeCount = 2 + Math.floor(rng() * 2);
   const frondLength = THREE.MathUtils.clamp(height * (0.75 + rng() * 0.1), 2.4, 4.4);
   const leafletLength = THREE.MathUtils.clamp(frondLength * 0.25, 0.55, 0.95);
-  const green: RGB = [0.16, 0.34, 0.07];
-  const yellowGreen: RGB = [0.5, 0.62, 0.14];
   const azimuth0 = rng() * TWO_PI;
   for (let i = 0; i < frondCount; i++) {
     // Phyllotaxis: fronds spiral out by the golden angle. The youngest two or
@@ -551,10 +512,21 @@ export function createPalm(options: PalmOptions): Palm {
     const tipElevation = spike ? 0.85 - i * 0.28 : lerp(-0.62, -1.05, age) + (rng() - 0.5) * 0.12;
     const lengthMul = spike ? 0.58 + i * 0.07 : 0.92 + rng() * 0.14;
     const upperness = spike ? 1 : clamp01(1 - age * 1.1);
-    const frondVar = 1 + (rng() - 0.5) * 0.14;
-    // Younger fronds lean yellow-green, older ones sit darker green.
-    const colorBase = scaleRGB(mixRGB(green, yellowGreen, 0.1 + upperness * 0.25), frondVar * lerp(0.82, 1, upperness));
-    const colorTip = scaleRGB(mixRGB(green, yellowGreen, 0.75 + upperness * 0.25), frondVar);
+    // Frond biochemistry. A frond opens pale (a third of the mature chlorophyll),
+    // greens up over its first months, and the lowest fronds are senescing:
+    // chlorophyll breaks down, carotenoids remain, and the blade yellows before
+    // it browns. Leaflets near the tip of a frond are the last to mature.
+    const chlorophyllVar = 1 + (rng() - 0.5) * 0.14;
+    const vary = (b: typeof LEAF_PRESETS.palmMature) => ({ ...b, Cab: b.Cab * chlorophyllVar });
+    const bioBase = vary(
+      mixBiochemistry(
+        mixBiochemistry(LEAF_PRESETS.palmMature, LEAF_PRESETS.palmYoung, upperness * 0.35),
+        LEAF_PRESETS.palmSenescent,
+        spike ? 0 : Math.pow(age, 2) * 0.7,
+      ),
+    );
+    const bioTip = vary(mixBiochemistry(bioBase, LEAF_PRESETS.palmYoung, spike ? 0.75 : 0.45));
+    const ramp = buildLeafRamp(bioBase, bioTip, 10);
     frondGeometries.push(
       buildFrond(
         {
@@ -571,9 +543,9 @@ export function createPalm(options: PalmOptions): Palm {
           leafletPairs: 22 + Math.floor(rng() * 9),
           leafletLength: leafletLength * (spike ? 0.8 : 1),
           leafletWidth: 0.062 + rng() * 0.022,
-          colorBase,
-          colorTip,
-          rachisColor: scaleRGB([0.4, 0.36, 0.1], frondVar),
+          ramp,
+          // Petiole: green-olive wood, ~sRGB (0.42, 0.40, 0.24).
+          rachisColor: [0.15, 0.135, 0.048],
           rachisRadius: 0.034,
           rng,
         },
@@ -583,8 +555,9 @@ export function createPalm(options: PalmOptions): Palm {
   }
   // The oldest fronds have died and hang brown-yellow straight down the trunk.
   const deadCount = 2 + Math.floor(rng() * 2);
-  const deadBase: RGB = [0.34, 0.25, 0.08];
-  const deadTip: RGB = [0.5, 0.4, 0.13];
+  // Dead tissue: no chlorophyll left, browned by oxidised phenolics; the tips
+  // bleach paler in the sun than the base of the frond.
+  const deadRamp = buildLeafRamp(LEAF_PRESETS.palmDead, { N: 1.6, Cab: 0.3, Car: 0.6, Cbrown: 1.0 }, 6);
   for (let i = 0; i < deadCount; i++) {
     const azimuth = azimuth0 + (i + 0.5) * (TWO_PI / deadCount) + (rng() - 0.5) * 0.6;
     frondGeometries.push(
@@ -600,9 +573,8 @@ export function createPalm(options: PalmOptions): Palm {
           leafletPairs: 22 + Math.floor(rng() * 5),
           leafletLength: leafletLength * 0.85,
           leafletWidth: 0.06,
-          colorBase: deadBase,
-          colorTip: deadTip,
-          rachisColor: [0.36, 0.26, 0.09],
+          ramp: deadRamp,
+          rachisColor: [0.2, 0.135, 0.055],
           rachisRadius: 0.028,
           rng,
         },
@@ -617,26 +589,31 @@ export function createPalm(options: PalmOptions): Palm {
   leavesGeometry.computeBoundingSphere();
 
   const windTime = uniform(0);
-  const leavesMaterial = new THREE.MeshStandardNodeMaterial({
-    roughness: 0.55,
-    metalness: 0,
-    side: THREE.DoubleSide,
+  const windTimePrev = uniform(0);
+  const leavesMaterial = createLeafMaterial({
+    surface: frondSurface(),
+    ior: 1.42,
+    meanReflectance: [stat.sum[0] / stat.count, stat.sum[1] / stat.count, stat.sum[2] / stat.count],
+    meanTransmittance: stat.sumT / stat.count,
+    veinTint: veinTint(LEAF_PRESETS.palmMature),
+    environment: options.environment,
+    name: 'palm-frond',
   });
-  leavesMaterial.colorNode = vertexColor();
-  // Thin fronds: the GI tracer lets light through them (see giVisibility).
-  leavesMaterial.userData.giTransmission = 0.45;
-  leavesMaterial.emissiveNode = leafTranslucency(0.28);
-  leavesMaterial.color.setRGB(stat.sum[0] / stat.count, stat.sum[1] / stat.count, stat.sum[2] / stat.count, THREE.LinearSRGBColorSpace);
   // Wind: a slow lateral sway growing toward the frond tips, phased by world x so
   // neighbouring palms do not move in lockstep. `positionWorld` reads the
   // undisplaced local position here (the assignment into `positionLocal` happens
   // after this expression is evaluated), which is what we want for a phase.
   {
     const swayWeight = attribute('sway', 'float');
-    const phase = windTime.mul(1.3).add(positionWorld.x.mul(0.5)).add((seed % 97) * 0.37);
-    const primary = sin(phase).mul(0.05).mul(swayWeight);
-    const secondary = sin(phase.mul(0.63).add(1.7)).mul(0.03).mul(swayWeight);
-    leavesMaterial.positionNode = positionLocal.add(vec3(primary, secondary.mul(0.5), secondary));
+    // As a function of the wind clock, so the motion vector (vertexMotion.ts) can
+    // evaluate the same sway at the previous frame's time.
+    const displaceAt = (t: ReturnType<typeof uniform>) => {
+      const phase = t.mul(1.3).add(positionWorld.x.mul(0.5)).add((seed % 97) * 0.37);
+      const primary = sin(phase).mul(0.05).mul(swayWeight);
+      const secondary = sin(phase.mul(0.63).add(1.7)).mul(0.03).mul(swayWeight);
+      return vec3(primary, secondary.mul(0.5), secondary);
+    };
+    installVertexMotion(leavesMaterial, displaceAt, windTime, windTimePrev);
   }
   const leavesMesh = new THREE.Mesh(leavesGeometry, leavesMaterial);
   leavesMesh.name = 'palmLeaves';
@@ -663,7 +640,8 @@ export function createPalm(options: PalmOptions): Palm {
       crownBase.z + Math.sin(az) * dist,
     );
     const ripeness = rng();
-    const col: RGB = mixRGB([0.3, 0.34, 0.1], [0.36, 0.26, 0.09], ripeness);
+    // Husk: chlorophyll-green epicarp ripening to a dry brown.
+    const col: RGB = mixRGB([0.14, 0.19, 0.05], [0.2, 0.13, 0.05], ripeness);
     const count = g.getAttribute('position').count;
     const colors = new Float32Array(count * 3);
     for (let k = 0; k < count; k++) {
@@ -689,12 +667,13 @@ export function createPalm(options: PalmOptions): Palm {
 
   const triangles = triangleCount(trunk.geometry) + triangleCount(leavesGeometry) + triangleCount(nutsGeometry);
   console.log(
-    `[palm] seed ${seed}: ${triangles} triangles (trunk ${triangleCount(trunk.geometry)}, leaves ${triangleCount(leavesGeometry)}, coconuts ${triangleCount(nutsGeometry)}), ${frondCount} fronds + ${deadCount} dead, frond ${frondLength.toFixed(2)} m`,
+    `[palm] seed ${seed}: ${triangles} triangles (trunk ${triangleCount(trunk.geometry)}, leaves ${triangleCount(leavesGeometry)}, coconuts ${triangleCount(nutsGeometry)}), ${frondCount} fronds + ${deadCount} dead, frond ${frondLength.toFixed(2)} m, trunk surface ${surfaceMs.toFixed(0)} ms`,
   );
 
   return {
     group,
     update(timeSec: number): void {
+      windTimePrev.value = windTime.value;
       windTime.value = timeSec;
     },
   };

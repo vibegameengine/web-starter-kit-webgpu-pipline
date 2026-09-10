@@ -1,5 +1,5 @@
 import * as THREE from 'three/webgpu';
-import { Fn, clamp, float, min, smoothstep, texture, uniform, uv, vec2, vec3, vec4 } from 'three/tsl';
+import { Fn, float, min, smoothstep, texture, uniform, uv, vec2, vec3, vec4 } from 'three/tsl';
 
 /**
  * The free surface, baked once per frame into one texture over the slab
@@ -47,10 +47,10 @@ export class SurfaceField {
       type: THREE.HalfFloatType,
       format: THREE.RGBAFormat,
       depthBuffer: false,
-      generateMipmaps: false,
+      generateMipmaps: true,
     });
     this.target.texture.name = 'waterSurfaceField';
-    this.target.texture.minFilter = THREE.LinearFilter;
+    this.target.texture.minFilter = THREE.LinearMipmapLinearFilter;
     this.target.texture.magFilter = THREE.LinearFilter;
     this.target.texture.wrapS = this.target.texture.wrapT = THREE.ClampToEdgeWrapping;
     this.node = texture(this.target.texture);
@@ -90,10 +90,12 @@ export class SurfaceField {
       const depth = film(xz) as F;
       const w = wind(xz) as V3;
       const cap = min(float(windCap), depth.mul(0.4));
-      const rise = clamp(w.x, cap.negate(), cap);
+      const capRatio = w.x.div(cap.max(0.0001));
+      const compression = float(1).div(float(1).add(capRatio.mul(capRatio)).sqrt());
+      const rise = w.x.mul(compression);
       const alive = smoothstep(0.0, 0.05, depth);
       const eta = etaC.sub(level).add(rise).mul(mask);
-      const slope = simSlope.add(w.yz.mul(alive)).mul(mask);
+      const slope = simSlope.add(w.yz.mul(compression.pow(3)).mul(alive)).mul(mask);
       return vec4(eta, slope.x, slope.y, depth);
     })();
     this.quad = new THREE.QuadMesh(material);
@@ -123,7 +125,8 @@ export class SurfaceField {
     const decode = raw instanceof Uint16Array ? (v: number) => THREE.DataUtils.fromHalfFloat(v) : (v: number) => v;
     const fx = Math.max(0, Math.min(1, px - i));
     const fz = Math.max(0, Math.min(1, pz - j));
-    const at = (corner: number, channel: number) => decode(raw[corner * 4 + channel]);
+    const rowElements = Math.ceil(2 * 4 * raw.BYTES_PER_ELEMENT / 256) * 256 / raw.BYTES_PER_ELEMENT;
+    const at = (corner: number, channel: number) => decode(raw[Math.floor(corner / 2) * rowElements + (corner % 2) * 4 + channel]);
     const lerp2 = (channel: number) =>
       (at(0, channel) * (1 - fx) + at(1, channel) * fx) * (1 - fz) + (at(2, channel) * (1 - fx) + at(3, channel) * fx) * fz;
     return { eta: lerp2(0), slopeX: lerp2(1), slopeZ: lerp2(2) };
@@ -132,5 +135,10 @@ export class SurfaceField {
   /** Field uv of a world xz. */
   uvOf(xz: THREE.Node) {
     return (xz as ReturnType<typeof vec2>).div(this.texel * this.size).add(0.5);
+  }
+
+  dispose(): void {
+    this.target.dispose();
+    for (const material of Array.isArray(this.quad.material) ? this.quad.material : [this.quad.material]) material.dispose();
   }
 }

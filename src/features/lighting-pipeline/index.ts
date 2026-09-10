@@ -22,6 +22,7 @@ import { DEFAULT_MOTION_BLUR, MotionBlur, type MotionBlurGaze, type MotionBlurSe
 import { readFloatTexture, readValidationTexture } from '../../shared/render/gpuReadback.ts';
 import { bakeKey, loadBake, saveBake } from '../../shared/gi/bake/persistedBake.ts';
 import { padLightmapCharts } from '../../shared/gi/bake/chartPadding.ts';
+import { sunIntensityFromEnvironment } from './sunFromEnvironment.ts';
 import {
   createLightControls,
   findSunPositionWeighted,
@@ -53,11 +54,18 @@ export interface SceneHost {
   /** Whether the orbiting demo sphere is in the scene unless `?mover=0`. */
   moverByDefault: boolean;
   /**
+   * Initial sun strength: a number, or `'environment'` to carry the energy the GI's
+   * luminance knee clips from the panorama's sun (see sunFromEnvironment.ts).
+   * Absent = the authored default. `?sun=<value>` overrides either.
+   */
+  sunIntensity?: number | 'environment';
+  /**
    * Present when the scene has single-layer translucents on `Layer.Overlay` (water):
    * the frame graph adds the overlay pass and calls this with the composited colour
    * and the scene depth every time those textures are (re)created.
    */
   bindScreen?: (color: THREE.Texture, depth: THREE.Texture, normal: THREE.Texture) => void;
+  interiorVolumes?: THREE.Box3[];
   /**
    * Volumetric fog preset for this scene (density, height, the box it lives in). Absent
    * = no fog unless `?fog=1`; present = on unless `?fog=0`. Runtime toggle in the GUI.
@@ -81,6 +89,7 @@ export interface SceneHost {
    * lifecycle live, 23.8 ms frozen.
    */
   staticLighting?: boolean;
+  // @important No scene sets it. The beach did and was wrong, though not for the reason first written: its ball is `giExclude`, so the GI has no movers at all there (`__audit.dynamicScene()` reports movers 0, 2026-09-10). Freezing the live half put out the foliage's only light instead, since leaves carry no lightmap chart. Kept for a genuinely still diorama; ?freezeAll=1 tests it.
   /** Traced reflections preset. On by default (`?reflections=0` turns it off). */
   reflections?: Partial<ReflectionSettings>;
   /** Motion blur preset. Off by default (`?motionBlur=1` turns it on, `?gaze=centre|camera`, `?shutter=`, `?integration=` ms). */
@@ -93,6 +102,8 @@ export interface PipelineUi {
   showError(error: unknown): void;
   /** `?hud=0`: no HUD, no GUI, no inspector widget in a judged frame. */
   showChrome: boolean;
+  /** Recalls the saved panel state into whatever folders exist so far; called before the bake reads the sun. */
+  applySavedSettings?(gui: GUI): void;
 }
 
 export interface LightingPipeline {
@@ -181,6 +192,14 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
     sun,
   );
   const envIntensityParam = num('env') ?? 1;
+  {
+    const requested = num('sun') ?? (host.sunIntensity === 'environment' ? sunIntensityFromEnvironment(gi.envTexture) * envIntensityParam : host.sunIntensity);
+    if (typeof requested === 'number' && Number.isFinite(requested)) {
+      lightCfg.intensity = requested;
+      updateLightFromAngles();
+      console.info(`[sun] intensity ${requested.toFixed(2)} (${num('sun') !== null ? '?sun' : host.sunIntensity === 'environment' ? 'from the environment map' : 'scene default'})`);
+    }
+  }
   // `?sun=0` puts the sun out without removing it, which is the only way to show that
   // an emissive surface is a *light source* rather than a surface that happens to look
   // bright when something else is lighting it. Pair with `?env=0`; the sky is the other
@@ -388,15 +407,6 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
     });
   };
 
-  /**
-   * `surfel` resolves the cache on screen every frame; `lightmap` samples a texture
-   * and does no GI work at all.
-   *
-   * These are not two views of one state, they are two consumers of the *same* surfel
-   * pool, and the bake spends the whole pool on atlas texels. So a switch is not a
-   * toggle — each direction has to re-prepare the pool for its own occupant, which is
-   * why this is async and shows the loading overlay rather than flipping instantly.
-   */
   // One pipeline: static light baked once into the atlas, dynamics from live
   // surfels, the frame adds them. There used to be three modes — `surfel` ran the
   // live chain alone, `lightmap` switched the whole dynamic half off, `hybrid` was
@@ -535,7 +545,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
     frameGraph.hybridReceivers.value = 1;
     // The tracer reads the same atlas at static hits (`?atlasHits=0` keeps every hit
     // on the surfel cache, which is the A/B control for what that read changes).
-    if (params.get('atlasHits') !== '0') gi.useBakedAtlas(lightmapTexture);
+    if (params.get('atlasHits') !== '0') gi.useBakedAtlas(lightmapTexture, lightmapIntensity);
   }
 
   let refreshFrozenControl = () => {};
@@ -590,6 +600,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
       )
     : null;
 
+  ui.applySavedSettings?.(gui);
   await bakeStatic();
 
   const giParams = {
@@ -605,6 +616,8 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   };
   gi.setBaseSampleCount(giParams.baseSamples);
 
+  const surfelGi = { on: params.get('surfelGi') !== '0' };
+  let giTexturesBound = true;
   const giFolder = gui.addFolder('GI (surfel)');
   giFolder
     .add(giParams, 'mode', Object.values(GiMode))
@@ -620,8 +633,14 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
     .add(giParams, 'baseSamples', 1, 64, 1)
     .name('rays/surfel')
     .onChange((v: number) => gi.setRuntimeSampleCount(v));
+  giFolder.add(surfelGi, 'on').name('surfels: all');
   giFolder.add(giParams, 'rayBudget', 256, 16384, 256).name('GI rays/frame')
     .onChange((value: number) => { gi.runtimeRayBudget = value; });
+  const receiverParams = { movers: gi.dynamicGi, unbound: gi.unboundGi };
+  giFolder.add(receiverParams, 'movers').name('surfels: movers')
+    .onChange((value: boolean) => { gi.dynamicGi = value; });
+  giFolder.add(receiverParams, 'unbound').name('surfels: non-static')
+    .onChange((value: boolean) => { gi.unboundGi = value; });
 
   const atlas = gi.getCacheAtlas();
   frameGraph.setCacheAtlasNode(atlas?.node ?? null);
@@ -677,7 +696,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   fogFolder.add(fogSettings, 'temporalBlend', 0, 0.97, 0.01).name('temporal blend');
   fogFolder.close();
   // Reflections: screen trace, then the contact tree + movers, then the environment.
-  // `?reflections=0|1`, `?reflectionsRoughness=`.
+  // @important `?reflectionsBudget=` caps BVH nodes per reflection ray; 0, the default, is no ceiling.
   const reflectionsParam = params.get('reflections');
   const reflections = new ReflectionPass(renderer, camera, gi.blueNoiseTexture, gi.envTexture, meanEnvironmentRadiance(gi.envTexture).multiplyScalar(0.5), {
     ...host.reflections,
@@ -685,6 +704,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   });
   const reflectionsRoughness = num('reflectionsRoughness'); if (reflectionsRoughness !== null) reflections.settings.maxRoughness = reflectionsRoughness;
   const reflectionsEvery = num('reflectionsEvery'); if (reflectionsEvery !== null) reflections.settings.traceInterval = reflectionsEvery;
+  const reflectionsBudget = num('reflectionsBudget'); if (reflectionsBudget !== null) reflections.settings.rayNodeBudget = reflectionsBudget;
   const contactEvery = num('contactEvery'); if (contactEvery !== null) contact.settings.traceInterval = contactEvery;
   const reflectionsIntensity = uniform(reflections.settings.intensity);
   let reflectionsReaderBound: unknown = null;
@@ -697,7 +717,6 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
     const height = reader.height;
     frameGraph.setReflections({
       intensity: reflectionsIntensity,
-      specular: gi.specularTexture,
       sample: (uv) => {
         // 3x3 box over the half grid: the cheap half of Stachowiak's neighbour ray
         // reuse. One ray a frame on a moving leaf has no history to lean on, and nine
@@ -1053,7 +1072,8 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   let auditGiFrame = 10000;
   (window as unknown as Record<string, unknown>).__audit = {
     bakeCache: () => ({ ...bakeCache }),
-    lighting: () => ({ baked, staticFrozen: baked, runtimeFrozen: gi.frozen }),
+    // @important `staticFrozen` was the same variable as `baked`, so three checks asserted a tautology; it now reports the pinned atlas.
+    lighting: () => ({ baked, staticFrozen: gi.staticPinned, runtimeFrozen: gi.frozen, freezeAll: gi.freezeCompletely }),
     bakedTransport: () => gi.bakedTransportStats,
     rayBudget(value: number) {
       if (!Number.isFinite(value)) throw new Error('Finite GI ray budget required');
@@ -1168,6 +1188,24 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
     },
   };
 
+  // Generating this scene's WGSL is main-thread work; compiling it belongs to the GPU
+  // process, and the two used to run strictly one after the other. Measured on the beach
+  // 2026-09-09: 5.7 s of generation, then 4.8 s in which the main thread did nothing but
+  // wait for the compiler. Starting the programs here lets the contact tree — the last
+  // heavy CPU job of the boot, and until now the first frame's problem — be built while
+  // Dawn compiles.
+  // `?warmup=0` is the ablation: the programs are then built by the first frame, the
+  // way they used to be, with the contact tree waiting behind them.
+  // The Inspector prints one warning here — it cannot record a node built outside a
+  // frame, which this compile is by definition. Swapping a plain InspectorBase in for
+  // the duration was tried and is worse: the detached session inspector then resolves
+  // its timestamps against a renderer it no longer has. `?inspector=0` silences it.
+  const programs = params.get('warmup') === '0' ? Promise.resolve() : renderer.compileAsync(scene, camera);
+  if ((contact.enabled || reflections.enabled) && !contactBvh && gi.staticBvh) {
+    contactBvh = createContactBVH(scene, gi.staticBvh.materialIdByUUID);
+  }
+  await programs;
+
   renderer.setAnimationLoop(() => {
     if (fatal || (auditPaused && !auditStepOnce)) return;
     auditStepOnce = false;
@@ -1193,18 +1231,31 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
       // Immediately after the sphere moved and before anything traces: the dynamic BVH
       // is what makes it visible to a ray at all. It self-gates on the world matrix, so
       // a still scene pays a matrix compare and nothing else.
-      gi.updateDynamicScene();
-      gi.update(renderer, scene, camera);
-      frameGraph.setGiTextures(gi.outputTexture, gi.albedoTexture);
-      // Same G-buffer, same jittered camera, this frame: trace the contact rays now.
-      contact.update(contactTree(), gi.dynamicBvhBundle, gi.gbufferDepthTexture, gi.receiverTexture,
+      /* @important Switching a receiver class off has to stop the work, not just its screen read.
+         The resolve mask alone changed the picture and left the frame where it was, because the
+         G-buffer render, the spawn pass and the integrator all run per screen pixel whoever is
+         going to read them. With no class left to serve the chain has nothing to do at all, and
+         skipping it is worth 24.5 ms of a 33.1 ms frame at 4K (2026-09-10, default beach camera).
+         The beach reports zero movers, so its entire chain serves the unbaked class alone. */
+      const giHasWork = surfelGi.on
+        && (gi.unboundGi || (gi.dynamicGi && (gi.getDynamicBvh()?.moverCount ?? 0) > 0));
+      if (giHasWork) {
+        gi.updateDynamicScene();
+        gi.update(renderer, scene, camera);
+        frameGraph.setGiTextures(gi.outputTexture, gi.albedoTexture);
+        giTexturesBound = true;
+      } else if (giTexturesBound) {
+        frameGraph.setGiTextures(null, null);
+        giTexturesBound = false;
+      }
+      contact.update(contactTree(), gi.dynamicBvhBundle, frameGraph.scenePass.getTexture('depth'), frameGraph.scenePass.getTexture('normal'),
         renderer.domElement.width, renderer.domElement.height, true);
       syncContact();
       // Reflections read last frame's resolved colour: the TAA history. Without TAA the
       // pass still runs, against whatever the history holds (stale after a switch).
       if (reflections.enabled && !contactBvh && gi.staticBvh) contactBvh = createContactBVH(scene, gi.staticBvh.materialIdByUUID);
-      reflections.update(contactBvh, gi.dynamicBvhBundle, gi.diffuseArrayTexture, gi.gbufferDepthTexture, gi.receiverTexture,
-        gi.specularTexture, frameGraph.taa.historyTexture, renderer.domElement.width, renderer.domElement.height, 1);
+      reflections.update(contactBvh, gi.dynamicBvhBundle, gi.diffuseArrayTexture, frameGraph.scenePass.getTexture('depth'), frameGraph.scenePass.getTexture('normal'),
+        frameGraph.scenePass.getTexture('velocity'), frameGraph.scenePass.getTexture('albedo'), frameGraph.taa.historyTexture, renderer.domElement.width, renderer.domElement.height, 1);
       syncReflections();
     }
 

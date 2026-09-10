@@ -45,7 +45,8 @@ export const SurfelMoments = struct(
 );
 
 /**
- * Bytes one slot costs, summed over every allocation in `ensureCapacity`.
+ * Fixed per-slot storage. Anchors are a separate, compact allocation; small
+ * allocator counters and the four-float debug readback add 28 bytes per pool.
  *
  * Exported because docs/scale-report.md had to reconstruct this number by reading that
  * function term by term, and a reconstruction goes stale the first time somebody adds a
@@ -73,6 +74,12 @@ export type SurfelPool = {
   getGeneration: () => number;
 
   getSurfelAttr: () => THREE.StorageBufferAttribute | null;
+  getAnchorAttr: () => THREE.StorageBufferAttribute;
+  /** Anchor slot zero is a null sentinel; the remaining slots cover [start, capacity). */
+  getAnchorStart: () => number;
+  setAnchorStart: (renderer: THREE.WebGPURenderer, start: number) => void;
+  dispose: (renderer: THREE.WebGPURenderer) => number;
+  releaseRetired: (renderer: THREE.WebGPURenderer) => number;
   getAliveAtomic: () => THREE.StorageBufferNode;
   getPoolAttr: () => THREE.StorageInstancedBufferAttribute | null;
   getPoolAllocAtomic: () => THREE.StorageBufferNode;
@@ -101,6 +108,9 @@ export function createSurfelPool(): SurfelPool {
   let frameParity = 0; // to ping pong offsets in the double sized moments buffer
 
   let surfelAttr: THREE.StorageBufferAttribute | null = null; // packed struct (posb + normal + age int)
+  let anchorAttr: THREE.StorageBufferAttribute;
+  let anchorStart = 0;
+  const retiredAnchors: THREE.StorageBufferAttribute[] = [];
   let aliveCountAtomic: THREE.StorageBufferNode;
   let aliveCountArray: Int32Array | null = null;
 
@@ -151,6 +161,11 @@ export function createSurfelPool(): SurfelPool {
     if (surfelAttr && wanted <= capacity) return false;
     capacity = wanted;
     generation++;
+    retiredAnchors.push(...attributes());
+    anchorStart = capacity;
+    // Baking and the unbound path need only the null sentinel. Never allocate
+    // motion history for the atlas texels that dominate this pool.
+    anchorAttr = new THREE.StorageBufferAttribute(new Float32Array(8), 4);
 
     // 1x vec4 per surfel: posb (xyz + age), 1x vec3 normal, 1x int age
     surfelAttr = new THREE.StorageBufferAttribute(
@@ -226,6 +241,36 @@ export function createSurfelPool(): SurfelPool {
 
   function getTouched() {
     return touchedAtomic;
+  }
+
+  function setAnchorStart(renderer: THREE.WebGPURenderer, start: number): void {
+    if (!Number.isInteger(start) || start < 0 || start > capacity) throw new Error('Invalid anchor range');
+    if (start !== anchorStart) {
+      retiredAnchors.push(anchorAttr);
+      anchorStart = start;
+      anchorAttr = new THREE.StorageBufferAttribute(new Float32Array((capacity - start + 1) * 8), 4);
+    }
+    // Three r182 has no BufferAttribute.dispose(). Release replaced GPU storage
+    // through its backend; callers rebuild anchor-bound compute nodes by identity.
+    // Only destroy attributes that have actually been uploaded.
+    releaseRetired(renderer);
+  }
+
+  function attributes(): THREE.BufferAttribute[] {
+    return [surfelAttr, anchorAttr, poolAttr, momentsAttr, guidingAttr, surfelDepthAttr,
+      debugReadAttr, aliveCountAtomic?.value, poolAllocCountAtomic?.value, poolMaxCountAtomic?.value,
+      touchedAtomic?.value, debugExecAttr?.value].filter(Boolean);
+  }
+
+  function releaseRetired(renderer: THREE.WebGPURenderer): number {
+    let released = 0;
+    for (const attribute of new Set(retiredAnchors.splice(0))) {
+      if (renderer.backend.has(attribute) && renderer.backend.get(attribute).buffer) {
+        released += renderer.backend.get(attribute).buffer.size;
+        renderer.backend.destroyAttribute(attribute);
+      }
+    }
+    return released;
   }
   function getSurfelAttr() {
     return surfelAttr;
@@ -320,6 +365,11 @@ export function createSurfelPool(): SurfelPool {
     getCapacity: () => capacity,
     getGeneration: () => generation,
     getSurfelAttr,
+    getAnchorAttr: () => anchorAttr,
+    getAnchorStart: () => anchorStart,
+    setAnchorStart,
+    releaseRetired,
+    dispose: renderer => { retiredAnchors.push(...attributes()); return releaseRetired(renderer); },
     getAliveAtomic,
     getPoolAttr,
     getPoolAllocAtomic,

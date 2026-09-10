@@ -9,6 +9,7 @@ import {
   ivec2,
   max,
   mix,
+  outputStruct,
   sqrt,
   texture,
   textureLoad,
@@ -20,6 +21,7 @@ import {
   velocity,
 } from 'three/tsl';
 import { U_PREVIOUS_VIEW_PROJECTION, U_VIEW_PROJECTION } from './vertexMotion.ts';
+import { MotionStencil } from './taaMotionStencil.ts';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type N = any;
@@ -37,6 +39,46 @@ function halton(index: number, base: number): number {
   return result;
 }
 const JITTER: Array<[number, number]> = Array.from({ length: 8 }, (_, i) => [halton(i + 1, 2), halton(i + 1, 3)]);
+
+const toYCoCg = (c: N) => vec3(
+  c.r.mul(0.25).add(c.g.mul(0.5)).add(c.b.mul(0.25)),
+  c.r.mul(0.5).sub(c.b.mul(0.5)),
+  c.r.mul(-0.25).add(c.g.mul(0.5)).sub(c.b.mul(0.25)),
+);
+const fromYCoCg = (c: N) => vec3(
+  c.x.add(c.y).sub(c.z),
+  c.x.add(c.z),
+  c.x.sub(c.y).sub(c.z),
+);
+
+function catmullRomHistory(historyNode: N, texel: N, size: N): N {
+  return Fn(([sampleUv]: [N]) => {
+    const position = sampleUv.mul(size);
+    const centre = position.sub(0.5).floor().add(0.5);
+    const f = position.sub(centre);
+    const w0 = f.mul(f.mul(f.mul(-0.5).add(1.0)).sub(0.5));
+    const w1 = f.mul(f).mul(f.mul(1.5).sub(2.5)).add(1.0);
+    const w2 = f.mul(f.mul(f.mul(-1.5).add(2.0)).add(0.5));
+    const w3 = f.mul(f).mul(f.mul(0.5).sub(0.5));
+    const w12 = w1.add(w2);
+    const offset12 = w2.div(w12);
+    const tc0 = centre.sub(1).mul(texel);
+    const tc3 = centre.add(2).mul(texel);
+    const tc12 = centre.add(offset12).mul(texel);
+    const tap = (x: N, y: N, w: N) => historyNode.sample(vec2(x, y)).rgb.mul(w);
+    const sum = vec3(0).toVar();
+    sum.addAssign(tap(tc0.x, tc0.y, w0.x.mul(w0.y)));
+    sum.addAssign(tap(tc12.x, tc0.y, w12.x.mul(w0.y)));
+    sum.addAssign(tap(tc3.x, tc0.y, w3.x.mul(w0.y)));
+    sum.addAssign(tap(tc0.x, tc12.y, w0.x.mul(w12.y)));
+    sum.addAssign(tap(tc12.x, tc12.y, w12.x.mul(w12.y)));
+    sum.addAssign(tap(tc3.x, tc12.y, w3.x.mul(w12.y)));
+    sum.addAssign(tap(tc0.x, tc3.y, w0.x.mul(w3.y)));
+    sum.addAssign(tap(tc12.x, tc3.y, w12.x.mul(w3.y)));
+    sum.addAssign(tap(tc3.x, tc3.y, w3.x.mul(w3.y)));
+    return max(sum, vec3(0));
+  });
+}
 
 const quad = new THREE.QuadMesh();
 const drawingSize = new THREE.Vector2();
@@ -94,6 +136,7 @@ export class TemporalAANode extends THREE.TempNode {
   /** Pixel speed at which the history weight has fallen to `motionWeight`. */
   readonly motionPixels = uniform(24);
   readonly motionWeight = uniform(0.5);
+  readonly stencil = new MotionStencil();
 
   /** Two targets, ping-pong: the frame resolves into one while reading the other. */
   private readonly targets: [THREE.RenderTarget, THREE.RenderTarget];
@@ -123,10 +166,11 @@ export class TemporalAANode extends THREE.TempNode {
     super('vec4');
     this.updateBeforeType = THREE.NodeUpdateType.FRAME;
     const make = (name: string) => {
-      const rt = new THREE.RenderTarget(1, 1, { depthBuffer: false, type: THREE.HalfFloatType });
+      const rt = new THREE.RenderTarget(1, 1, { depthBuffer: false, type: THREE.HalfFloatType, count: 2 });
       rt.texture.name = name;
       rt.texture.minFilter = THREE.LinearFilter;
       rt.texture.magFilter = THREE.LinearFilter;
+      rt.textures[1].name = `${name}.velocity`;
       return rt;
     };
     this.targets = [make('TAA.a'), make('TAA.b')];
@@ -162,6 +206,12 @@ export class TemporalAANode extends THREE.TempNode {
   /** The frame being accumulated (the composed beauty the resolve reads), for audits. */
   get inputTexture(): THREE.Texture | null {
     return this.inputNode?.value ?? null;
+  }
+
+  setStencil(active: boolean): void {
+    if (this.stencil.active === active) return;
+    this.stencil.active = active;
+    this.buildMaterials();
   }
 
   /** Replaces the frame being accumulated (composite rebuilt); history is kept. */
@@ -287,7 +337,7 @@ export class TemporalAANode extends THREE.TempNode {
     quad.render(renderer);
     renderer.setRenderTarget(previousTarget);
     this.uOutputParity.value = this.copyMode ? 0 : this.parity;
-    if (this.copyMode) renderer.copyTextureToTexture(write.texture, read.texture);
+    if (this.copyMode) { renderer.copyTextureToTexture(write.texture, read.texture); renderer.copyTextureToTexture(write.textures[1], read.textures[1]); }
     else this.parity = 1 - this.parity;
     this.historyReady = true;
   }
@@ -301,28 +351,19 @@ export class TemporalAANode extends THREE.TempNode {
   private buildMaterials(): void {
     if (!this.inputNode) return;
     for (let p = 0; p < 2; p++) {
-      this.resolveMaterials[p].fragmentNode = this.buildResolve(this.inputNode, texture(this.targets[1 - p].texture));
+      const history = this.targets[1 - p];
+      this.resolveMaterials[p].fragmentNode = this.buildResolve(this.inputNode, texture(history.texture), texture(history.textures[1]));
       this.resolveMaterials[p].needsUpdate = true;
     }
   }
 
-  private buildResolve(inputNode: N, historyNode: N): N {
+  private buildResolve(inputNode: N, historyNode: N, previousMotion: N): N {
     const current = inputNode;
     const depth = this.depthNode;
     const motion = this.velocityNode;
     const texel = this.texelSize;
     const size = vec2(1).div(texel);
 
-    const toYCoCg = (c: N) => vec3(
-      c.r.mul(0.25).add(c.g.mul(0.5)).add(c.b.mul(0.25)),
-      c.r.mul(0.5).sub(c.b.mul(0.5)),
-      c.r.mul(-0.25).add(c.g.mul(0.5)).sub(c.b.mul(0.25)),
-    );
-    const fromYCoCg = (c: N) => vec3(
-      c.x.add(c.y).sub(c.z),
-      c.x.add(c.z),
-      c.x.sub(c.y).sub(c.z),
-    );
     const loadCurrent = (px: N) => vec3(textureLoad(current.value, px).rgb);
     const loadDepth = (px: N) => textureLoad(depth.value, px).r;
     // The RTT node itself has to sit in this material's graph, or it is never rendered.
@@ -332,35 +373,7 @@ export class TemporalAANode extends THREE.TempNode {
     const unjitterUv = uv().add(this.uJitter.mul(texel).mul(this.unjitterSign));
     const centreSample = vec3(current.sample(unjitterUv).rgb);
 
-    // Catmull-Rom 9-tap history fetch on the bilinear sampler (Jimenez 2016, 5 taps
-    // would drop the corners; the full 9 keeps the reconstruction symmetric).
-    const catmullRom = Fn(([sampleUv]: [N]) => {
-      const position = sampleUv.mul(size);
-      const centre = position.sub(0.5).floor().add(0.5);
-      const f = position.sub(centre);
-      const w0 = f.mul(f.mul(f.mul(-0.5).add(1.0)).sub(0.5));
-      const w1 = f.mul(f).mul(f.mul(1.5).sub(2.5)).add(1.0);
-      const w2 = f.mul(f.mul(f.mul(-1.5).add(2.0)).add(0.5));
-      const w3 = f.mul(f).mul(f.mul(0.5).sub(0.5));
-      const w12 = w1.add(w2);
-      const offset12 = w2.div(w12);
-      const tc0 = centre.sub(1).mul(texel);
-      const tc3 = centre.add(2).mul(texel);
-      const tc12 = centre.add(offset12).mul(texel);
-      const tap = (x: N, y: N, w: N) => historyNode.sample(vec2(x, y)).rgb.mul(w);
-      const sum = vec3(0).toVar();
-      sum.addAssign(tap(tc0.x, tc0.y, w0.x.mul(w0.y)));
-      sum.addAssign(tap(tc12.x, tc0.y, w12.x.mul(w0.y)));
-      sum.addAssign(tap(tc3.x, tc0.y, w3.x.mul(w0.y)));
-      sum.addAssign(tap(tc0.x, tc12.y, w0.x.mul(w12.y)));
-      sum.addAssign(tap(tc12.x, tc12.y, w12.x.mul(w12.y)));
-      sum.addAssign(tap(tc3.x, tc12.y, w3.x.mul(w12.y)));
-      sum.addAssign(tap(tc0.x, tc3.y, w0.x.mul(w3.y)));
-      sum.addAssign(tap(tc12.x, tc3.y, w12.x.mul(w3.y)));
-      sum.addAssign(tap(tc3.x, tc3.y, w3.x.mul(w3.y)));
-      // The negative lobes can undershoot on high contrast; the clip below bounds it.
-      return max(sum, vec3(0));
-    });
+    const catmullRom = catmullRomHistory(historyNode, texel, size);
 
     const resolve = Fn(() => {
       const fragUv = uv();
@@ -401,12 +414,13 @@ export class TemporalAANode extends THREE.TempNode {
         .and(prevUv.y.greaterThanEqual(0)).and(prevUv.y.lessThanEqual(1));
       const historyRgb = catmullRom(prevUv);
       const historyY = toYCoCg(historyRgb);
+      const marked = this.stencil.active ? this.stencil.mark({ motion, previousMotion, px, maxPx, prevUv, size }) : float(0);
 
       // --- clip the history into the current neighbourhood's box ------------------
       // Clip toward the box centre along the segment from the history sample (AABB
       // clipping, not clamping, so colour direction is preserved).
       const centre = boxMin.add(boxMax).mul(0.5);
-      const extent = boxMax.sub(boxMin).mul(0.5).add(1e-5);
+      const extent = this.stencil.clipExtent(boxMax.sub(boxMin).mul(0.5).add(1e-5), marked);
       const offset = historyY.sub(centre);
       const unit = abs(offset.div(extent));
       const maxUnit = max(unit.x, max(unit.y, unit.z));
@@ -416,7 +430,7 @@ export class TemporalAANode extends THREE.TempNode {
       const speed = uvDelta.mul(size).length();
       const motionFactor = clamp(speed.div(this.motionPixels), 0, 1);
       let weight: N = mix(this.historyWeight, this.motionWeight, motionFactor);
-      weight = weight.mul(onScreen.select(float(1), float(0))).mul(this.historyValid);
+      weight = this.stencil.historyWeight(weight, marked).mul(onScreen.select(float(1), float(0))).mul(this.historyValid);
       // Karis: weigh both inputs by 1/(1+luma) so a bright transient does not flicker.
       const wCurrent = float(1).sub(weight).div(float(1).add(centreColor.x));
       const wHistory = weight.div(float(1).add(clipped.x));
@@ -424,7 +438,7 @@ export class TemporalAANode extends THREE.TempNode {
       return vec4(max(fromYCoCg(resolved), vec3(0)), 1);
     });
 
-    return resolve();
+    return outputStruct(resolve(), vec4(textureLoad(motion.value, ivec2(uv().mul(size))).xy, 0, 0));
   }
 
   dispose(): void {

@@ -265,6 +265,10 @@ export const sceneHitStruct = wgsl(/* wgsl */ `
 		isDynamic: bool,
 		indices: vec3u,
 		barycoord: vec3f,
+		// The static traversal stopped on its node ceiling. Whatever is in didHit is
+		// then a partial answer: possibly nothing, possibly a surface with a nearer one
+		// never visited.
+		exhausted: bool,
 	};
 `);
 
@@ -307,7 +311,7 @@ export const traceScene = wgslFn(
 	fn traceScene( ray: Ray, dynEnabled: f32, dynBounds: vec4f, maxNodes: u32 ) -> SceneHit {
 
 		var staticHit: IntersectionResult;
-		if ( maxNodes == 0u ) { staticHit = bvhIntersectFirstHit( ray ); }
+		if ( maxNodes == 0u ) { staticHit = bvhIntersectFirstHit( ray ); staticHit.exhausted = false; }
 		else { staticHit = bvhIntersectFirstHitBudget( ray, maxNodes ); }
 
 		var best = staticHit;
@@ -329,6 +333,12 @@ export const traceScene = wgslFn(
 		out.indices = best.indices.xyz;
 		out.barycoord = best.barycoord;
 		out.attrib = vec3f( 0.0 );
+		// Faithful, not filtered: the ceiling can be reached AFTER something was found,
+		// and the stack is not a priority queue, so a nearer triangle in a sibling
+		// subtree may be the thing left unvisited. Reporting only the empty-handed case
+		// would call a hit-behind-an-unseen-occluder a clean result. What to do with an
+		// unreliable hit is the caller's decision.
+		out.exhausted = staticHit.exhausted;
 
 		if ( best.didHit ) {
 			if ( isDynamic ) {

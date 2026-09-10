@@ -1,6 +1,5 @@
 import * as THREE from 'three/webgpu';
-import { modelWorldMatrix, mrt, positionLocal, uniform, vec4 } from 'three/tsl';
-import { bakedIndirect } from '../gi/bake/applyLightmap.ts';
+import { metalness, modelWorldMatrix, mrt, positionLocal, roughness, uniform, vec4 } from 'three/tsl';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type N = any;
@@ -39,9 +38,7 @@ export function vertexMotionVelocity(displaceAt: (time: N) => N, timeNow: N, tim
  */
 export function installVertexMotion(material: THREE.NodeMaterial, displaceAt: (time: N) => N, timeNow: N, timePrev: N): void {
   material.positionNode = positionLocal.add(displaceAt(timeNow));
-  // Merged with the frame graph's MRT; only the velocity attachment is replaced, and
-  // its spare channels keep carrying the lightmap term (zero on foliage).
   material.mrtNode = mrt({
-    velocity: vec4(vertexMotionVelocity(displaceAt, timeNow, timePrev), bakedIndirect.g, bakedIndirect.b),
+    velocity: vec4(vertexMotionVelocity(displaceAt, timeNow, timePrev), metalness, roughness),
   });
 }

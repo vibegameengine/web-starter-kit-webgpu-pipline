@@ -58,6 +58,7 @@ export function createEzPine(options: EzPineOptions): EzPine {
   const tree = new Tree();
   tree.loadPreset(options.preset ?? 'Pine Large');
   tree.options.seed = options.seed;
+  if (options.preset?.startsWith('Pine')) narrowCrown(tree);
   tree.generate();
 
   const scale = options.height / tallestSide(tree);
@@ -79,6 +80,25 @@ export function createEzPine(options: EzPineOptions): EzPine {
   group.name = `ezPine-${options.seed}`;
   group.add(tree);
   return { group, triangleCount: countTriangles(tree) };
+}
+
+function narrowCrown(tree: Tree): void {
+  const leaves = tree.options.leaves as { size: number; count: number; angle: number; start: number };
+  leaves.size *= 0.5;
+  leaves.count = Math.round(leaves.count * 2.4);
+  leaves.angle = Math.max(8, leaves.angle * 0.6);
+  leaves.start = 0.02;
+  const branch = tree.options.branch as {
+    angle: Record<string, number>;
+    length: Record<string, number>;
+    children: Record<string, number>;
+    start: Record<string, number>;
+  };
+  branch.angle['1'] = 104;
+  branch.length['1'] *= 0.72;
+  branch.children['0'] = Math.round(branch.children['0'] * 1.35);
+  branch.children['1'] = Math.max(3, Math.round(branch.children['1'] * 1.6));
+  branch.start['1'] = 0.1;
 }
 
 function leafMaterialOf(material: THREE.MeshStandardNodeMaterial): THREE.MeshStandardNodeMaterial {

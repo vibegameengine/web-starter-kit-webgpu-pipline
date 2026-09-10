@@ -12,12 +12,15 @@ import { giKnobs } from './knobs';
 import { Mobility } from '../../world/index.ts';
 
 export type SceneBVHBundle = {
+  disposeMaterials: () => void;
+  staticMaterialUUIDs: Set<string>;
   // TSL Storage Nodes
   bvhNode: THREE.StorageBufferNode;
   positionNode: THREE.StorageBufferNode;
   normalNode: THREE.StorageBufferNode;
   indexNode: THREE.StorageBufferNode;
   colorNode: THREE.StorageBufferNode;
+  lightmapUvTexture: THREE.DataTexture;
   diffuseArrayTex: THREE.Texture;
   /**
    * LOCAL ADDITION vs upstream: the dynamic BVH is a second, separately bound
@@ -132,8 +135,10 @@ function proxyBoxGeometry(box: THREE.Box3, matId: number): THREE.BufferGeometry 
   }
   geom.setAttribute('color', new THREE.BufferAttribute(packed, 3));
 
+  geom.setAttribute('bakeUv', new THREE.BufferAttribute(new Float32Array(count * 2).fill(-1), 2));
+
   for (const name of Object.keys(geom.attributes)) {
-    if (name !== 'position' && name !== 'normal' && name !== 'color') {
+    if (name !== 'position' && name !== 'normal' && name !== 'color' && name !== 'bakeUv') {
       geom.deleteAttribute(name);
     }
   }
@@ -177,6 +182,10 @@ function buildTemplate(
     );
   }
   const uvAttr = geom.getAttribute('uv') as THREE.BufferAttribute;
+  const bakeUv = geom.getAttribute('uv1');
+  geom.setAttribute('bakeUv', bakeUv
+    ? bakeUv.clone()
+    : new THREE.BufferAttribute(new Float32Array(vertexCount * 2).fill(-1), 2));
 
   // --- NEW: compute matId per vertex (constant within each triangle) ---
   const matIdArray = new Float32Array(vertexCount);
@@ -207,12 +216,10 @@ function buildTemplate(
   // -----------------------------------------------------
 
   // LOCAL ADDITION vs upstream: mergeGeometries requires an identical attribute
-  // set on every input. Once uv/matId are packed into `color`, nothing else is
-  // read by the tracer — and dropping the rest is what keeps the merge from
-  // failing the moment the lightmap unwrapper has given uv1 to some meshes and
-  // not others.
+  // set on every input. `color` holds material UV/id; `bakeUv` preserves uv1 or a
+  // negative sentinel. Drop the remaining raster-only attributes before merging.
   for (const name of Object.keys(geom.attributes)) {
-    if (name !== 'position' && name !== 'normal' && name !== 'color') {
+    if (name !== 'position' && name !== 'normal' && name !== 'color' && name !== 'bakeUv') {
       geom.deleteAttribute(name);
     }
   }
@@ -430,6 +437,12 @@ export function createSceneBVH(
     capOverride > 0 ? capOverride : DIFFUSE_LAYER_MAX,
   );
   const { diffuseArrayTex, materialIdByUUID } = diffuse;
+  const staticMaterialUUIDs = new Set<string>();
+  scene.traverse(object => {
+    const mesh = object as THREE.Mesh;
+    if (!mesh.isMesh || !mesh.visible || mesh.userData.mobility === Mobility.Movable || mesh.userData.giExclude) return;
+    for (const material of Array.isArray(mesh.material) ? mesh.material : [mesh.material]) staticMaterialUUIDs.add(material.uuid);
+  });
 
   // Published to the tracers as uniforms rather than threaded through five call sites.
   // There is exactly one diffuse array per run and every pass that shades a ray hit
@@ -506,6 +519,15 @@ export function createSceneBVH(
     3,
   );
 
+  // Vertex order is unchanged by BVH index reordering. Preserve uv1 in a texture
+  // so baked-hit lookup adds no storage-buffer binding to the 14-buffer integrator.
+  const uvWidth = Math.min(1024, posAttr.count), uvHeight = Math.ceil(posAttr.count / uvWidth);
+  const bakeUvPixels = new Float32Array(uvWidth * uvHeight * 2).fill(-1);
+  bakeUvPixels.set(merged.getAttribute('bakeUv').array);
+  const lightmapUvTexture = new THREE.DataTexture(bakeUvPixels, uvWidth, uvHeight, THREE.RGFormat, THREE.FloatType);
+  lightmapUvTexture.name = 'Static BVH / Lightmap UV';
+  lightmapUvTexture.needsUpdate = true;
+
   // TSL Nodes
   const bvhNode = storage(bvhAttr, 'BVHNode', 0).toReadOnly().setName('bvh');
   const positionNode = storage(posAttr, 'vec3', 0)
@@ -577,11 +599,14 @@ export function createSceneBVH(
 
   // Initial empty
   return {
+    disposeMaterials: diffuse.dispose,
+    staticMaterialUUIDs,
     bvhNode,
     positionNode,
     normalNode,
     indexNode,
     colorNode,
+    lightmapUvTexture,
     diffuseArrayTex,
     materialIdByUUID,
     emissiveBase: diffuse.emissiveBase,
@@ -595,4 +620,48 @@ export function createSceneBVH(
       buildMs,
     },
   };
+}
+
+/** Repack changed material membership, keeping static geometry/BVH and baked UVs.
+ * Existing static triangle material indices are translated in place, not rebuilt. */
+export function refreshSceneMaterials(renderer, scene, bundle: SceneBVHBundle) {
+  const cap = giKnobs.diffuseLayerCap();
+  const next = buildDiffuseArrayTexture(renderer, scene, cap > 0 ? cap : DIFFUSE_LAYER_MAX);
+  const remap = new Map<number, number>();
+  // A mover may have shared a deduplicated layer with a static material and now
+  // change colour. Only static owners may decide how static triangle ids move.
+  for (const uuid of bundle.staticMaterialUUIDs) {
+    const oldId = bundle.materialIdByUUID.get(uuid);
+    const newId = next.materialIdByUUID.get(uuid);
+    if (newId !== undefined) remap.set(oldId, newId);
+  }
+  const attribute = bundle.colorNode.value;
+  const values = attribute.array;
+  // Three r182 pads vec3 storage arrays to four words when uploading. Read the
+  // actual CPU layout; treating padding/UVs as material IDs corrupts the remap.
+  const stride = attribute.itemSize;
+  for (let i = 2; i < values.length; i += stride) {
+    if (!remap.has(values[i])) { next.dispose(); throw new Error('Static material removed during dynamic scene update'); }
+  }
+  let changed = false;
+  for (let i = 2; i < values.length; i += stride) {
+    const id = remap.get(values[i]);
+    if (values[i] !== id) { values[i] = id; changed = true; }
+  }
+  if (changed) {
+    if (stride === 4) {
+      // Its upload adapter expects unpadded triples again for subsequent writes.
+      const packed = new Float32Array(attribute.count * 3);
+      for (let i = 0; i < attribute.count; i++) packed.set(values.subarray(i * 4, i * 4 + 3), i * 3);
+      attribute.array = packed;
+    }
+    attribute.needsUpdate = true;
+  }
+  const disposeOld = bundle.disposeMaterials;
+  bundle.diffuseArrayTex = next.diffuseArrayTex; bundle.materialIdByUUID = next.materialIdByUUID;
+  bundle.emissiveBase = next.emissiveBase; bundle.emissiveScale = next.emissiveScale;
+  bundle.disposeMaterials = next.dispose;
+  U_GI_EMISSIVE_BASE.value = giKnobs.emissiveLights() ? next.emissiveBase : -1;
+  U_GI_EMISSIVE_SCALE.value = next.emissiveScale;
+  disposeOld();
 }

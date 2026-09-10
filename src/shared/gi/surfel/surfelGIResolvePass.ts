@@ -1,4 +1,4 @@
-// @ts-nocheck -- vendored from jure/webgiya; kept byte-compatible so upstream fixes can be re-applied.
+// @ts-nocheck -- based on jure/webgiya, with hybrid ownership and coverage validity.
 // src/surfelGIResolvePass.ts
 import * as THREE from 'three/webgpu';
 import {
@@ -29,6 +29,7 @@ import {
   wgslFn,
 } from 'three/tsl';
 import { SurfelMoments, SurfelStruct, type SurfelPool } from './surfelPool';
+import { bindSurfelAnchors } from './surfelAnchors';
 import {
   snap_to_surfel_grid_origin,
   surfel_grid_c4_to_hash,
@@ -68,6 +69,7 @@ export const resolveIrradiance = Fn(
     U_CAM_POS,
     U_OCCLUSION_PARAMS,
     surfelDepth,
+    freshWeight = float(0),
   }) => {
     const s = surfels.element(sid);
     const sPos = s.get('posb').xyz;
@@ -106,7 +108,10 @@ export const resolveIrradiance = Fn(
     const wFinal = weightGeom.mul(weightDir).toVar();
 
     // TODO: Tweak
-    const fade = saturate(sinceBirth.div(float(FADE_FRAMES))); // (e.g., 4–16 frames)
+    // Integration precedes gather, so a newborn already carries a real sample.
+    // Give it a low, nonzero relative weight on moving receivers; zero would
+    // discard all illumination on a newly exposed surface for its first frame.
+    const fade = saturate(sinceBirth.div(float(FADE_FRAMES))).max(freshWeight);
     const conf = saturate(samples.div(float(TARGET_SAMPLE_COUNT))); //(or some smaller target)
     wFinal.mulAssign(fade.mul(conf));
 
@@ -135,12 +140,9 @@ export const resolveIrradiance = Fn(
 );
 
 /**
- * Upstream's final gather, unaltered: hash the pixel into one grid cell, average the
- * surfels it holds, emit black when it holds none.
- *
- * The screen-probe and reflection tiers that used to be constructed here are gone —
- * they were an answer to this pass's coverage holes, and the build has moved to baking
- * the statics into a lightmap instead. What remains is the reference gather.
+ * Hash-grid final gather. Hybrid skips baked receivers and pinned samples;
+ * FindMissing shares the same spatial, directional and visibility weights.
+ * Alpha distinguishes missing coverage from valid dark illumination.
  */
 export function createSurfelGIResolvePass(
   grid: SurfelHashGrid,
@@ -158,14 +160,19 @@ export function createSurfelGIResolvePass(
   const U_FRAME = uniform(0);
   /**
    * 1 while the lightmap owns the statics, so the gather drops pinned atlas surfels.
-   * Set per frame from `giKnobs.dynamicSurfels()`; 0 is upstream's behaviour, in which
+   * Set per frame from the pinned atlas state; 0 is upstream's behaviour, in which
    * every surfel in the cell counts and there are no pinned ones to worry about.
    */
   const U_SKIP_PINNED = uniform(0);
+  // @important 1 drops rigid receivers from the gather. GI normal alpha is 1 for baked, 0 for unbound and a negative receiver id for rigid, so movers are the negative half.
+  const U_SKIP_RIGID = uniform(0);
+  // @important 1 drops unbound receivers, whose alpha is exactly 0: baked is 1, rigid is a negative id.
+  const U_SKIP_UNBOUND = uniform(0);
 
   const U_GRID_ORIGIN = uniform(new THREE.Vector3());
 
   let computeNode: THREE.ComputeNode | null = null;
+  let lastAnchorAttr = null;
   /**
    * LOCAL CHANGE vs upstream: upstream's `maxFetchPerPixel = 64` is now the `?resolvecap=1`
    * path, not the default. Read once here rather than per frame because the compute graph
@@ -193,6 +200,7 @@ export function createSurfelGIResolvePass(
     renderer: THREE.WebGPURenderer,
     camera: THREE.PerspectiveCamera,
     gbuffer: { target: THREE.RenderTarget },
+    options: { skipPinned?: boolean; skipRigid?: boolean; skipUnbound?: boolean } = {},
   ) {
     const width = gbuffer.target.width;
     const height = gbuffer.target.height;
@@ -205,7 +213,9 @@ export function createSurfelGIResolvePass(
     U_CAM_WORLD.value.copy(camera.matrixWorld);
     U_CAM_POS.value.copy(camera.position);
     U_FRAME.value = renderer.info.frame;
-    U_SKIP_PINNED.value = giKnobs.dynamicSurfels() ? 1 : 0;
+    U_SKIP_PINNED.value = options.skipPinned ? 1 : 0;
+    U_SKIP_RIGID.value = options.skipRigid ? 1 : 0;
+    U_SKIP_UNBOUND.value = options.skipUnbound ? 1 : 0;
     const { writeOffset } = pool.getOffsets();
     U_RESOLVE_OFFSET.value = writeOffset; // Because we want the fresh values
 
@@ -232,6 +242,9 @@ export function createSurfelGIResolvePass(
       return;
 
     // Build compute shader
+    if (lastAnchorAttr !== pool.getAnchorAttr()) {
+      computeNode?.dispose(); computeNode = null; lastAnchorAttr = pool.getAnchorAttr();
+    }
     if (!computeNode) {
       const capacity = surfelAttr.count;
       const surfels = storage(surfelAttr, SurfelStruct, capacity).setAccess(
@@ -242,6 +255,7 @@ export function createSurfelGIResolvePass(
         SurfelMoments,
         capacity * 2,
       ).setAccess('readOnly'); // The calculated light from integration
+      const anchors = bindSurfelAnchors(pool);
       const offsetsAndList = storage(
         offsetsAndListAttr,
         'int',
@@ -283,13 +297,17 @@ export function createSurfelGIResolvePass(
 
         // 1. Reconstruct World Position & Normal from G-Buffer
         const depth = texture(texDepth, uv).r;
-        const valid = depth.lessThan(0.999).and(depth.greaterThan(0.0));
+        const valid = depth.lessThan(0.999).and(depth.greaterThan(0.0))
+          .and(U_SKIP_PINNED.lessThan(0.5).or(texture(texNormal, uv).w.lessThan(0.5)))
+          .and(U_SKIP_RIGID.lessThan(0.5).or(texture(texNormal, uv).w.greaterThanEqual(0.0)))
+          .and(U_SKIP_UNBOUND.lessThan(0.5).or(texture(texNormal, uv).w.lessThan(0.0).or(texture(texNormal, uv).w.greaterThanEqual(0.5))));
 
         const outColor = vec4(0).toVar();
 
         If(valid, () => {
           const encN = texture(texNormal, uv).xyz;
           const pixNormal = encN.mul(2.0).sub(1.0).normalize();
+          const owner = texture(texNormal, uv).w.negate().max(0).round();
 
           const viewPos = getViewPosition(uv, depth, U_PROJ_INV);
           const worldPos = U_CAM_WORLD.mul(vec4(viewPos, 1.0)).xyz;
@@ -338,12 +356,16 @@ export function createSurfelGIResolvePass(
             const notPinned = U_SKIP_PINNED.lessThan(0.5).or(
               surfels.element(sid).get('age').greaterThanEqual(int(0)),
             );
+            const anchor = anchors.position(sid);
+            const sameOwner = owner.equal(0).or(anchor.w.equal(owner)
+              .and(anchors.normal(sid).w.equal(surfels.element(sid).get('posb').w)));
             // Basic bounds check
             If(
               sid
                 .greaterThanEqual(int(0))
                 .and(sid.lessThan(int(capacity)))
-                .and(notPinned),
+                .and(notPinned).and(sameOwner),
+                // Only probes attached to this rigid receiver can shade it.
               () => {
                 // @ts-ignore Fn is mistyped
                 const irr = resolveIrradiance({
@@ -357,6 +379,7 @@ export function createSurfelGIResolvePass(
                   U_CAM_POS,
                   U_OCCLUSION_PARAMS,
                   surfelDepth: surfelDepthBufferRO,
+                  freshWeight: U_SKIP_PINNED.div(float(FADE_FRAMES)),
                 });
 
                 If(irr.w.greaterThan(bestContrib), () => {

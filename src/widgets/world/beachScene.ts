@@ -6,6 +6,8 @@ import { createScene } from '../../shared/gi/surfel/scene.ts';
 import { Layer, Mobility, applyMobility } from '../../shared/world/index.ts';
 import { seededRandom } from '../../shared/lib/noise.ts';
 import { IslandField, createIsland, type CliffTextures } from '../../entities/island/index.ts';
+import { loadSandLayerMaps } from '../../entities/island/sandLayerTextures.ts';
+import { useSandLayerMaps } from '../../entities/island/sandLayerMaps.ts';
 import { createWater, type Water } from '../../entities/water/index.ts';
 import { createFloatingBall } from '../../entities/ball/index.ts';
 import { bakeBathymetry } from '../../entities/water/bathymetry.ts';
@@ -13,12 +15,11 @@ import { createBackdrop } from '../../entities/backdrop/index.ts';
 import { createRock, createRockMaterial, type RockTextures } from '../../entities/rocks/index.ts';
 import { createPalm, type Palm } from '../../entities/palm/index.ts';
 import { createShrub, type Shrub } from '../../entities/shrub/index.ts';
+import { createVan, parseDoors, DOOR_IDS, type Van, type DoorId } from '../../entities/van/index.ts';
 import type { VolumetricFogSettings } from '../../shared/render/index.ts';
 import { updateFoliageSun } from '../../entities/foliage/translucency.ts';
 
 export interface BeachScene {
-  /** Nothing in the diorama moves: the surfel lifecycle stops once the cache is in. */
-  staticLighting: boolean;
   scene: THREE.Scene;
   camera: THREE.PerspectiveCamera;
   controls: OrbitControls;
@@ -81,6 +82,8 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
     // Into the sun through the palms, from the back-left corner: the fog's forward
     // lobe and the shadow-carved shafts are only visible from here.
     sunward: [new THREE.Vector3(-6.0, 1.5, -7.5), new THREE.Vector3(3.0, 4.0, 0.0)],
+    van: [new THREE.Vector3(-1.4, 2.3, 4.2), new THREE.Vector3(2.7, 1.1, -0.5)],
+    vanRear: [new THREE.Vector3(6.2, 2.6, 3.4), new THREE.Vector3(2.7, 1.1, -0.5)],
   };
   // `?camPos=x,y,z&camTarget=x,y,z` puts the eye anywhere, for a defect a preset misses.
   const search = new URLSearchParams(window.location.search);
@@ -128,6 +131,9 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
 
   // --- island --------------------------------------------------------------------
   const field = new IslandField(7, 6, -3.2);
+  // @important `?sandMaps=drawn` keeps the procedural maps, as the control for the authored set.
+  const authoredSand = new URLSearchParams(window.location.search).get('sandMaps') !== 'drawn';
+  if (authoredSand) useSandLayerMaps(await loadSandLayerMaps());
   const island = createIsland({ field, textures: cliffTextures });
   scene.add(island.group);
   applyMobility(island.group, Mobility.Static);
@@ -230,6 +236,31 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
     shrubs.push(shrub);
   }
 
+  let van: Van | null = null;
+  if (search.get('van') !== '0') {
+    van = await createVan({
+      x: 3.3,
+      z: 2.3,
+      headingRadiansFromNoseTowardPositiveZ: Math.PI * 0.08,
+      scale: 0.92,
+      ground: (x, z) => field.height(x, z),
+      doors: parseDoors(search.get('doors')),
+    });
+    scene.add(van.group);
+    applyMobility(van.group, Mobility.Static);
+    const handle = van;
+    (window as unknown as Record<string, unknown>).__beach = {
+      height: (x: number, z: number) => field.height(x, z),
+      waterLevel: field.waterLevel,
+      half: field.half,
+    };
+    (window as unknown as Record<string, unknown>).__van = {
+      setDoor: handle.setDoor,
+      setDoors: handle.setDoors,
+      poses: handle.poses,
+    };
+  }
+
   // --- water and backdrop (outside the GI) -------------------------------------
   // The bed the water runs over is the geometry itself, rendered from above once.
   const bathymetry = bakeBathymetry({ renderer, objects: [rocks], base: field.toTexture(512, true), half: field.half, size: 512 });
@@ -283,7 +314,6 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
     sun,
     water,
     field,
-    staticLighting: true,
     bindScreen: water.bindScreen,
     // Mist sits on the water (density at the water line, e-folding every ~2.5 m up),
     // stays inside the slab's footprint plus a soft margin, and carries a slow wind.
@@ -318,6 +348,19 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
       folder.add(c, 'windDirection', -180, 180, 1).name('wind direction (°)').onChange(() => c.apply());
       folder.add(c, 'manning', 0.01, 0.06, 0.001).name('Manning n (bed)').onChange(() => c.apply());
       folder.add(water.uniforms.foamStrength, 'value', 0, 2, 0.05).name('foam');
+      if (van) {
+        const initial = parseDoors(search.get('doors'));
+        const state: Record<string, number> = { all: typeof initial === 'number' ? initial : 0 };
+        for (const id of DOOR_IDS) state[id] = typeof initial === 'number' ? initial : initial[id] ?? 0;
+        const vanFolder = gui.addFolder('Van');
+        const sliders = DOOR_IDS.map((id) =>
+          vanFolder.add(state, id, 0, 1, 0.01).onChange((v: number) => van!.setDoor(id as DoorId, v)));
+        vanFolder.add(state, 'all', 0, 1, 0.01).name('all doors').onChange((v: number) => {
+          van!.setDoors(v);
+          for (const id of DOOR_IDS) state[id] = v;
+          for (const slider of sliders) slider.updateDisplay();
+        });
+      }
     },
     update(elapsedSeconds) {
       island.update(elapsedSeconds, sun.color, sunDirection.copy(sun.position).sub(sun.target.position).normalize());
