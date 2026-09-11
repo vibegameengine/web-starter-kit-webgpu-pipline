@@ -159,9 +159,12 @@ export class BakeLeakStages {
     this.normals.set(normals, base);
   }
 
+  private hasGeometry(texel: number): boolean {
+    return this.world[texel * 4 + 3] >= 0.5;
+  }
+
   private vectorAt(source: Float32Array, texel: number): [number, number, number] | null {
-    const w = source[texel * 4 + 3];
-    return w === 0 && source[texel * 4] === 0 ? null : [source[texel * 4], source[texel * 4 + 1], source[texel * 4 + 2]];
+    return this.hasGeometry(texel) ? [source[texel * 4], source[texel * 4 + 1], source[texel * 4 + 2]] : null;
   }
 
   private reportOfSlot(slot: number, tolerance = DEFAULT_TOLERANCE): LeakTexelReport | null {
@@ -197,7 +200,9 @@ export class BakeLeakStages {
     let best = -1;
     let nearest = Infinity;
     for (let slot = 0; slot < this.slots; slot++) {
-      const i = this.texelOfSlot[slot] * 4;
+      const texel = this.texelOfSlot[slot];
+      if (!this.hasGeometry(texel)) continue;
+      const i = texel * 4;
       const distance = (this.world[i] - x) ** 2 + (this.world[i + 1] - y) ** 2 + (this.world[i + 2] - z) ** 2;
       if (distance >= nearest) continue;
       nearest = distance;
