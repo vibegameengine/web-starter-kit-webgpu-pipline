@@ -19,6 +19,7 @@ vendor/webgiya/
 public/bakes/
 vendor/react-three-fiber/
 vendor/three/
+vendor/three-r186/
 tmp/dashboard/
 
 # ctx-kit (machine-specific paths + local index)
@@ -26,3 +27,6 @@ tmp/dashboard/
 .codex/hooks.json
 .codex/hooks/ctx-kit-codex.ps1
 .codex/hooks/ctx-kit-codex.sh
+
+# Sibling git worktrees live here; they are checkouts, not sources of this one.
+worktrees/
