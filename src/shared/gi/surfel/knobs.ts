@@ -65,6 +65,9 @@ export const giKnobs = {
      and the weights are normalised afterwards. `?bakeExactReuse=0` is the ablation. Design section 04. */
   exactBakeReuse: () => flag('bakeExactReuse', false),
 
+  /** @important `?spawnEps=radius` restores the ray offset that was a length in metres; see spawnEpsilon. */
+  spawnEpsilonFromRadius: () => (params()?.get('spawnEps') ?? '') === 'radius',
+
   /** Base surfel pool capacity, before any growth. */
   surfelBase: () => num('surfels', 0),
 

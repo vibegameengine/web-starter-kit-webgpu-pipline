@@ -16,8 +16,11 @@ const extra = process.argv[4] ?? '';
 const base = `http://127.0.0.1:5188/?scene=leak-room&cam=${cam}&leak=1&hud=0&inspector=0&still=1&aa=none&grain=0&exposure=1${extra}`;
 const tag = extra.replace(/[^a-z0-9]+/gi, '') || 'default';
 
-const INTERIOR = [[0.15, 0.001, 0.1], [0.6, 0.001, 0.6], [-0.6, 0.001, -0.6], [0.9, 0.001, 0], [-0.998, 1, 0], [0, 1, -0.998], [0, 1.998, 0]];
-const OUTSIDE = [[2.4, 0.001, 0], [0, 0.001, 2.4]];
+const scaleMatch = /[?&]scale=([0-9.eE+-]+)/.exec(extra);
+const SCALE = scaleMatch && Number.isFinite(Number(scaleMatch[1])) ? Number(scaleMatch[1]) : 1;
+const scaled = (points) => points.map((p) => p.map((v) => v * SCALE));
+const INTERIOR = scaled([[0.15, 0.001, 0.1], [0.6, 0.001, 0.6], [-0.6, 0.001, -0.6], [0.9, 0.001, 0], [-0.998, 1, 0], [0, 1, -0.998], [0, 1.998, 0]]);
+const OUTSIDE = scaled([[2.4, 0.001, 0], [0, 0.001, 2.4]]);
 
 const browser = await chromium.launch({ channel: 'chrome', headless: false, args: ['--enable-unsafe-webgpu', '--ignore-gpu-blocklist', '--use-angle=d3d11'] });
 const page = await browser.newPage({ viewport: { width: 1024, height: 640 } });

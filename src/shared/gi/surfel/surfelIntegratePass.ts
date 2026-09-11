@@ -163,6 +163,21 @@ const sampleEnvEquirectClamped = wgslFn(
   [consts],
 );
 
+/* @important The offset that lifts a ray off its own surface is float error, not a length in metres.
+   clamp(sRad * 0.01, 0.0005, 0.01) put a hard half-millimetre floor under it, and design section 07's
+   A3 is what that costs: the sealed room built a thousand times smaller has 0.2 mm walls, every ray
+   started outside it, and the interior read 0.355 against 0.248 for the sunlit ground - brighter
+   inside a closed box than out in the sun. float32 keeps about seven digits, so the offset scales
+   with the coordinate it is added to. ?spawnEps=radius restores the old rule. Design section 03. */
+const RADIUS_SPAWN_EPSILON = 'return clamp(sRad * 0.01, 0.0005, 0.01);';
+const POSITION_SPAWN_EPSILON = 'let reach = max(abs(p.x), max(abs(p.y), abs(p.z))); return max(reach * 1e-5, 1e-7);';
+
+export const spawnEpsilon = wgslFn(/* wgsl */ `
+  fn spawn_epsilon(p: vec3f, sRad: f32) -> f32 {
+    ${giKnobs.spawnEpsilonFromRadius() ? RADIUS_SPAWN_EPSILON : POSITION_SPAWN_EPSILON}
+  }
+`);
+
 export const radiusBasedEpsilon = wgslFn(/* wgsl */ `
   fn radius_based_epsilon(sRad: f32) -> f32 {
     // return 0.0001;
@@ -873,7 +888,7 @@ export function createSurfelIntegratePass(
           let sRad = surfel_radius_for_pos(pRelSurfel) * SURFEL_RADIUS_OVERSCALE;
     
           // IMPORTANT: match the origin offset used for depth learning
-          let eps = radius_based_epsilon(sRad);
+          let eps = spawn_epsilon(sPos, sRad);
           let sPosOff = sPos + sNor * eps;
 
           let dV    = pt_ws - sPosOff;
@@ -1101,8 +1116,7 @@ ${bakedAtlas ? `          bakeUvTex: texture_2d<f32>,
           var ray: Ray;
           let pRelS = s.posb.xyz - camPos;
           let sRad = surfel_radius_for_pos(pRelS);
-          let eps = radius_based_epsilon(sRad);
-          // Offset along normalized normal (from basis) for consistent epsilon.
+          let eps = spawn_epsilon(s.posb.xyz, sRad);
           ray.origin = s.posb.xyz + nW * eps;
 
           if (doProbe) {
@@ -1451,6 +1465,7 @@ ${bakedAtlas ? `                var fromAtlas = false;
           msmeHelpers,
           update_surfel_depth2,
           radiusBasedEpsilon,
+          spawnEpsilon,
           surfelRadialDepthOcclusionRW,
           diffuseLodForHit,
           sampleDiffuseArray,
