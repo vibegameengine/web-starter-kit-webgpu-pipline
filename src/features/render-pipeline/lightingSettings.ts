@@ -1,4 +1,4 @@
-import type { GuiSettings } from '../../app/guiSettings.ts';
+import { loadGuiSettings, settingsProfile, settingsSceneName, type GuiSettings } from '../../app/guiSettings.ts';
 
 export interface SavedLighting {
   bakePasses?: number;
@@ -28,4 +28,12 @@ export function savedLighting(settings: GuiSettings | null): SavedLighting {
     probeIntensity: numberAt(settings, ['Lighting'], 'probe mul'),
     environmentIntensity: numberAt(settings, LIVE_SURFEL_FOLDERS, 'env'),
   };
+}
+
+/* @important The pipeline asks for the profile itself instead of waiting to be handed one:
+   the bake runs before any GUI exists, and threading the settings through the UI object
+   only moved the same ordering problem one layer up. */
+export async function savedLightingFromUrl(search: string): Promise<SavedLighting> {
+  const params = new URLSearchParams(search);
+  return savedLighting(await loadGuiSettings(settingsSceneName(params), settingsProfile(params)).catch(() => null));
 }

@@ -10,7 +10,7 @@ import { giLightSummary } from '../../shared/gi/surfel/sceneLights.ts';
 import { addDynamicDemoObject, type DynamicObject } from '../../shared/gi/surfel/content.ts';
 import { hook, readUrlParams, type PipelineUi, type RenderPipeline, type SceneHost, type UrlParams } from './host.ts';
 import { setupSun, type SunControls } from './sun.ts';
-import { savedLighting } from './lightingSettings.ts';
+import { savedLightingFromUrl } from './lightingSettings.ts';
 import { CINE_CAMERAS, DEFAULT_CINE_CAMERA, applyCineCamera, horizontalFovDeg, relativeStops } from './cineCamera.ts';
 import { StaticLight } from './staticLight.ts';
 import { leakHookApi } from '../../shared/gi/bake/leakStages.ts';
@@ -460,7 +460,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   const hud = ui.showChrome ? new Hud(world, stats, () => staticLight.ready ? `atlas ${staticLight.atlasSize}px + probes` : 'baking', () => staticLight.ready ? staticLight.bakeStatusText() : 'baking') : null;
   ui.applySavedSettings?.(gui);
   const contactTree = await bootStage('Building the contact BVH', () => trace.buildTree(scene));
-  const lighting = savedLighting(ui.savedSettings ?? null);
+  const lighting = await savedLightingFromUrl(window.location.search);
   if (lighting.bakePasses !== undefined) staticLight.bakeParams.passes = lighting.bakePasses;
   if (lighting.atlasIntensity !== undefined) staticLight.atlasParams.intensity = lighting.atlasIntensity;
   if (lighting.environmentIntensity !== undefined) gi.setEnvControls(lighting.environmentIntensity, 4);
