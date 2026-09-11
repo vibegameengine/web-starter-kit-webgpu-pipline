@@ -1,10 +1,31 @@
 import { wgslFn, wgsl } from 'three/tsl';
 
+/* @important One constant used to guard the determinant, the three barycentric coordinates and the
+   ray distance at once - an area, three dimensionless fractions and a length, all against 1e-5. The
+   determinant cull is the one that costs light: it drops a grazing hit, the ray carries on and the
+   miss is paid out as sky. Measured on the sealed room at 0.23 m/texel, where the true interior
+   value is zero: the interior floor texel reads 0.00164 at 1e-5 and 0.00073 at 1e-7, while 1e-3
+   changes nothing - the barycentric slack is permissive in both directions, the determinant is not.
+   Split into three, each overridable: ?triDetEps= ?triBaryEps= ?triTEps=. Design section 03,
+   The distance test is the one that mattered: a ray leaving a corner hits the next wall at a tiny t,
+   1e-5 rejected that hit, the ray carried on out of the sealed room and the miss was paid out as
+   sky. The interior texel reads 0.00164 at t=1e-5, 0.00148 at 1e-6, 0.00071 at 1e-7 and 0.00001 at
+   1e-8, while the sunlit ground outside stays 0.255 throughout - nothing is being over-occluded.
+   Self-intersection is the spawn offset's job, not this test's; see radiusBasedEpsilon. */
+function epsilon( name, fallback ) {
+	if ( typeof window === 'undefined' ) return fallback;
+	const raw = new URLSearchParams( window.location.search ).get( name );
+	const value = raw === null || raw === '' ? NaN : Number( raw );
+	return Number.isFinite( value ) ? value : fallback;
+}
+
 export const constants = wgsl( /* wgsl */`
 
 	const BVH_STACK_DEPTH = 60u;
 	const INFINITY = 1e20;
-	const TRI_INTERSECT_EPSILON = 1e-5;
+	const TRI_DET_EPSILON = ${epsilon( 'triDetEps', 1e-12 ).toExponential()};
+	const TRI_BARY_EPSILON = ${epsilon( 'triBaryEps', 1e-7 ).toExponential()};
+	const TRI_T_EPSILON = ${epsilon( 'triTEps', 1e-8 ).toExponential()};
 
 ` );
 

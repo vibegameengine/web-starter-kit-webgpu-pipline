@@ -1,6 +1,6 @@
 import { wgsl, wgslFn } from 'three/tsl';
 
-/** WGSL constants block (BVH_STACK_DEPTH, INFINITY, TRI_INTERSECT_EPSILON). */
+/** WGSL constants block (BVH_STACK_DEPTH, INFINITY, TRI_DET_EPSILON, TRI_BARY_EPSILON, TRI_T_EPSILON). */
 export const constants: ReturnType<typeof wgsl>;
 
 export const bvhIntersectFirstHit: ReturnType<typeof wgslFn>;

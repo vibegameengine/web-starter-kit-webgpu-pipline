@@ -14,7 +14,7 @@ export const intersectsTriangle = wgslFn( /* wgsl */ `
 
 		let det = - dot( ray.direction, n );
 
-		if ( abs( det ) < TRI_INTERSECT_EPSILON ) {
+		if ( abs( det ) < TRI_DET_EPSILON ) {
 
 			return result;
 
@@ -31,7 +31,7 @@ export const intersectsTriangle = wgslFn( /* wgsl */ `
 
 		let w = 1.0 - u - v;
 
-		if ( u < - TRI_INTERSECT_EPSILON || v < - TRI_INTERSECT_EPSILON || w < - TRI_INTERSECT_EPSILON || t < TRI_INTERSECT_EPSILON ) {
+		if ( u < - TRI_BARY_EPSILON || v < - TRI_BARY_EPSILON || w < - TRI_BARY_EPSILON || t < TRI_T_EPSILON ) {
 
 			return result;
 
