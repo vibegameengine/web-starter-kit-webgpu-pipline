@@ -185,7 +185,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   // authored angles — that is what keeps the analytic sun and the image-based
   // ambient agreeing with each other. Same call webgiya makes on every scene load.
   const sunUv = findSunPositionWeighted(gi.envTexture);
-  setLightAnglesFromEnvMapSunUVLocation(sunUv[0], sunUv[1]);
+  if (sunUv) setLightAnglesFromEnvMapSunUVLocation(sunUv[0], sunUv[1]);
 
   const { updateAnimation, updateLightFromAngles, lightCfg } = createLightControls(
     gui,

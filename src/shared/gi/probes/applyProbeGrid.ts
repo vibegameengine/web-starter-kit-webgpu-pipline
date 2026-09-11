@@ -1,6 +1,7 @@
 import * as THREE from 'three/webgpu';
 import { Fn, diffuseColor, normalWorld, positionWorld, uniform, vec3 } from 'three/tsl';
 import { Layer } from '../../world/index.ts';
+import { artisticIndirect } from '../../render/look.ts';
 import { bakedIndirect, emissionBeforeLightmap } from '../bake/applyLightmap.ts';
 import type { ProbeVolume } from './probeVolume.ts';
 import { PROBE_LAYER_ALL, layerOfObject, layerOfPoint } from './probeLayers.ts';
@@ -62,7 +63,7 @@ function installProbeEmission(material: THREE.MeshStandardNodeMaterial, volume: 
   const existing = originalEmission.get(material);
   const layerMask = uniform(PROBE_LAYER_ALL, 'int').onObjectUpdate(({ object }) => volume.forcedLayerMask ?? (object ? layerOfObject(volume.interiorVolumes, object) : PROBE_LAYER_ALL));
   const indirect = Fn(() => {
-    const lit = vec3(volume.irradianceAt(positionWorld, normalWorld, layerMask)).mul(diffuseColor.rgb);
+    const lit = artisticIndirect(volume.irradianceAt(positionWorld, normalWorld, layerMask)).mul(diffuseColor.rgb);
     bakedIndirect.assign(lit);
     return lit;
   })();

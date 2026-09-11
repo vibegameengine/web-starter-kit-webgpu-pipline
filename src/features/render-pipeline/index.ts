@@ -95,9 +95,9 @@ function openLodLab(renderer: THREE.WebGPURenderer, staticLight: StaticLight, ca
 
 function bindLightingGui(gui: GUI, p: Pipeline, ui: PipelineUi): void {
   const { frameGraph, gi, staticLight } = p;
-  const giFolder = gui.addFolder('GI (surfel)');
+  const giFolder = gui.addFolder('GI (live surfels)');
   const giParams = { indirectIntensity: frameGraph.indirectIntensity.value as number };
-  giFolder.add(giParams, 'indirectIntensity', 0, 8, 0.05).name('indirect').onChange((v: number) => { frameGraph.indirectIntensity.value = v; });
+  giFolder.add(giParams, 'indirectIntensity', 0, 8, 0.05).name('live surfel intensity').onChange((v: number) => { frameGraph.indirectIntensity.value = v; });
   giFolder.add(p.live, 'on').name('live surfels (legacy)').onChange(() => { p.gi.resize(p.renderer, p.giScale()); p.staticLight.setLiveChainServesReceivers(p.live.on); });
   const splitParams = { right: (p.url.get('split') as SplitView) ?? SplitView.Off, at: frameGraph.splitPosition };
   const splitFolder = gui.addFolder('Split view');

@@ -55,8 +55,8 @@ function installShadowFilter(sun: THREE.DirectionalLight, blueNoise: THREE.Textu
 }
 
 export function setupSun(gui: GUI, host: SceneHost, assets: { envTexture: THREE.Texture; blueNoise: THREE.Texture }, url: UrlParams): SunControls & { shadowFilter: string } {
-  const [u, v] = findSunPositionWeighted(assets.envTexture as THREE.DataTexture);
-  setLightAnglesFromEnvMapSunUVLocation(u, v);
+  const sunUv = findSunPositionWeighted(assets.envTexture as THREE.DataTexture);
+  if (sunUv) setLightAnglesFromEnvMapSunUVLocation(sunUv[0], sunUv[1]);
   const controls = createLightControls(gui, host.sun);
   const intensity = requestedIntensity(host, assets.envTexture, url);
   if (typeof intensity === 'number' && Number.isFinite(intensity)) controls.lightCfg.intensity = intensity;

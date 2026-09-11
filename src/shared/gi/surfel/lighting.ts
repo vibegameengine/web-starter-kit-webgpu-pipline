@@ -95,48 +95,4 @@ export function setLightAnglesFromEnvMapSunUVLocation(u: number, v: number) {
   setLightAngles(azimuth, elevation);
 }
 
-export function findSunPositionWeighted(
-  texture: THREE.DataTexture,
-  threshold = 0.5,
-) {
-  const { data, width, height } = texture.image;
-
-  if (!data) {
-    throw new Error('No data');
-  }
-  // First pass: find max luminance
-  let maxLum = 0;
-  for (let i = 0; i < data.length; i += 4) {
-    const lum = 0.2126 * data[i] + 0.7152 * data[i + 1] + 0.0722 * data[i + 2];
-    if (lum > maxLum) maxLum = lum;
-  }
-
-  // Second pass: weighted centroid of bright pixels
-  const cutoff = maxLum * threshold;
-  let sumX = 0,
-    sumY = 0,
-    sumWeight = 0;
-
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const i = (y * width + x) * 4;
-      const lum =
-        0.2126 * data[i] + 0.7152 * data[i + 1] + 0.0722 * data[i + 2];
-
-      if (lum > cutoff) {
-        sumX += x * lum;
-        sumY += y * lum;
-        sumWeight += lum;
-      }
-    }
-  }
-
-  const sunU = (sumX / sumWeight + 0.5) / width;
-  let sunV = (sumY / sumWeight + 0.5) / height;
-
-  if (!texture.flipY) {
-    sunV = 1 - sunV;
-  }
-
-  return [sunU, sunV];
-}
+export { findSunPositionWeighted, type SunUv } from './envSunSearch.ts';

@@ -17,8 +17,10 @@ import {
   velocity,
 } from 'three/tsl';
 import { bakedIndirect } from '../gi/bake/applyLightmap.ts';
-import { DFGLUT, getViewPosition, cameraProjectionMatrixInverse, cameraWorldMatrix, normalize, renderOutput, hash, screenCoordinate, luminance, metalness, roughness, cameraNear, cameraFar } from 'three/tsl';
+import { DFGLUT, getViewPosition, cameraProjectionMatrixInverse, cameraWorldMatrix, normalize, luminance, metalness, roughness, cameraNear, cameraFar } from 'three/tsl';
 import { MotionBlur } from './motionBlur.ts';
+import { applyOutputStages } from './outputStage.ts';
+import { artisticIndirect, type ArtisticLook } from './look.ts';
 import { fxaa } from 'three/addons/tsl/display/FXAANode.js';
 import { bloom } from 'three/addons/tsl/display/BloomNode.js';
 import { TemporalAANode } from './temporalAA.ts';
@@ -75,6 +77,7 @@ export const SplitView = {
   /** Traced specular radiance before the BRDF weight. */
   Reflections: 'reflections',
   Baked: 'baked',
+  Leak: 'leak',
 } as const;
 export type SplitView = (typeof SplitView)[keyof typeof SplitView];
 
@@ -108,6 +111,7 @@ export class FrameGraph {
   /** Supplied by the app once the GI cache exists; see gi/cacheAtlas.ts. */
   private cacheAtlasNode: ((uv: unknown) => unknown) | null = null;
   private lightmapTexture: THREE.Texture | null = null;
+  private leakTexture: THREE.Texture | null = null;
 
   private readonly color: TslNode;
   private readonly taps: Array<{ name: string; node: TslNode }> = [];
@@ -127,6 +131,7 @@ export class FrameGraph {
   private antialiasing: Antialiasing;
   /** Scene-referred exposure multiplier (a GPU value from the meter), applied after AA, before tone mapping. Null = 1. */
   private exposureNode: TslNode | null = null;
+  private look: ArtisticLook | null = null;
   /** Film grain strength in display space, after tone mapping; null = none. */
   private grain: THREE.UniformNode<number> | null = null;
   /** Per-pixel motion blur after the temporal resolve (see motionBlur.ts); null = off. */
@@ -227,6 +232,14 @@ export class FrameGraph {
   }
 
   /** The baked lightmap, for the split view's `lightmap` pane. */
+  get split(): SplitView { return this.splitView; }
+
+  setLeakTexture(tex: THREE.Texture | null): void {
+    if (tex === this.leakTexture) return;
+    this.leakTexture = tex;
+    this.needsComposite = true;
+  }
+
   setLightmapTexture(tex: THREE.Texture | null): void {
     if (tex === this.lightmapTexture) return;
     this.lightmapTexture = tex;
@@ -302,6 +315,12 @@ export class FrameGraph {
     this.needsComposite = true;
   }
 
+  setLook(look: ArtisticLook | null): void {
+    if (look === this.look) return;
+    this.look = look;
+    this.needsComposite = true;
+  }
+
   /**
    * Film grain: display-referred noise after tone mapping, weighted toward the shadows
    * where film and sensors are noisiest. `strength` is a uniform; null removes the stage
@@ -371,7 +390,7 @@ export class FrameGraph {
     if (this.giTexture && this.albedoTexture) {
       const albedo = texture(this.albedoTexture, screenUV);
       giRaw = texture(this.giTexture, screenUV).toInspector('GI / Surfel');
-      indirect = (giRaw as ReturnType<typeof texture>)
+      indirect = vec4(artisticIndirect((giRaw as ReturnType<typeof texture>).rgb), 1)
         .mul(albedo)
         .mul(this.indirectIntensity)
         .mul(this.scenePass.getTextureNode('albedo').a.mul(this.hybridReceivers).oneMinus());
@@ -483,20 +502,9 @@ export class FrameGraph {
         cameraFar,
       ).toInspector('Post / Motion blur') as unknown as TslNode;
     }
-    // Exposure after AA (the history stays scene-referred), then the output transform
-    // (tone map + colour space), then grain on the display-referred result.
-    if (this.exposureNode) resolved = (resolved as ReturnType<typeof vec4>).mul(this.exposureNode) as unknown as TslNode;
-    if (this.grain) {
-      this.post.outputColorTransform = false;
-      const display = renderOutput(resolved as ReturnType<typeof vec4>);
-      const pixel = screenCoordinate.x.floor().add(screenCoordinate.y.floor().mul(7919)).add(this.frameIndex.mul(104729));
-      const noise = hash(pixel).sub(0.5);
-      const shadowWeight = float(1).sub(luminance(display.rgb).clamp(0, 1).mul(0.6));
-      resolved = vec4(display.rgb.add(noise.mul(this.grain).mul(shadowWeight)), display.a) as unknown as TslNode;
-    } else {
-      this.post.outputColorTransform = true;
-    }
-    this.post.outputNode = this.foldTaps(resolved);
+    const output = applyOutputStages(resolved, { exposure: this.exposureNode, look: this.look, grain: this.grain, frameIndex: this.frameIndex });
+    this.post.outputColorTransform = output.outputColorTransform;
+    this.post.outputNode = this.foldTaps(output.node as unknown as TslNode);
     this.post.needsUpdate = true;
     this.needsComposite = false;
   }
@@ -548,6 +556,9 @@ export class FrameGraph {
       case SplitView.Reflections:
         if (this.reflections) right = vec4((this.reflections.sample(screenUV as unknown as TslNode) as ReturnType<typeof vec4>).rgb, 1);
         break;
+      case SplitView.Leak:
+        if (this.leakTexture) right = vec4(texture(this.leakTexture, this.paneSquareUv()).rgb, 1);
+        break;
       case SplitView.Lightmap:
         if (this.lightmapTexture) {
           // Remap the pane to a full square so the atlas is shown whole.
@@ -578,6 +589,10 @@ export class FrameGraph {
     // A one-pixel-ish seam, so the boundary is unmistakable in a screenshot.
     const seam = screenUV.x.sub(split).abs().lessThan(0.0012);
     return seam.select(vec4(1, 0.35, 0.1, 1), picked) as unknown as TslNode;
+  }
+
+  private paneSquareUv() {
+    return vec2(screenUV.x.sub(this.splitPosition).div(1 - this.splitPosition), screenUV.y);
   }
 
   private static readSplitAt(): number {

@@ -3,12 +3,28 @@ import type GUI from 'lil-gui';
 import { uniform } from 'three/tsl';
 import { VolumetricFog, type Antialiasing, type FogView, type FrameGraph, SplitView } from '../../shared/render/index.ts';
 import { AutoExposure } from '../../shared/render/exposure.ts';
+import { ArtisticLook, NEUTRAL_LOOK, TONE_MAPPING, type LookState, type OutputTransform } from '../../shared/render/look.ts';
 import { DEFAULT_MOTION_BLUR, MotionBlur, type MotionBlurGaze } from '../../shared/render/motionBlur.ts';
 import { readFloatTexture } from '../../shared/render/gpuReadback.ts';
 import type { SceneHost, UrlParams } from './host.ts';
 
 const DEFAULT_GLARE = { strength: 0.22, radius: 0.5 };
 const DEFAULT_GRAIN = 0.015;
+
+function lookFromUrl(url: UrlParams): Partial<LookState> {
+  const output = url.get('lookOutput');
+  const stop = (key: string, index: number) => url.num(key) ?? NEUTRAL_LOOK.creativeBalanceRGBStops[index];
+  return {
+    exposureEV: url.num('exposureEV') ?? NEUTRAL_LOOK.exposureEV,
+    indirectEV: url.num('indirectEV') ?? NEUTRAL_LOOK.indirectEV,
+    indirectChroma: url.num('indirectChroma') ?? NEUTRAL_LOOK.indirectChroma,
+    saturation: url.num('saturation') ?? NEUTRAL_LOOK.saturation,
+    contrast: url.num('contrast') ?? NEUTRAL_LOOK.contrast,
+    shadowLiftEV: url.num('shadowLiftEV') ?? NEUTRAL_LOOK.shadowLiftEV,
+    creativeBalanceRGBStops: [stop('balanceR', 0), stop('balanceG', 1), stop('balanceB', 2)],
+    output: output === 'agx' || output === 'linear' || output === 'neutral' ? output : NEUTRAL_LOOK.output,
+  };
+}
 
 function fogView(url: UrlParams): FogView {
   const view = url.get('fogView');
@@ -23,6 +39,8 @@ export class PostStages {
   readonly grainState: { enabled: boolean };
   readonly motionBlur: MotionBlur;
   readonly aaParams: { mode: Antialiasing };
+  readonly look: ArtisticLook;
+  private lookEnabled: boolean;
   still: boolean;
 
   constructor(
@@ -56,6 +74,8 @@ export class PostStages {
     const gaze = url.get('gaze') as MotionBlurGaze | null;
     if (gaze === 'centre' || gaze === 'camera') this.motionBlur.settings.gaze = gaze;
     this.aaParams = { mode: frameGraph.antialiasingMode };
+    this.look = new ArtisticLook(lookFromUrl(url));
+    this.lookEnabled = url.flag('look', true);
     this.still = url.get('still') === '1';
     this.applyTaaOverrides(url);
     this.syncAll();
@@ -73,8 +93,20 @@ export class PostStages {
   }
 
   syncAll(): void {
-    this.syncFog(); this.syncGlare(); this.syncGrain(); this.syncMotionBlur();
+    this.syncFog(); this.syncGlare(); this.syncGrain(); this.syncMotionBlur(); this.syncLook();
     this.frameGraph.setExposure(this.autoExposure.node);
+  }
+
+  /* @important The output transform stays with the renderer whether or not the artistic
+     grade is on: `?look=0` has to be an A/B of the grade alone, and flipping the tone
+     mapper underneath it compares two different pipelines. */
+  syncLook(): void {
+    this.look.sync(this.lookEnabled);
+    const toneMapping = TONE_MAPPING[this.look.state.output];
+    const changedTransform = this.renderer.toneMapping !== toneMapping;
+    this.renderer.toneMapping = toneMapping;
+    this.frameGraph.setLook(this.lookEnabled ? this.look : null);
+    if (changedTransform) this.frameGraph.forceRebuild();
   }
 
   syncFog(): void { this.frameGraph.setAtmosphere(this.fog.enabled ? this.applyFog : null); }
@@ -85,7 +117,28 @@ export class PostStages {
   bindGui(gui: GUI): void {
     this.bindFogGui(gui);
     this.bindExposureGui(gui);
+    this.bindLookGui(gui);
     this.bindPostGui(gui);
+  }
+
+  private bindLookGui(gui: GUI): void {
+    const folder = gui.addFolder('Look');
+    const s = this.look.state;
+    const balance = { r: s.creativeBalanceRGBStops[0], g: s.creativeBalanceRGBStops[1], b: s.creativeBalanceRGBStops[2] };
+    const push = () => this.syncLook();
+    folder.add({ enabled: this.lookEnabled }, 'enabled').name('artistic look').onChange((v: boolean) => { this.lookEnabled = v; push(); });
+    folder.add(s, 'exposureEV', -3, 3, 0.05).name('exposure comp (EV)').onChange(push);
+    folder.add(s, 'indirectEV', -1, 2, 0.05).name('diffuse indirect (EV)').onChange(push);
+    folder.add(s, 'indirectChroma', 0, 1, 0.01).name('indirect chroma').onChange(push);
+    folder.add(s, 'saturation', 0, 1.25, 0.01).name('saturation').onChange(push);
+    folder.add(s, 'contrast', 0.8, 1.2, 0.01).name('luminance contrast').onChange(push);
+    folder.add(s, 'shadowLiftEV', 0, 0.75, 0.01).name('shadow lift (EV)').onChange(push);
+    for (const channel of ['r', 'g', 'b'] as const) {
+      const index = { r: 0, g: 1, b: 2 }[channel];
+      folder.add(balance, channel, -0.15, 0.15, 0.005).name(`balance ${channel.toUpperCase()} (stops)`).onChange((v: number) => { s.creativeBalanceRGBStops[index] = v; push(); });
+    }
+    folder.add(s, 'output', ['neutral', 'agx', 'linear']).name('output transform').onChange((v: OutputTransform) => { s.output = v; push(); });
+    folder.close();
   }
 
   private bindFogGui(gui: GUI): void {
@@ -160,6 +213,10 @@ export class PostStages {
       glare: (value?: boolean) => { if (typeof value === 'boolean') { this.glare.enabled = value; this.syncGlare(); } return this.glare.enabled; },
       split: (view: SplitView, at = 0.5) => { frameGraph.splitPosition = at; frameGraph.setSplitView(view); frameGraph.forceRebuild(); },
       exposureSettings: this.autoExposure.settings,
+      look: this.look.state,
+      lookNeutral: () => this.look.neutral,
+      lookApply: (patch?: Partial<LookState>) => { if (patch) Object.assign(this.look.state, patch); this.syncLook(); return { ...this.look.state }; },
+      lookEnabled: (value?: boolean) => { if (typeof value === 'boolean') { this.lookEnabled = value; this.syncLook(); } return this.lookEnabled; },
       exposure: () => this.autoExposure.read(),
       taaFrame: () => readFloatTexture(renderer, frameGraph.taa.resolvedTexture),
       taaState: () => frameGraph.taa.state,

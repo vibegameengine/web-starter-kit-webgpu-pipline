@@ -10,6 +10,7 @@ import {
   vec3,
 } from 'three/tsl';
 import { Layer } from '../../world/index.ts';
+import { artisticIndirect } from '../../render/look.ts';
 
 /** Not a literal: a literal `* 0` is folded away and the tapped node never compiles. */
 const inspectorZero = uniform(0);
@@ -109,7 +110,7 @@ export function applyLightmap(
       const existing = originalEmission.get(material);
       const lightmapUv = attribute('uv1', 'vec2');
       const bounds = mesh.geometry.getAttribute('lightmapBounds') ? attribute('lightmapBounds', 'vec4') : undefined;
-      const lighting = sampling ? sampling.sample(lightmapUv, bounds) : texture(lightmap, lightmapUv).rgb;
+      const lighting = artisticIndirect(sampling ? sampling.sample(lightmapUv, bounds) : texture(lightmap, lightmapUv).rgb);
       const baked = vec3(lighting)
         .mul(albedo)
         .mul(intensityUniform)
