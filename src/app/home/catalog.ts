@@ -57,6 +57,8 @@ export const SCENES: Entry[] = [
       { label: 'анаморфот 2x', href: '/?scene=midsee-village&cam=front&cine=anamorphic-2x-40' },
       { label: 'IMAX 65', href: '/?scene=midsee-village&cam=front&cine=imax65-50' },
       ...withLodLab('midsee-village', ['front', 'side', 'rear', 'quay', 'roofs']),
+      { label: 'лёгкий стенд (1 дом)', href: '/?scene=village-light' },
+      { label: 'стенд без motion-фикса', href: '/?scene=village-light&instanceMotion=0' },
     ],
   },
   {

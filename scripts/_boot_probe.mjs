@@ -1,0 +1,13 @@
+import { chromium } from 'playwright';
+const port = process.env.PORT ?? '5188';
+const scene = process.env.SCENE ?? 'village-light';
+const browser = await chromium.launch({ channel: 'chrome', headless: false, args: ['--enable-unsafe-webgpu', '--ignore-gpu-blocklist', '--use-angle=d3d11'] });
+const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+page.on('console', (m) => console.log(m.type().toUpperCase(), m.text().slice(0, 300)));
+page.on('pageerror', (e) => console.log('PAGEERROR', String(e.stack ?? e).slice(0, 600)));
+const t0 = Date.now();
+await page.goto(`http://127.0.0.1:${port}/?scene=${scene}&hud=0&still=1`);
+const ok = await page.waitForFunction(() => window.__fog && document.querySelector('#loading-overlay')?.hidden, null, { timeout: Number(process.env.BOUND ?? 20000) }).then(() => true).catch(() => false);
+console.log(ok ? `BOOT ${((Date.now() - t0) / 1000).toFixed(1)}s` : 'BOOT FAIL (>20s)');
+await browser.close();
+process.exit(ok ? 0 : 1);

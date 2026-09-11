@@ -4,22 +4,30 @@ import { initRenderer } from '../shared/render/index.ts';
 import { createLightingPipeline, type SceneHost } from '../features/lighting-pipeline/index.ts';
 import { createRenderPipeline } from '../features/render-pipeline/index.ts';
 import { staticInteriorVolume } from '../shared/gi/probes/index.ts';
-import { createBeachScene, createCorridorScene, createCornellScene, createForestScene, populateCornell } from '../widgets/world/index.ts';
-import { applyGuiSettings, loadGuiSettings, settingsProfile, settingsSceneName } from './guiSettings.ts';
+import { createBeachScene, createMidseeVillageScene, createVillageLightScene, createCorridorScene, createCornellScene, createForestScene, createLeakRoomScene, populateCornell } from '../widgets/world/index.ts';
+import { applyGuiSettings, loadGuiSettings, settingsProfile, settingsProfileSource, settingsSceneName } from './guiSettings.ts';
 import { addGuiSettingsControls } from './guiSettingsPanel.ts';
+import { bootStage, onBootProgress } from '../shared/ui/bootProgress.ts';
 
 const loadingOverlay = document.querySelector<HTMLElement>('#loading-overlay');
 const loadingMessage = document.querySelector<HTMLElement>('#loading-message');
+const loadingDetail = document.querySelector<HTMLElement>('#loading-detail');
 const errorOverlay = document.querySelector<HTMLElement>('#error-overlay');
 const errorMessage = document.querySelector<HTMLElement>('#error-message');
 
 let fatal = false;
+const bootStarted = performance.now();
 
 function setLoading(message: string): void {
+  const seconds = ((performance.now() - bootStarted) / 1000).toFixed(1);
   if (loadingMessage) loadingMessage.textContent = message;
+  if (loadingDetail) loadingDetail.textContent = `${seconds}s since the page opened`;
+  console.log(`[boot] ${seconds}s: ${message}`);
   loadingOverlay?.classList.remove('hidden');
   if (loadingOverlay) loadingOverlay.hidden = false;
 }
+
+onBootProgress(setLoading);
 
 function clearLoading(): void {
   loadingOverlay?.classList.add('hidden');
@@ -54,8 +62,7 @@ async function boot(): Promise<void> {
   // output pixel for pixel without chrome getting in the way.
   const showChrome = params.get('hud') !== '0';
 
-  setLoading('Initializing WebGPU');
-  const { renderer } = await initRenderer();
+  const { renderer } = await bootStage('Initializing WebGPU', () => initRenderer());
 
   const gui = new GUI({ title: 'Elderwood' });
   if (!showChrome) {
@@ -70,9 +77,8 @@ async function boot(): Promise<void> {
   const ui = { setLoading, clearLoading, showError, showChrome, applySavedSettings: (target: GUI) => applyGuiSettings(target, saved) };
   const pipeline = params.get('pipeline') === 'legacy'
     ? await createLightingPipeline(renderer, ui)
-    : await createRenderPipeline(renderer, ui);
+    : await createRenderPipeline(renderer);
 
-  setLoading('Building scene');
   let host: SceneHost;
   if (params.get('scene') === 'forest') {
     const forest = await createForestScene(renderer);
@@ -80,19 +86,27 @@ async function boot(): Promise<void> {
   } else if (params.get('scene') === 'corridor') {
     const corridor = await createCorridorScene(renderer);
     host = { ...corridor, skyIsBackground: true, moverByDefault: false, sunIntensity: 'environment', interiorVolumes: [staticInteriorVolume(corridor.scene)] };
+  } else if (params.get('scene') === 'leak-room') {
+    const room = createLeakRoomScene(renderer);
+    host = { ...room, skyIsBackground: true, moverByDefault: false };
+  } else if (params.get('scene') === 'midsee-village') {
+    const village = await createMidseeVillageScene(renderer, pipeline.envTexture);
+    host = { ...village, skyIsBackground: false, moverByDefault: false, sunIntensity: 'environment', reflections: { denoisePasses: 1 } };
+  } else if (params.get('scene') === 'village-light') {
+    const village = await createVillageLightScene(renderer, pipeline.envTexture);
+    host = { ...village, skyIsBackground: false, moverByDefault: false, sunIntensity: 'environment' };
   } else if (params.get('scene') === 'beach') {
     const beach = await createBeachScene(renderer, pipeline.envTexture);
     host = { ...beach, skyIsBackground: false, moverByDefault: false, sunIntensity: 'environment', reflections: { denoisePasses: 1 } };
   } else {
     const cornell = createCornellScene(renderer);
-    setLoading('Building Cornell box');
-    populateCornell(cornell.scene, cornell.sun);
+    await bootStage('Building the Cornell box', () => populateCornell(cornell.scene, cornell.sun));
     host = { ...cornell, skyIsBackground: true, moverByDefault: true, interiorVolumes: [staticInteriorVolume(cornell.scene)] };
   }
 
   await pipeline.run(host, gui, ui);
   applyGuiSettings(gui, saved);
-  addGuiSettingsControls(gui, settingsScene, profile, ui);
+  addGuiSettingsControls(gui, settingsScene, { profile, source: settingsProfileSource(params) }, ui);
 }
 
 boot().catch(showError);
