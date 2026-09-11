@@ -9,7 +9,7 @@ import { readValidationTexture } from '../../shared/render/gpuReadback.ts';
 import { giLightSummary } from '../../shared/gi/surfel/sceneLights.ts';
 import { addDynamicDemoObject, type DynamicObject } from '../../shared/gi/surfel/content.ts';
 import { hook, readUrlParams, type PipelineUi, type RenderPipeline, type SceneHost, type UrlParams } from './host.ts';
-import { setupSun, type SunControls } from './sun.ts';
+import { setupSun } from './sun.ts';
 import { savedLightingFromUrl } from './lightingSettings.ts';
 import { CINE_CAMERAS, DEFAULT_CINE_CAMERA, applyCineCamera, horizontalFovDeg, relativeStops } from './cineCamera.ts';
 import { StaticLight } from './staticLight.ts';
@@ -117,7 +117,7 @@ function createFrameGraph(renderer: THREE.WebGPURenderer, host: SceneHost, url: 
 
 interface Pipeline {
   renderer: THREE.WebGPURenderer; gi: SurfelGI; host: SceneHost; url: UrlParams; frameGraph: FrameGraph;
-  staticLight: StaticLight; trace: TraceStages; post: PostStages; sun: SunControls; live: { on: boolean }; giScale: () => number;
+  staticLight: StaticLight; trace: TraceStages; post: PostStages; sun: ReturnType<typeof setupSun>; live: { on: boolean }; giScale: () => number;
   dynamic: ReturnType<typeof addMovers>; world: WorldState; stats: CacheStats; hud: Hud | null;
   lab: LodLab | null;
   cine: { name: string };
@@ -378,6 +378,33 @@ function installAuditHooks(p: Pipeline, state: { paused: boolean; stepOnce: bool
         sunDot: normal ? +normal.dot(p.host.sun.position.clone().normalize()).toFixed(3) : null,
       };
     },
+    shadow(settings: { bias?: number; normalBias?: number; mapSize?: number; extent?: number }) {
+      if (settings.bias !== undefined) p.host.sun.shadow.bias = settings.bias;
+      if (settings.normalBias !== undefined) p.host.sun.shadow.normalBias = settings.normalBias;
+      if (settings.mapSize !== undefined) {
+        p.host.sun.shadow.mapSize.set(settings.mapSize, settings.mapSize);
+        p.host.sun.shadow.map?.dispose();
+        p.host.sun.shadow.map = null;
+      }
+      if (settings.extent !== undefined) {
+        const camera = p.host.sun.shadow.camera;
+        camera.top = settings.extent; camera.bottom = -settings.extent;
+        camera.left = -settings.extent; camera.right = settings.extent;
+        camera.updateProjectionMatrix();
+      }
+      p.host.sun.shadow.needsUpdate = true;
+      return { bias: p.host.sun.shadow.bias, normalBias: p.host.sun.shadow.normalBias, mapSize: p.host.sun.shadow.mapSize.x, extent: p.host.sun.shadow.camera.top };
+    },
+    sunOccluded(x: number, y: number, z: number, nx = 0, ny = 1, nz = 0) {
+      const origin = new THREE.Vector3(x, y, z).addScaledVector(new THREE.Vector3(nx, ny, nz).normalize(), 1e-4);
+      const toSun = p.host.sun.position.clone().sub(p.host.sun.target.position).normalize();
+      const raycaster = new THREE.Raycaster(origin, toSun, 0, 1000);
+      const hit = raycaster.intersectObjects(p.host.scene.children, true)[0];
+      return {
+        occluded: hit !== undefined, by: hit?.object.name ?? null, distance: hit ? +hit.distance.toFixed(4) : null,
+        toSun: toSun.toArray().map((v) => +v.toFixed(3)),
+      };
+    },
     meshBounds() {
       const box = new THREE.Box3();
       const out: { name: string; min: number[]; max: number[]; side: number; shadow: boolean }[] = [];
@@ -434,6 +461,7 @@ function startLoop(p: Pipeline, ui: PipelineUi, state: { paused: boolean; stepOn
     controls.update();
     p.sun.updateAnimation();
     camera.updateMatrixWorld();
+    p.sun.shadowFit.update(camera);
     frameGraph.beginFrame();
     if (!state.frozen) p.dynamic?.update(now * 0.001);
     if (!post.still) host.update?.(now * 0.001);

@@ -3,6 +3,7 @@ import type GUI from 'lil-gui';
 import { Layer } from '../../shared/world/index.ts';
 import { installReceiverPlaneShadows } from '../../shared/render/receiverPlaneShadow.ts';
 import { installSoftSunShadows, U_SUN_ANGULAR_DIAMETER_DEG } from '../../shared/render/softSunShadow.ts';
+import { createSunShadowFit, type SunShadowFit } from '../../shared/render/sunShadowFit.ts';
 import {
   createLightControls,
   findSunPositionWeighted,
@@ -13,14 +14,27 @@ import { applyOcclusionSettings } from '../../shared/gi/surfel/surfelRadialDepth
 import { sunIntensityFromEnvironment } from '../lighting-pipeline/sunFromEnvironment.ts';
 import type { SceneHost, UrlParams } from './host.ts';
 
-const SHADOW_MAP_SIZE = 4096;
+/* @important The map is sized to a target texel, not to a constant. A lit sliver narrower than one
+   shadow texel is what draws a white line along a wall foot, and it is the texel that sets its width:
+   measured at ?scene=corridor&cam=bench with the lightmap, probes and reflections at zero, the line
+   is 72 bright pixels at 6.3 mm a texel, 11 at 3.2, 5 at 1.5 and 2 at 0.7, while no depth or normal
+   bias moves it at all. The corridor spans 26 m, so 4096 gave 6.3 mm; 4 mm asks for 8192. */
+const SHADOW_TEXEL_TARGET_METRES = 0.004;
+const MIN_SHADOW_MAP_SIZE = 2048;
+const MAX_SHADOW_MAP_SIZE = 8192;
+
+function shadowMapSizeFor(extent: number): number {
+  const wanted = (2 * extent) / SHADOW_TEXEL_TARGET_METRES;
+  const power = 2 ** Math.ceil(Math.log2(Math.max(1, wanted)));
+  return Math.min(MAX_SHADOW_MAP_SIZE, Math.max(MIN_SHADOW_MAP_SIZE, power));
+}
 /* @important A constant depth bias is what put a hard white line along every wall-floor contact in
    the corridor - reproduced at ?scene=corridor&cam=bench, and still there with the lightmap forced
    to zero, so it was never the bake. -0.0003 pushes the comparison toward the light and the floor
    texels at the wall foot escape the wall's shadow. The offset is along the surface normal instead,
    1.5 shadow texels wide, which cures the acne it was hiding without moving anything toward the
    light: measured clean at 1 and 1.5 texels, acne returns at 0. Design section 06. */
-const SHADOW_NORMAL_BIAS_TEXELS = 1.5;
+const SHADOW_NORMAL_BIAS_TEXELS = 0.3;
 const MIN_SHADOW_EXTENT = 15;
 
 export type SunControls = ReturnType<typeof createLightControls>;
@@ -34,7 +48,8 @@ export function configureSunShadow(sun: THREE.DirectionalLight, scene: THREE.Sce
   const radius = bounds.isEmpty() ? 0 : bounds.getSize(new THREE.Vector3()).length() * 0.5;
   const extent = Math.max(MIN_SHADOW_EXTENT, Math.ceil(radius * 1.1));
   sun.castShadow = true;
-  sun.shadow.mapSize.set(SHADOW_MAP_SIZE, SHADOW_MAP_SIZE);
+  const mapSize = shadowMapSizeFor(extent);
+  sun.shadow.mapSize.set(mapSize, mapSize);
   sun.shadow.camera.near = 0.1;
   sun.shadow.camera.far = 100;
   sun.shadow.camera.top = extent;
@@ -42,7 +57,8 @@ export function configureSunShadow(sun: THREE.DirectionalLight, scene: THREE.Sce
   sun.shadow.camera.left = -extent;
   sun.shadow.camera.right = extent;
   sun.shadow.bias = 0;
-  sun.shadow.normalBias = (2 * extent / SHADOW_MAP_SIZE) * SHADOW_NORMAL_BIAS_TEXELS;
+  sun.shadow.normalBias = (2 * extent / mapSize) * SHADOW_NORMAL_BIAS_TEXELS;
+  console.log(`[shadow] ${mapSize}² over ${(2 * extent).toFixed(1)} m, ${((2000 * extent) / mapSize).toFixed(1)} mm a texel`);
   sun.shadow.camera.updateProjectionMatrix();
 }
 
@@ -82,7 +98,26 @@ function applyShadowSide(scene: THREE.Scene, url: UrlParams): void {
   console.log(`[shadow] caster sides ${JSON.stringify([...seen])}${wanted === undefined ? '' : ` forced to ${url.get('shadowSide')}`}`);
 }
 
-export function setupSun(gui: GUI, host: SceneHost, assets: { envTexture: THREE.Texture; blueNoise: THREE.Texture }, url: UrlParams): SunControls & { shadowFilter: string } {
+function staticBounds(scene: THREE.Scene): THREE.Box3 {
+  const bounds = new THREE.Box3();
+  scene.traverse((object) => {
+    const mesh = object as THREE.Mesh;
+    if (mesh.isMesh && mesh.layers.isEnabled(Layer.GiStatic)) bounds.expandByObject(mesh);
+  });
+  return bounds;
+}
+
+function directionFromAngles(config: { azimuthDeg: number; elevationDeg: number }): THREE.Vector3 {
+  const azimuth = THREE.MathUtils.degToRad(config.azimuthDeg);
+  const elevation = THREE.MathUtils.degToRad(config.elevationDeg);
+  return new THREE.Vector3(
+    Math.cos(elevation) * Math.cos(azimuth),
+    Math.sin(elevation),
+    Math.cos(elevation) * Math.sin(azimuth),
+  ).normalize();
+}
+
+export function setupSun(gui: GUI, host: SceneHost, assets: { envTexture: THREE.Texture; blueNoise: THREE.Texture }, url: UrlParams): SunControls & { shadowFilter: string; shadowFit: SunShadowFit } {
   applyShadowSide(host.scene, url);
   const sunUv = findSunPositionWeighted(assets.envTexture as THREE.DataTexture);
   if (sunUv) setLightAnglesFromEnvMapSunUVLocation(sunUv[0], sunUv[1]);
@@ -96,5 +131,9 @@ export function setupSun(gui: GUI, host: SceneHost, assets: { envTexture: THREE.
   controls.updateLightFromAngles();
   configureSunShadow(host.sun, host.scene);
   controls.lightCfg.animate = url.get('animate') === '1';
-  return { ...controls, shadowFilter: installShadowFilter(host.sun, assets.blueNoise, url) };
+  const shadowFit = createSunShadowFit(host.sun, staticBounds(host.scene), () => directionFromAngles(controls.lightCfg), {
+    maxDistance: url.num('shadowFitDistance') ?? undefined,
+  });
+  shadowFit.enabled = url.flag('shadowFit', false);
+  return { ...controls, shadowFilter: installShadowFilter(host.sun, assets.blueNoise, url), shadowFit };
 }
