@@ -123,7 +123,19 @@ export async function loadBake(key: string): Promise<PersistedBake | null> {
   if (!response.ok || response.status === 204 || response.headers.get('content-type')?.includes('text/html')) return null;
   return decodeBake(await response.arrayBuffer());
 }
-export async function saveBake(key: string, bake: PersistedBake): Promise<void> {
+export async function loadBakeManifest(key: string): Promise<Record<string, unknown> | null> {
+  const local = pageFs();
+  if (local) {
+    const file = `${local.dir}/${key}.json`;
+    if (!local.fs.existsSync(file)) return null;
+    return JSON.parse(new TextDecoder().decode(local.fs.readFileSync(file)));
+  }
+  const response = await fetch(`/bakes/${key}.json`);
+  if (!response.ok || !response.headers.get('content-type')?.includes('application/json')) return null;
+  return response.json();
+}
+
+export async function saveBake(key: string, bake: PersistedBake, provenance?: unknown): Promise<void> {
   const encoded = await encodeBake(bake);
   const local = pageFs();
   if (local) {
@@ -135,6 +147,7 @@ export async function saveBake(key: string, bake: PersistedBake): Promise<void> 
     const temporary = `${local.dir}/${key}.${Date.now()}.tmp`;
     local.fs.writeFileSync(temporary, new Uint8Array(encoded));
     local.fs.renameSync(temporary, `${local.dir}/${key}.bin`);
+    if (provenance) local.fs.writeFileSync(`${local.dir}/${key}.json`, new TextEncoder().encode(JSON.stringify({ key, provenance }, null, 2)));
     console.log(`[bake-cache] wrote ${local.dir}/${key}.bin (${(encoded.byteLength / 1048576).toFixed(0)} MB) to the page filesystem`);
     return;
   }
@@ -142,7 +155,8 @@ export async function saveBake(key: string, bake: PersistedBake): Promise<void> 
   // in the page store; keep the decoded format/checksum unchanged.
   const compressed = new Blob([encoded]).stream().pipeThrough(new CompressionStream('gzip'));
   const body = await new Response(compressed).arrayBuffer();
-  const response = await fetch(`/__bake_cache/${key}`, { method: 'PUT',
-    headers: { 'Content-Type': 'application/octet-stream', 'Content-Encoding': 'gzip' }, body });
+  const headers: Record<string, string> = { 'Content-Type': 'application/octet-stream', 'Content-Encoding': 'gzip' };
+  if (provenance) headers['X-Bake-Provenance'] = btoa(JSON.stringify(provenance));
+  const response = await fetch(`/__bake_cache/${key}`, { method: 'PUT', headers, body });
   if (!response.ok) throw new Error(`Project bake save unavailable (${response.status})`);
 }

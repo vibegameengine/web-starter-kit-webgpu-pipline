@@ -4,7 +4,8 @@ import type { SurfelGI } from '../../shared/gi/index.ts';
 import { applyLightmap, assignLightmapUvs, measureCoverage, rasteriseLightmapGBuffer, type LightmapLayout } from '../../shared/gi/bake/index.ts';
 import { padLightmapCharts } from '../../shared/gi/bake/chartPadding.ts';
 import { BakeLeakStages, leakHookApi } from '../../shared/gi/bake/leakStages.ts';
-import { bakeKey, loadBake, saveBake } from '../../shared/gi/bake/persistedBake.ts';
+import { bakeKey, loadBake, loadBakeManifest, saveBake } from '../../shared/gi/bake/persistedBake.ts';
+import { captureLightingProvenance, compareLightingProvenance, describeProvenance, environmentDigest, transportDigest, type LightingProvenance, type ProvenanceStatus } from '../../shared/gi/bake/lightingProvenance.ts';
 import { readFloatAttachment, readFloatTexture } from '../../shared/render/gpuReadback.ts';
 import { LightmapLod } from '../../shared/gi/lod/index.ts';
 import { MAX_TEMPORAL_M } from '../../shared/gi/surfel/constants.ts';
@@ -62,6 +63,8 @@ export class StaticLight {
   private gbuffer: ReturnType<typeof rasteriseLightmapGBuffer> | null = null;
   private coverage = 0;
   private busy = false;
+  private bakedProvenance: LightingProvenance | null = null;
+  private digests = { environment: 'pending', transport: 'pending' };
 
   constructor(
     private readonly renderer: THREE.WebGPURenderer,
@@ -90,6 +93,7 @@ export class StaticLight {
     this.busy = true;
     this.ready = false;
     try {
+      await this.warmProvenance();
       frameGraph.setGiTextures(null, null);
       const atlas = await this.prepareAtlas(frameGraph, options.forceBake === true, options.contactTree ?? null);
       this.atlasPixels = atlas.pixels;
@@ -118,7 +122,8 @@ export class StaticLight {
           this.gi.restoreStaticBake(this.renderer, saved.surfels, this.url.get('atlasSurfels') === '1');
           this.publishAtlas(frameGraph, halfFloatTexture(this.renderer, saved.pixels, saved.size, saved.size * (saved.pages ?? 1)));
           Object.assign(cache, { source: 'saved', storage: 'bundle', saved: true });
-          console.log(`[bake-cache] restored ${cache.key}`);
+          this.bakedProvenance = ((await loadBakeManifest(cache.key).catch(() => null))?.provenance as LightingProvenance | undefined) ?? null;
+          console.log(`[bake-cache] restored ${cache.key}, indirect light ${this.bakeStatusText()}`);
           return { pixels: saved.pixels, surfels: saved.surfels, probes: saved.probes, fresh: false };
         }
       } catch (error) {
@@ -147,13 +152,38 @@ export class StaticLight {
     });
   }
 
+  /* @important The two digests are taken once and kept: the panorama and the transport
+     settings do not change while the scene runs, and the HUD asks for the status every
+     frame. Only the sun's transform, intensity and colour are read live. */
+  private async warmProvenance(): Promise<void> {
+    this.digests = {
+      environment: await environmentDigest(this.gi.envTexture as THREE.DataTexture),
+      transport: await transportDigest({ atlasSize: this.atlasSize, passes: this.bakeParams.passes, rays: this.bakeParams.rays, scene: this.url.get('scene') ?? 'default' }),
+    };
+  }
+
+  currentProvenance(): LightingProvenance {
+    return captureLightingProvenance(this.sun, this.digests.environment, this.digests.transport);
+  }
+
+  /* @important Reports only. The rule of this project is that nothing in code decides to
+     rebake: a stale indirect term is shown to the person, who presses "re-bake now". */
+  bakeStatus(): ProvenanceStatus {
+    return compareLightingProvenance(this.bakedProvenance, this.currentProvenance());
+  }
+
+  bakeStatusText(): string {
+    return describeProvenance(this.bakeStatus());
+  }
+
   private async save(pixels: Float32Array, surfels: FrozenSurfelData): Promise<void> {
     const cache = this.bakeCache;
     if (!this.url.flag('bakeCache', true) || this.leak || !cache.key) return;
     bootNote('Saving the static lighting in the project');
     try {
       const probes = cache.probes === 'baked' || cache.probes === 'saved' ? this.probes?.export() : undefined;
-      await saveBake(cache.key, { size: this.atlasSize, pages: this.layout?.pages ?? 1, pixels, surfels, probes });
+      this.bakedProvenance = this.currentProvenance();
+      await saveBake(cache.key, { size: this.atlasSize, pages: this.layout?.pages ?? 1, pixels, surfels, probes }, this.bakedProvenance);
       cache.saved = true;
       console.log(`[bake-cache] saved ${cache.key}${probes ? ' with probes' : ' without probes'}`);
     } catch (error) {

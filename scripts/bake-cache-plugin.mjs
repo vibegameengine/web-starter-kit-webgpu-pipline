@@ -61,10 +61,16 @@ export function bakeCachePlugin() {
           }
           await writeFile(temporary, data);
           await rename(temporary, path.join(directory, `${match[1]}.bin`));
+          const provenanceHeader = req.headers['x-bake-provenance'];
+          let provenance;
+          if (typeof provenanceHeader === 'string' && provenanceHeader.length <= 4096) {
+            try { provenance = JSON.parse(Buffer.from(provenanceHeader, 'base64').toString('utf8')); } catch { provenance = undefined; }
+          }
           await writeFile(path.join(directory, `${match[1]}.json`), JSON.stringify({
             key: match[1], format: 'Webgiya frozen static bake', version: data.readUInt32LE(4),
             atlasSize: data.readUInt32LE(8), capacity: data.readUInt32LE(12), pinnedSurfels: data.readUInt32LE(16),
             bytes: data.length, sha256: createHash('sha256').update(data).digest('hex'),
+            ...(provenance ? { provenance } : {}),
           }, null, 2));
           res.statusCode = 204; res.end();
         } catch (error) {

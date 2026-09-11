@@ -25,6 +25,7 @@ export class Hud {
     private readonly stats: CacheStats,
     /** Reports whether the GI cache is frozen — the headline state of a baked build. */
     private readonly giFrozen: () => string = () => 'converging',
+    private readonly bakedLight: (() => string) | null = null,
   ) {
     this.root = document.createElement('div');
     this.root.id = 'hud';
@@ -33,6 +34,7 @@ export class Hud {
 
     this.addRow('fps', () => this.fps.toFixed(0));
     this.addRow('gi cache', () => this.giFrozen());
+    if (this.bakedLight) this.addRow('baked light', () => this.bakedLight!());
     this.addRow('sun', () => {
       const { azimuthDeg, elevationDeg } = this.world.sun;
       return `${azimuthDeg.toFixed(2)}° / ${elevationDeg.toFixed(2)}°`;
