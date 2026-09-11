@@ -218,7 +218,7 @@ export class BakeLeakStages {
      value at a point. Two probes cannot see a leak that is spread thin: a seven-fold error at one
      texel hid under a tolerance derived from the lit reference, and a critic found it by arithmetic
      rather than by the check. This returns every charted texel whose sample stands inside a box. */
-  region(min: [number, number, number], max: [number, number, number], stageName = 'resident') {
+  region(min: [number, number, number], max: [number, number, number], stageName = 'resident', threshold = 0) {
     const stage = this.stages.find((entry) => entry.name === stageName);
     if (!stage) return null;
     const values: number[] = [];
@@ -230,13 +230,14 @@ export class BakeLeakStages {
       if (!inside || stage.values[slot * 4 + 3] < MEASURED_ALPHA) continue;
       values.push(luma(stage.values, slot * 4));
     }
-    if (values.length === 0) return { texels: 0, mean: 0, p99: 0, max: 0 };
+    if (values.length === 0) return { texels: 0, mean: 0, p99: 0, max: 0, above: 0 };
     values.sort((a, b) => a - b);
     return {
       texels: values.length,
       mean: values.reduce((sum, v) => sum + v, 0) / values.length,
-      p99: values[Math.min(values.length - 1, Math.floor(values.length * 0.99))],
+      p99: values[Math.min(values.length - 1, Math.floor(values.length * REGION_PERCENTILE))],
       max: values[values.length - 1],
+      above: values.filter((v) => v > threshold).length,
     };
   }
 
@@ -298,6 +299,6 @@ export function leakHookApi(leak: BakeLeakStages, onShown?: () => void) {
     atWorld: (x: number, y: number, z: number, withinMetres?: number) => leak.atWorld(x, y, z, withinMetres),
     firstChange: (tolerance?: number) => leak.firstChange(tolerance),
     inventedLight: (blackLevel?: number) => leak.inventedLight(blackLevel),
-    region: (min: [number, number, number], max: [number, number, number], stage?: string) => leak.region(min, max, stage),
+    region: (min: [number, number, number], max: [number, number, number], stage?: string, threshold?: number) => leak.region(min, max, stage, threshold),
   };
 }

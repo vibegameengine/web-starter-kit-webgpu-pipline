@@ -95,7 +95,7 @@ commit rather than dressed up.
 node scripts/check-leak-room.mjs contact 0,1,5,20            # A1, A2 - green
 node scripts/check-leak-room.mjs contact 0 "&lm=64"          # A4, one texel spans the wall base - green
 node scripts/check-bake-leak.mjs corridor floor              # section 01 capture and its mutation - green
-node scripts/check-leak-reference.mjs 0,20                              # the independent reference - green
+node scripts/check-leak-reference.mjs 0,20 32768                        # the independent reference - RED, see below
 node scripts/check-leak-reference.mjs 0 32768 "&leakMutation=atlasHalf"  # and it must go red - green
 node scripts/check-leak-room.mjs contact 0 "&scale=0.001"    # A3 - RED, see below
 ```
@@ -124,6 +124,18 @@ on a measured texel within 1.8 cm of itself, and the frame is checked for being 
 has to catch is `?leakMutation=atlasHalf`, which halves what the bake writes: outdoor goes 0.00724
 against a reference of 0.01443 and the check goes red. A check that has not been shown to fail is
 not evidence.
+
+**The reference check is red, and it is right to be.** The sealed room's interior holds 21 texels
+above tau - p99 uses 73 % of it, but the worst texel is 145 % - and they are connected, along the
+seams where the walls meet the floor and the ceiling. That is the design's other constraint in
+section 07, the width of a connected leak, and the first two versions of this check could not see it:
+p99 over 23684 texels discards the top 236, and 236 texels is a one-texel line eight metres long.
+239 texels at full sunlight would have passed.
+
+Where they come from: raw. The transport leaves 172 texels above tau, the denoise brings that to 21,
+and nothing downstream moves it. So the residue is the bake's own rays at a concave corner, not the
+filter, and it is what design sections 02 and 03 still have open - the contact split and the
+watertight intersection. The gate stays red until one of them closes it.
 
 Reading the sun back matters. The scene sets its own sun and `setupSun` then replaces both direction
 and intensity from the GUI's light config, which is seeded from the panorama's sun search: assuming

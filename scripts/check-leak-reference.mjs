@@ -35,9 +35,13 @@ const scale = Number(process.argv[5] ?? 1);
 const origin = process.env.LEAK_CHECK_ORIGIN ?? 'http://127.0.0.1:5188';
 
 const OUTDOOR_TOLERANCE = 0.1;
+/* @important The renderer's sun, read back from a page in an earlier run: setupSun overwrites whatever the
+   scene asked for from the panorama's sun search, and tau must exist before the first page loads. */
+const SUN_GUESS = { direction: [0.484, 0.800, 0.355], intensity: 2 };
 const MEASURED_ALPHA = 0.75;
 const PROBE_REACH_METRES = 0.05;
-/* 0.005 of the lit reference is the design's own number, section 07: tau = max(5 sigma, 0.005 L_ref).
+const SEALED_TEXELS_ABOVE_TAU = 0;
+/* @important 0.005 of the lit reference is the design's own number, section 07: tau = max(5 sigma, 0.005 L_ref).
    0.001 was mine and arbitrary, and the sealed room failed it at 123 % of tolerance. */
 const INTERIOR_FLOOR = 0.005;
 
@@ -63,6 +67,11 @@ function frameMean(png) {
   return sum / (img.width * img.height);
 }
 
+/* tau has to exist before the region is asked how many texels exceed it, and it depends on the lit
+   reference, so it is computed once from the reference at the sunward probe rather than from the
+   run being measured. */
+const tolerance = INTERIOR_FLOOR * indirectAtPoint(leakRoomGeometry({ gap: 0, scale }), PROBES[3].at, PROBES[3].normal, { paths: 8192, sun: SUN_GUESS.direction, intensity: SUN_GUESS.intensity });
+
 async function bakedAt(gap) {
   const query = `&leak=1&hud=0&inspector=0&still=1&aa=none&grain=0&exposure=1${mutation}`;
   await page.goto(`${origin}/?scene=leak-room&cam=outside&gap=${gap}${query}&env=0${scale === 1 ? '' : `&scale=${scale}`}`);
@@ -85,7 +94,8 @@ async function bakedAt(gap) {
      earlier can hand the reference a scene with no light at all. */
   const light = await page.evaluate(() => ({ position: window.__probe().sunPos, intensity: window.__probe().sunIntensity }));
   if (!(light.intensity > 0)) throw new Error(`the sun read back as ${light.intensity}`);
-  const interiorRegion = await page.evaluate((box) => window.__leak.region(box[0], box[1]), INTERIOR_BOX);
+  const interiorRegion = await page.evaluate(([box, tau]) => window.__leak.region(box[0], box[1], 'resident', tau), [INTERIOR_BOX, tolerance]);
+  if (!interiorRegion || interiorRegion.texels === 0) throw new Error('the interior region is empty: nothing was measured inside the room');
   const png = await page.screenshot();
   await writeFile(`${out}/gap-${gap}mm${mutation ? '-mutated' : ''}.png`, png);
   const length = Math.hypot(...light.position);
@@ -140,17 +150,24 @@ const interiorMatches = interior.every((row) => Math.abs(row.luma - row.referenc
 /* @important Only the sealed room is judged by its region: with a gap open the truth inside is neither zero nor
    uniform, and the texels at the slit are legitimately the brightest in it. */
 const sealedRegion = regions.find((region) => region.gap === 0);
-const regionWithin = sealedRegion === undefined || sealedRegion.p99 <= interiorFloor;
+/* @important p99 over 23684 texels discards the top 236, and 236 texels is a one-texel line eight metres long -
+   the whole seam where floor meets wall. The design bounds the width of a connected leak separately
+   for exactly this reason, so the count above tau is what the gate uses, not the percentile alone. */
+const regionWithin = sealedRegion !== undefined && sealedRegion.p99 <= interiorFloor && sealedRegion.above <= SEALED_TEXELS_ABOVE_TAU;
 const outdoorAgrees = ratios.length > 0 && ratios.every((r) => Math.abs(r - 1) <= OUTDOOR_TOLERANCE);
 const referenceIsSharp = litReference > 0 && noiseFloor / litReference < OUTDOOR_TOLERANCE / 2;
-const litSurfacesShow = darkestFrame > 1;
+/* The frame criterion is gone. It read the mean of the whole shot, and the sky is a quarter of it at
+   149/255: with every surface in the scene forced black the mean was still 42 against a threshold of
+   1. It never judged the bake, and a criterion that cannot fail is worse than none. What the frame
+   is for here is a human looking at it. */
+const litSurfacesShow = true;
 console.log(`errors ${errors.length}${errors.length ? ': ' + errors.slice(0, 2).join(' | ').slice(0, 300) : ''}`);
 console.log(`every probe on a measured texel: ${unmeasured.length === 0 ? 'PASS' : `FAIL (${unmeasured.map((row) => row.probe).join(', ')})`}`);
 console.log(`reference noise under half the gate: ${referenceIsSharp ? 'PASS' : 'FAIL'} (${(100 * noiseFloor / (litReference || 1)).toFixed(1)}%)`);
 console.log(`each outdoor probe within ${100 * OUTDOOR_TOLERANCE}%: ${outdoorAgrees ? 'PASS' : 'FAIL'}`);
 console.log(`interior probes within tau: ${interiorMatches ? 'PASS' : 'FAIL'}`);
-console.log(`sealed interior region p99 under tau ${interiorFloor.toFixed(6)}: ${regionWithin ? 'PASS' : 'FAIL'}${sealedRegion ? ` (uses ${(100 * sealedRegion.p99 / interiorFloor).toFixed(0)}% of it)` : ', no sealed run'}`);
-console.log(`lit surfaces are not black: ${litSurfacesShow ? 'PASS' : 'FAIL'}`);
+console.log(`sealed interior under tau ${interiorFloor.toFixed(6)}: ${regionWithin ? 'PASS' : 'FAIL'}${sealedRegion ? ` (p99 uses ${(100 * sealedRegion.p99 / interiorFloor).toFixed(0)}%, ${sealedRegion.above} texels above it, max ${(100 * sealedRegion.max / interiorFloor).toFixed(0)}%)` : ', NO SEALED RUN - this criterion was not exercised'}`);
+console.log(`frame written for a human to look at: ${out}/gap-*.png`);
 
 /* @important The health of the run and the measurement are different things. A mutation "caught" by
    a dead dev server proves nothing, and the previous version could not tell them apart: any of six
@@ -158,7 +175,7 @@ console.log(`lit surfaces are not black: ${litSurfacesShow ? 'PASS' : 'FAIL'}`);
 /* With no outdoor probe on a measured texel there is no lit reference, tau collapses to zero and
    every criterion reads FAIL for want of a scale rather than for a leak - which is what a coarse
    atlas does, its texels being wider than the probe's reach. That is an unsound run, not a verdict. */
-const healthy = unmeasured.length === 0 && litReference > 0 && referenceIsSharp && litSurfacesShow && errors.length === 0;
+const healthy = unmeasured.length === 0 && litReference > 0 && referenceIsSharp && sealedRegion !== undefined && errors.length === 0;
 const measures = outdoorAgrees && interiorMatches && regionWithin;
 console.log(`run is healthy: ${healthy ? 'PASS' : 'FAIL'}; measurements agree: ${measures ? 'PASS' : 'FAIL'}`);
 if (!healthy) { console.log('the run itself is unsound; no verdict on the bake'); process.exit(2); }
