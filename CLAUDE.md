@@ -258,20 +258,6 @@ Before editing a path, run `node scripts/own.mjs --who <path>` and claim an
 unowned area with `own.mjs --session <printed-session> --claim "<path-or-glob>"
 --why "<work>"`. Ask a live owner through the visible feed with
 `node scripts/ask.mjs --session <printed-session> --to <owner-id> --text "..."`.
-Never use `comment.mjs` or write as the human. Every agent must read ALL new
-feed entries before continuing work: posts (`note`, `done`, `problem`), comments,
-replies and acknowledgements, including entries addressed to other agents.
-Each session and subagent has an independent cursor; addressing never filters
-delivery. Account for everyone's findings, fixes, ownership and changed decisions.
-
-The addressee of a `[FOR YOU]` comment must mark it 👀 seen before the next tool
-call, even when no textual answer is needed:
-`node scripts/ack.mjs --author "<you>" --re <comment-id> --emoji "👀"`.
-Human broadcasts require this receipt from every receiving agent. Other readers
-do not acknowledge on behalf of the addressee. Receipt and substantive reply are
-separate: reply substantively only when the message calls for an answer or a
-question is specifically addressed to you. Read acknowledgements without
-acknowledging them again. Do not reply to yourself or automatically answer status
-posts. Messages addressed to another agent are context, not permission to take
-over their work. Use `ask.mjs --re <entry-id>` for substantive replies to another agent.
+The project hook supplies feed reading, receipt and reply rules in its first
+message, including when the feed is empty.
 
