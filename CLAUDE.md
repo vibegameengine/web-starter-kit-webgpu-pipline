@@ -86,6 +86,25 @@
   sparse checkout drags in `vendor/three/examples/*.html` and Vite's scanner then refuses to
   start. Details in [lessons-three-fork.md](docs/lessons-three-fork.md) and
   [lessons-instance-velocity.md](docs/lessons-instance-velocity.md).
+- Iteration 29 (2026-09-11) halves the village boot. Every launch paid ~50 s of the 75 s
+  for WGSL generation, and a CDP profile of that window (`scripts/_boot_profile.mjs`) put
+  35 s of 48 inside three's `NodeBuilder` resolving TSL node types - `MathNode.getNodeType`
+  8.0 s self, `getTypeLength` 3.3, `OperatorNode` 2.9, `VarNode` 2.5 - with only 12 s idle on
+  the GPU compile: `getInputType` asks each child for its type, each child asks its own, and
+  nothing memoises, so a tree is re-typed once per parent per build stage. `NodeBuilder.typeOf`
+  (fork commit b94a2d49f) memoises in a WeakMap keyed by `buildStage|shaderStage`, skipped
+  during `setup` where a type is not settled yet, and the four hot recursion sites go through
+  it; `globalThis.__nodeTypeCacheOff` is the ablation. Shader stage 17.0 to 6.2 s, first frame
+  37.8 to 9.8 s, 75 of 921600 pixels differing by more than 1/255. **A boot comparison here is
+  not pixel-exact by default:** the first A/B read 98.8 % of pixels differing and it was film
+  grain plus TAA jitter phase, not the change - exposure matched to seven digits, removing a
+  global gain made it worse, and `scripts/_diff_png.mjs` showed the difference uniform across
+  the empty backdrop; `&grain=0&aa=none` collapses it to the noise floor. The cold lightmap and
+  probe bake is a further 92 s and is cached; what is left on top is the contact BVH (6.5 s
+  idle, 27 s with eight other dev servers running) and ~10 s of CPU scene generation.
+  `scripts/check-boot-stages.mjs` is the per-stage timeline, `scripts/check-node-type-cache.mjs`
+  the A/B. Details in [lessons-village-boot-time.md](docs/lessons-village-boot-time.md).
+
 - **Never run anything headless.** User rule (2026-09-08): every capture, check and measurement uses a headed Chrome window; `capture-chrome.mjs` and all `check-*.mjs` launch headed unconditionally. Headless is not an option to mention or offer.
 - **Never leave the renderer broken, and never wait out a failure.** User rule (2026-09-11): this repository is shared by several sessions at once, so a pipeline error you introduce is everybody's error — check the plain URL boots before starting any long measurement, and fix a break before walking away from it. Harness scripts must fail on the first error instead of sitting on a timeout: watch `#error-overlay` and the page's `pageerror`, and exit the moment either fires. A 240-second `waitForFunction` that ends in a timeout when the answer was known in two seconds is the defect, not the scene.
 - **A new view is not delivered as a URL for the user to type.** User rule (2026-09-11): when something new can be looked at — a lab, a split view, a debug pane — wire it into the UI in the same change: a chip on its card in `src/app/home/catalog.ts`, a GUI control, or whatever the user already clicks. Handing over `?lab=1` and waiting to be asked "why don't I see it" is the failure: the user opened the app, found nothing, and had to send a screenshot with an arrow. A URL parameter is the ablation for checks, never the way a person reaches the feature.
