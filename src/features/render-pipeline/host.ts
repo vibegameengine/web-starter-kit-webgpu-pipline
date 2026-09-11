@@ -5,6 +5,7 @@ import type { ContactOcclusionSettings } from '../../shared/gi/contact/contactOc
 import type { ReflectionSettings } from '../../shared/gi/reflect/reflectionPass.ts';
 import type { MotionBlurSettings } from '../../shared/render/motionBlur.ts';
 import type { SurfelGI } from '../../shared/gi/index.ts';
+import type { ReflectionVolumeSpec } from '../../shared/gi/reflect/cache/reflectionVolumes.ts';
 
 export interface SceneHost {
   scene: THREE.Scene;
@@ -22,6 +23,7 @@ export interface SceneHost {
   contact?: Partial<ContactOcclusionSettings>;
   staticLighting?: boolean;
   reflections?: Partial<ReflectionSettings>;
+  reflectionVolumes?: ReflectionVolumeSpec[];
   motionBlur?: Partial<MotionBlurSettings>;
   interiorVolumes?: THREE.Box3[];
 }

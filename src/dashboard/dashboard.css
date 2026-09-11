@@ -1,0 +1,12 @@
+/**
+ * The dashboard's stylesheet, in load order: tokens, then the reset and shared
+ * primitives, then the page shell, then the feed, then the comment threads that
+ * hang under its posts.
+ */
+
+@import "./styles/tokens.css";
+@import "./styles/base.css";
+@import "./styles/layout.css";
+@import "./styles/rail.css";
+@import "./styles/feed.css";
+@import "./styles/reply.css";

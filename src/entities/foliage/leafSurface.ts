@@ -21,6 +21,8 @@
  */
 import * as THREE from 'three/webgpu';
 import type { NoiseField } from '../../shared/lib/noise';
+import type { LeafSurface } from '../../shared/render/foliage/index.ts';
+export type { LeafSurface } from '../../shared/render/foliage/index.ts';
 
 export type Venation = 'parallel' | 'pinnate';
 
@@ -32,13 +34,6 @@ export interface LeafSurfaceOptions {
   noise: NoiseField;
   width_px?: number;
   length_px?: number;
-}
-
-export interface LeafSurface {
-  /** Tangent-space normal of the adaxial face, +u right, +v toward the apex. */
-  normal: THREE.DataTexture;
-  /** R = adaxial (waxy) roughness, G = abaxial roughness, B = vein mask. Linear. */
-  roughness: THREE.DataTexture;
 }
 
 const clamp01 = (x: number): number => (x < 0 ? 0 : x > 1 ? 1 : x);

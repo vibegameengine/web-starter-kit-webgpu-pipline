@@ -1,0 +1,161 @@
+@import url("https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@500;600;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=IBM+Plex+Mono:wght@400;500;600&display=swap");
+
+html[data-view="pipeline"] {
+  color-scheme: light dark;
+  height: auto;
+  overflow: visible;
+  background: var(--ground);
+}
+
+html[data-view="pipeline"] body {
+  height: auto;
+  overflow: visible;
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--body);
+  font-size: 17px;
+  line-height: 1.62;
+  -webkit-font-smoothing: antialiased;
+}
+
+html[data-view="pipeline"] #app,
+html[data-view="pipeline"] .overlay,
+html[data-view="pipeline"] #home {
+  display: none;
+}
+
+html[data-view="pipeline"] {
+  --ground: #eef0f4;
+  --surface: #f7f8fa;
+  --sunk: #e3e6ec;
+  --line: #c6ccd8;
+  --ink: #171b24;
+  --ink-soft: #4b5468;
+  --ink-faint: #78829a;
+  --them: #4a6fa5;
+  --them-soft: #dce4f0;
+  --us: #1d7d78;
+  --us-soft: #d3e8e6;
+  --bake: #b56a12;
+  --bake-soft: #f0e0c8;
+  --cost: #b23c33;
+  --cost-soft: #f2d8d5;
+  --display: "Familjen Grotesk", "Segoe UI", system-ui, sans-serif;
+  --body: "Source Serif 4", Georgia, serif;
+  --mono: "IBM Plex Mono", ui-monospace, monospace;
+}
+
+.pipeline-doc {
+  max-width: 1220px;
+  margin: 0 auto;
+  padding: 0 28px 110px;
+}
+
+@media (prefers-color-scheme: dark) {
+  html[data-view="pipeline"]:not([data-theme="light"]) {
+    --ground: #12151c;
+    --surface: #1a1e27;
+    --sunk: #0d1015;
+    --line: #2e3542;
+    --ink: #e7eaf0;
+    --ink-soft: #a4adbf;
+    --ink-faint: #7c8598;
+    --them: #8fb0e0;
+    --them-soft: #1c2734;
+    --us: #56bdb6;
+    --us-soft: #14322f;
+    --bake: #e2a04a;
+    --bake-soft: #3a2c17;
+    --cost: #e2726a;
+    --cost-soft: #38201d;
+  }
+}
+
+html[data-view="pipeline"][data-theme="dark"] {
+  --ground: #12151c;
+  --surface: #1a1e27;
+  --sunk: #0d1015;
+  --line: #2e3542;
+  --ink: #e7eaf0;
+  --ink-soft: #a4adbf;
+  --ink-faint: #7c8598;
+  --them: #8fb0e0;
+  --them-soft: #1c2734;
+  --us: #56bdb6;
+  --us-soft: #14322f;
+  --bake: #e2a04a;
+  --bake-soft: #3a2c17;
+  --cost: #e2726a;
+  --cost-soft: #38201d;
+}
+
+.pipeline-doc * { box-sizing: border-box; }
+.pipeline-doc .col { max-width: 64ch; }
+
+.pipeline-doc > header { padding: 60px 0 36px; border-bottom: 1px solid var(--line); margin-bottom: 20px; }
+.pipeline-doc .eyebrow { font-family: var(--mono); font-size: 12px; font-weight: 500; letter-spacing: .12em; text-transform: uppercase; color: var(--ink-faint); margin: 0 0 16px; }
+.pipeline-doc h1 { font-family: var(--display); font-weight: 700; font-size: clamp(36px, 5.4vw, 58px); line-height: 1.03; letter-spacing: -.025em; margin: 0 0 18px; text-wrap: balance; max-width: 18ch; }
+.pipeline-doc .standfirst { font-size: 19.5px; color: var(--ink-soft); margin: 0; max-width: 62ch; }
+.pipeline-doc .standfirst b { color: var(--ink); font-weight: 600; }
+
+.pipeline-doc .part { margin: 76px 0 0; padding-top: 22px; border-top: 3px solid var(--ink); }
+.pipeline-doc .part-k { font-family: var(--mono); font-size: 12px; font-weight: 600; letter-spacing: .16em; text-transform: uppercase; color: var(--ink-faint); margin: 0 0 10px; }
+.pipeline-doc h2 { font-family: var(--display); font-weight: 700; font-size: 34px; letter-spacing: -.022em; line-height: 1.12; margin: 0 0 8px; text-wrap: balance; max-width: 22ch; }
+.pipeline-doc .subtitle { font-family: var(--display); font-size: 18px; font-weight: 500; color: var(--ink-soft); margin: 0 0 22px; max-width: 60ch; }
+.pipeline-doc h3 { font-family: var(--display); font-weight: 600; font-size: 19px; letter-spacing: -.005em; margin: 40px 0 8px; }
+.pipeline-doc p { margin: 0 0 16px; }
+.pipeline-doc a { color: var(--us); text-underline-offset: 3px; }
+.pipeline-doc a:focus-visible { outline: 2px solid var(--us); outline-offset: 3px; border-radius: 3px; }
+.pipeline-doc code { font-family: var(--mono); font-size: .88em; }
+
+.pipeline-doc .stage { display: grid; grid-template-columns: 4.4rem 1fr; gap: 22px; padding: 22px 0; border-top: 1px solid var(--line); align-items: start; }
+.pipeline-doc .stage .k { font-family: var(--mono); font-size: 12.5px; font-weight: 600; letter-spacing: .06em; color: var(--them); padding-top: 5px; }
+.pipeline-doc .stage .t { font-family: var(--display); font-weight: 600; font-size: 18px; margin-bottom: 4px; display: block; }
+.pipeline-doc .stage .d { color: var(--ink-soft); font-size: 16px; line-height: 1.55; max-width: 62ch; display: block; }
+.pipeline-doc .stage .d em { color: var(--ink); font-style: normal; font-weight: 600; }
+.pipeline-doc .shots { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
+.pipeline-doc .shot { margin: 0; width: 210px; }
+.pipeline-doc .shot img { display: block; width: 100%; height: auto; border: 1px solid var(--line); background: var(--sunk); }
+.pipeline-doc .shot figcaption { font-family: var(--mono); font-size: 10.5px; line-height: 1.4; color: var(--ink-faint); margin-top: 5px; }
+
+.pipeline-doc figure { margin: 32px 0; }
+.pipeline-doc figure.big img { display: block; width: 100%; max-width: 860px; height: auto; border: 1px solid var(--line); }
+.pipeline-doc figure svg { display: block; width: 100%; max-width: 100%; height: auto; }
+.pipeline-doc figcaption.cap { font-family: var(--mono); font-size: 12.5px; line-height: 1.5; color: var(--ink-faint); margin-top: 12px; max-width: 76ch; }
+.pipeline-doc .scroller { overflow-x: auto; }
+.pipeline-doc .scroller > svg { min-width: 780px; }
+
+.pipeline-doc table { border-collapse: collapse; width: 100%; margin: 18px 0 4px; font-size: 15px; }
+.pipeline-doc th,
+.pipeline-doc td { text-align: left; padding: 11px 16px 11px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+.pipeline-doc th { font-family: var(--mono); font-size: 11.5px; font-weight: 500; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-faint); }
+.pipeline-doc th.n,
+.pipeline-doc td.n { font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+.pipeline-doc tr.hit td { background: var(--cost-soft); }
+.pipeline-doc tr.hit td:first-child { box-shadow: inset 3px 0 0 var(--cost); padding-left: 12px; }
+.pipeline-doc .tag { font-family: var(--mono); font-size: 11px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; padding: 2px 7px; border-radius: 3px; white-space: nowrap; display: inline-block; }
+.pipeline-doc .same { background: var(--us-soft); color: var(--us); }
+.pipeline-doc .gap { background: var(--bake-soft); color: var(--bake); }
+.pipeline-doc .diff { background: var(--cost-soft); color: var(--cost); }
+.pipeline-doc .na { background: var(--sunk); color: var(--ink-faint); }
+.pipeline-doc .src { background: var(--them-soft); color: var(--them); }
+
+.pipeline-doc .pull { border-left: 3px solid var(--cost); padding: 4px 0 4px 20px; margin: 30px 0; font-family: var(--display); font-size: 21px; font-weight: 500; line-height: 1.35; letter-spacing: -.01em; max-width: 48ch; }
+.pipeline-doc .pull.ok { border-color: var(--us); }
+.pipeline-doc .pull.them { border-color: var(--them); }
+
+.pipeline-doc .steps { list-style: none; margin: 18px 0 0; padding: 0; }
+.pipeline-doc .steps li { display: grid; grid-template-columns: 3rem 1fr; gap: 18px; padding: 13px 0; border-top: 1px solid var(--line); }
+.pipeline-doc .steps li:last-child { border-bottom: 1px solid var(--line); }
+.pipeline-doc .steps .k { font-family: var(--mono); font-size: 12px; font-weight: 600; letter-spacing: .08em; color: var(--us); padding-top: 4px; }
+.pipeline-doc .steps.bake .k { color: var(--bake); }
+.pipeline-doc .steps .t { font-family: var(--display); font-weight: 600; font-size: 16.5px; margin-bottom: 2px; display: block; }
+.pipeline-doc .steps .d { color: var(--ink-soft); font-size: 15.5px; line-height: 1.5; display: block; }
+
+.pipeline-doc .risks div { padding: 13px 0; border-top: 1px solid var(--line); }
+.pipeline-doc .risks div:last-child { border-bottom: 1px solid var(--line); }
+.pipeline-doc .risks b { font-family: var(--display); font-weight: 600; }
+.pipeline-doc .risks span { color: var(--ink-soft); }
+
+.pipeline-doc .foot { margin-top: 66px; padding-top: 22px; border-top: 1px solid var(--line); font-family: var(--mono); font-size: 12.5px; color: var(--ink-faint); line-height: 1.75; }
+.pipeline-doc .foot a { color: var(--ink-faint); }

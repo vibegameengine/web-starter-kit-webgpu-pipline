@@ -1,0 +1,321 @@
+/**
+ * Comments and the box you write them in — everything that hangs UNDER a post.
+ *
+ * The thread is indented and railed so it reads as belonging to the post above
+ * it rather than as the next item in the stream. Comments are compact and
+ * tinted; they are remarks about a post, not events competing with it. And the
+ * reply box is a writing surface with no box around it, because a bordered
+ * field asks to be filled in and then forgotten.
+ */
+
+/* ---- the thread ------------------------------------------------------ */
+
+.thread {
+  display: grid;
+  gap: 10px;
+  /* Indented from the post's own left edge, and railed, so a run of comments
+     cannot be mistaken for a run of posts. */
+  margin: 12px 0 0 26px;
+  padding-left: 18px;
+  border-left: 2px solid var(--hairline);
+}
+
+/* ---- one comment ----------------------------------------------------- */
+
+.comment {
+  padding: 12px 16px 14px;
+  border-radius: var(--r-m);
+  /* The wash sits ON the surface, so a comment is still a surface and `problem`
+     is still the only saturated thing on the page. */
+  background: linear-gradient(var(--wash), var(--wash)), var(--surface);
+  box-shadow: var(--surface-lift);
+}
+
+.comment-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 3px 9px;
+  margin-bottom: 5px;
+}
+
+.comment-author {
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.012em;
+}
+
+/* Quiet, but never hidden: a comment an agent wrote must not be able to pass
+   for one the human wrote. */
+.comment-via {
+  padding: 1px 7px;
+  border-radius: var(--r-full);
+  background: var(--fill-1);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: var(--ink-3);
+}
+
+.comment-time {
+  font-size: var(--fs-meta);
+  letter-spacing: 0;
+  color: var(--ink-3);
+  white-space: nowrap;
+  cursor: help;
+}
+
+.comment .post-body {
+  font-size: 15px;
+}
+
+/* ---- receipts -------------------------------------------------------- */
+
+/* Small, but never quiet enough to miss: this row is the only thing on the page
+   that answers "did anyone hear me", and it has to answer within seconds of the
+   comment being written. */
+.acks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ack {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  max-width: 100%;
+  padding: 3px 10px 4px;
+  border-radius: var(--r-full);
+  background: var(--surface);
+  box-shadow: inset 0 0 0 1px var(--hairline);
+  font-size: var(--fs-meta);
+  letter-spacing: 0;
+}
+
+.ack-emoji {
+  font-size: 13px;
+  line-height: 1;
+}
+
+.ack-author {
+  font-weight: 600;
+  color: var(--ink-2);
+}
+
+.ack-text {
+  color: var(--ink-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ack-time {
+  color: var(--ink-3);
+  white-space: nowrap;
+}
+
+/* ---- the reply box --------------------------------------------------- */
+
+.reply {
+  display: grid;
+  grid-template-columns: 32px 1fr;
+  gap: 10px;
+  padding-top: 2px;
+}
+
+/* The broadcast is the same box with no post above it, so it needs the breathing
+   room the thread would otherwise have given it. */
+.broadcast {
+  margin-bottom: 30px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.reply-avatar {
+  width: 32px;
+  height: 32px;
+  border: 0;
+  border-radius: var(--r-full);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0;
+  cursor: pointer;
+}
+
+.reply-name {
+  width: 100%;
+  border: 0;
+  border-bottom: 1px solid var(--accent);
+  border-radius: 0;
+  padding: 2px 0 4px;
+  margin-bottom: 6px;
+  background: none;
+  color: var(--ink);
+  font: inherit;
+  font-size: var(--fs-meta);
+}
+
+.reply-name:focus,
+.reply-name:focus-visible {
+  outline: none;
+}
+
+.reply-write {
+  position: relative;
+}
+
+/* The writing surface. No background, no border, no box — it is the page. */
+.reply-input {
+  display: block;
+  width: 100%;
+  border: 0;
+  padding: 5px 0;
+  background: none;
+  color: var(--ink);
+  font: inherit;
+  font-size: 16px;
+  line-height: 1.5;
+  letter-spacing: var(--ls-body);
+  resize: none;
+  overflow: hidden;
+}
+
+/* `box-shadow`, not just `outline`. The page-wide `:focus-visible` rule in
+   base.css draws its ring as a box-shadow (`--ring`) with a 7px radius, so
+   overriding only the outline leaves a soft rounded rectangle around the field
+   — the exact form-shaped box this design exists to not have. The caret is the
+   affordance here, which is what a text field has and what every writing
+   surface relies on; every other control keeps its ring. */
+.reply-input:focus,
+.reply-input:focus-visible {
+  outline: none;
+  box-shadow: none;
+  border-radius: 0;
+}
+
+.reply-input::placeholder {
+  color: var(--ink-3);
+}
+
+/* Completing a name is part of typing, not a lookup you go and do. */
+.reply-mentions {
+  position: absolute;
+  z-index: 5;
+  top: 100%;
+  left: -8px;
+  min-width: 210px;
+  max-width: 300px;
+  padding: 6px;
+  margin: 0;
+  list-style: none;
+  border-radius: var(--r-m);
+  background: var(--surface);
+  box-shadow: var(--shadow-2), var(--surface-lift);
+}
+
+.reply-mentions button {
+  display: block;
+  width: 100%;
+  border: 0;
+  border-radius: var(--r-xs);
+  padding: 7px 10px;
+  background: none;
+  color: var(--ink);
+  font: inherit;
+  font-size: var(--fs-meta);
+  text-align: left;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.reply-mentions button[data-selected="true"],
+.reply-mentions button:hover {
+  background: var(--fill-1);
+}
+
+.reply-foot {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  padding-top: 8px;
+}
+
+/* A readout, not a control: who is about to be told to act. */
+.reply-target {
+  margin-right: auto;
+  font-size: var(--fs-meta);
+  font-weight: 600;
+  color: var(--accent);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.reply-target.is-all {
+  font-weight: 500;
+  color: var(--ink-3);
+}
+
+.reply-cancel {
+  border: 0;
+  background: none;
+  padding: 0;
+  color: var(--ink-3);
+  font: inherit;
+  font-size: var(--fs-meta);
+  cursor: pointer;
+}
+
+.reply-send {
+  flex: none;
+  border: 0;
+  border-radius: var(--r-full);
+  padding: 7px 16px;
+  background: var(--accent);
+  color: #fff;
+  font: inherit;
+  font-size: var(--fs-meta);
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 160ms ease;
+}
+
+.reply-send:hover:not(:disabled) {
+  opacity: 0.88;
+}
+
+.reply-send:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+/* A failed send must never be quiet: the human believes an agent was told
+   something, and nothing was written. */
+.reply-status {
+  margin-top: 8px;
+  font-size: var(--fs-meta);
+  line-height: 1.45;
+  color: var(--loud);
+}
+
+@media (max-width: 620px) {
+  .thread {
+    margin-left: 12px;
+    padding-left: 12px;
+  }
+
+  .reply-mentions {
+    left: 0;
+    min-width: 0;
+    width: 100%;
+  }
+}

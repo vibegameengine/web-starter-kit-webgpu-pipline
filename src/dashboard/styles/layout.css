@@ -1,0 +1,121 @@
+/** Page shell: the floating bar, the single column, and the page head. */
+
+/* One very soft wash behind the top of the page — the only thing keeping a long
+   grey field from reading as flat. Kept under 7% so it never becomes a colour. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0 0 auto;
+  height: 700px;
+  background: radial-gradient(120% 560px at 50% -120px, var(--wash), transparent 76%);
+  pointer-events: none;
+  z-index: -1;
+}
+
+.chrome {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: var(--chrome-bg);
+  backdrop-filter: saturate(180%) blur(20px);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  border-bottom: 1px solid var(--hairline);
+}
+
+.chrome-inner {
+  width: min(var(--col-wide), 100% - 2 * var(--gutter));
+  margin: 0 auto;
+  height: 52px;
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+}
+
+.chrome-brand {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.012em;
+  margin-right: auto;
+}
+
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--fs-meta);
+  color: var(--ink-3);
+  letter-spacing: 0;
+}
+
+.status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--quiet-good);
+  animation: breathe 3s ease-in-out infinite;
+}
+
+.status-off .status-dot {
+  background: var(--loud);
+  animation: none;
+}
+
+@keyframes breathe {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
+}
+
+/* ---- the column ------------------------------------------------------ */
+
+.page {
+  width: min(var(--col-wide), 100% - 2 * var(--gutter));
+  margin: 0 auto;
+  padding: var(--s9) 0 var(--s9);
+}
+
+.page-head {
+  margin-bottom: var(--s8);
+}
+
+.page-head h1 {
+  font-size: var(--fs-hero);
+  font-weight: 600;
+  line-height: var(--lh-tight);
+  letter-spacing: var(--ls-hero);
+}
+
+.lede {
+  margin-top: 14px;
+  font-size: var(--fs-lede);
+  line-height: 1.42;
+  letter-spacing: -0.014em;
+  color: var(--ink-2);
+  max-width: 30rem;
+  text-wrap: balance;
+}
+
+.page-meta {
+  margin-top: var(--s5);
+  font-size: var(--fs-meta);
+  letter-spacing: 0;
+  color: var(--ink-3);
+}
+
+@media (max-width: 620px) {
+  .page {
+    padding-top: var(--s7);
+  }
+
+  .page-head {
+    margin-bottom: var(--s6);
+  }
+
+  .lede {
+    max-width: none;
+  }
+}

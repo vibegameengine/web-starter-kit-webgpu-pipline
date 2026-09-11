@@ -242,6 +242,10 @@ export class ProbeVolume {
     return texel.div(vec2(this.tilesPerRow * tile, this.rows * tile));
   }
 
+  get recordsNode(): THREE.Node {
+    return this.probeRecords;
+  }
+
   private probeRecord(index: THREE.Node): THREE.Node {
     return vec4((this.probeRecords as any).element(index));
   }

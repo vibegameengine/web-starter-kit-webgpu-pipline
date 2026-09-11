@@ -1,7 +1,8 @@
 import * as THREE from 'three/webgpu';
 import type GUI from 'lil-gui';
-import { float, mix, uint, uniform, vec4 } from 'three/tsl';
+import { cameraProjectionMatrixInverse, cameraWorldMatrix, float, getViewPosition, mix, normalize, screenUV, uint, uniform, vec3, vec4 } from 'three/tsl';
 import type { SurfelGI } from '../../shared/gi/index.ts';
+import type { ReflectionCache } from '../../shared/gi/reflect/cache/index.ts';
 import { ContactOcclusionPass, DEFAULT_CONTACT_SETTINGS } from '../../shared/gi/contact/contactOcclusionPass.ts';
 import { createContactBVH, type ContactBVHBundle } from '../../shared/gi/contact/contactBvh.ts';
 import { ReflectionPass } from '../../shared/gi/reflect/reflectionPass.ts';
@@ -49,9 +50,12 @@ export class TraceStages {
   readonly reflections: ReflectionPass;
   readonly contactIntensity: THREE.UniformNode<number>;
   readonly reflectionsIntensity: THREE.UniformNode<number>;
+  readonly mode: 'legacy' | 'cached';
   private contactBvh: ContactBVHBundle | null = null;
   private contactReaderBound: unknown = null;
   private reflectionsReaderBound: unknown = null;
+  private cache: ReflectionCache | null = null;
+  private cachedReader: { sample: (uv: TslNode) => TslNode; intensity: THREE.UniformNode<number> } | null = null;
 
   constructor(
     private readonly renderer: THREE.WebGPURenderer,
@@ -78,10 +82,41 @@ export class TraceStages {
     const budget = url.num('reflectionsBudget'); if (budget !== null) this.reflections.settings.rayNodeBudget = budget;
     const denoise = url.num('reflectionsDenoise'); if (denoise !== null) this.reflections.settings.denoisePasses = denoise;
     this.reflectionsIntensity = uniform(this.reflections.settings.intensity) as THREE.UniformNode<number>;
+    this.mode = url.get('reflections') === 'cached' ? 'cached' : 'legacy';
+  }
+
+  installReflectionCache(cache: ReflectionCache, frameGraph: FrameGraph): void {
+    this.cache = cache;
+    this.reflections.setEnabled(false);
+    this.cachedReader = {
+      intensity: this.reflectionsIntensity,
+      sample: () => this.cachedSample(frameGraph),
+    };
+    this.reflectionsReaderBound = this.cachedReader;
+    frameGraph.setReflections(this.cachedReader);
+  }
+
+  private cachedSample(frameGraph: FrameGraph): TslNode {
+    const scenePass = frameGraph.scenePass;
+    const depthNode = scenePass.getTextureNode('depth');
+    const viewPosition = getViewPosition(screenUV, depthNode, cameraProjectionMatrixInverse);
+    const worldPosition = vec3(cameraWorldMatrix.mul(vec4(viewPosition, 1)).xyz);
+    const viewNormal = normalize(scenePass.getTextureNode('normal').rgb);
+    const worldNormal = normalize(cameraWorldMatrix.mul(vec4(viewNormal, 0)).xyz);
+    const viewDirection = normalize(vec3(cameraWorldMatrix[3].xyz).sub(worldPosition));
+    const roughness = scenePass.getTextureNode('velocity').a;
+    const lookup = this.cache!.sampler.sample({
+      worldPosition,
+      worldNormal,
+      viewDirection,
+      roughness,
+      regionId: float(0),
+    });
+    return vec4(vec3(lookup.radiance), float(lookup.sourceKind).greaterThan(0).select(float(1), float(0))) as unknown as TslNode;
   }
 
   get needsTree(): boolean {
-    return this.contact.enabled || this.reflections.enabled;
+    return this.contact.enabled || this.reflections.enabled || this.mode === 'cached';
   }
 
   tree(scene: THREE.Scene): ContactBVHBundle | null {
@@ -95,6 +130,7 @@ export class TraceStages {
   }
 
   bindGui(gui: GUI, frameGraph: FrameGraph): void {
+    if (this.cache) { this.bindCacheGui(gui); return; }
     const reflectionsFolder = gui.addFolder('Reflections');
     reflectionsFolder.add(this.reflections.settings, 'enabled').name('enabled').onChange((v: boolean) => { this.reflections.setEnabled(v); this.syncReflections(frameGraph); });
     reflectionsFolder.add(this.reflections.settings, 'maxRoughness', 0.05, 1, 0.01).name('max roughness');
@@ -112,6 +148,19 @@ export class TraceStages {
     contactFolder.close();
   }
 
+  private bindCacheGui(gui: GUI): void {
+    const cache = this.cache!;
+    const folder = gui.addFolder('Reflection cache');
+    folder.add(cache.settings, 'enabled').name('enabled');
+    folder.add(cache.settings, 'freezeUpdates').name('freeze updates');
+    folder.add(cache.settings, 'intensity', 0, 2, 0.01).name('strength').onChange((v: number) => { cache.sampler.intensity.value = v; });
+    folder.add(cache.settings, 'wideBlendRoughness', 0, 1, 0.01).name('wide blend roughness').onChange((v: number) => { cache.sampler.wideBlendRoughness.value = v; });
+    folder.add(cache.settings, 'maxFootprintTaps', 1, 8, 1).name('footprint taps').onChange((v: number) => { cache.sampler.maxTaps.value = v; });
+    folder.add(cache.settings, 'depthCorrection').name('depth correction').onChange((v: boolean) => { cache.sampler.depthCorrection.value = v ? 1 : 0; });
+    folder.add({ rebuild: () => cache.invalidate(performance.now()) }, 'rebuild').name('recapture');
+    folder.open();
+  }
+
   update(scene: THREE.Scene, frameGraph: FrameGraph): void {
     const { width, height } = this.renderer.domElement;
     const tree = this.tree(scene);
@@ -121,6 +170,10 @@ export class TraceStages {
     const normal = scenePass.getTexture('normal');
     this.contact.update(this.contact.enabled ? tree : null, gi.dynamicBvhBundle, depth, normal, width, height, true);
     this.syncContact(frameGraph);
+    if (this.cache) {
+      this.cache.update(performance.now(), 1, gi.dynamicBvhBundle ? gi.dynamicBvhBundle.enabled.value > 0 : false);
+      return;
+    }
     this.reflections.update(tree, gi.dynamicBvhBundle, gi.diffuseArrayTexture, depth, normal,
       scenePass.getTexture('velocity'), scenePass.getTexture('albedo'), frameGraph.taa.historyTexture, width, height, 1);
     this.syncReflections(frameGraph);
@@ -134,6 +187,7 @@ export class TraceStages {
   }
 
   private syncReflections(frameGraph: FrameGraph): void {
+    if (this.cache) return;
     const reader = this.reflections.enabled ? this.reflections.reader : null;
     if (reader === this.reflectionsReaderBound) return;
     this.reflectionsReaderBound = reader;
@@ -152,6 +206,14 @@ export class TraceStages {
         return this.reflections.enabled;
       },
       reflectionSettings: this.reflections.settings,
+      reflectionCache: () => this.cache,
+      reflectionCacheCounters: () => this.cache?.counterSnapshot ?? null,
+      reflectionCacheProbes: () => this.cache?.probeStates ?? null,
+      reflectionCacheDump: () => this.cache?.dump() ?? null,
+      reflectionCacheFreeze: (value?: boolean) => {
+        if (this.cache && typeof value === 'boolean') this.cache.settings.freezeUpdates = value;
+        return this.cache?.settings.freezeUpdates ?? false;
+      },
     };
   }
 }

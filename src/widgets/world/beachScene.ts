@@ -18,6 +18,7 @@ import { createShrub, type Shrub } from '../../entities/shrub/index.ts';
 import { createVan, parseDoors, DOOR_IDS, type Van, type DoorId } from '../../entities/van/index.ts';
 import type { VolumetricFogSettings } from '../../shared/render/index.ts';
 import { updateFoliageSun } from '../../entities/foliage/translucency.ts';
+import { bootStage } from '../../shared/ui/bootProgress.ts';
 
 export interface BeachScene {
   scene: THREE.Scene;
@@ -118,14 +119,14 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
     tex.anisotropy = 8;
     return tex;
   };
-  const [rockColor, rockNormal, rockRoughness, rockAo, dirtColor, dirtNormal] = await Promise.all([
+  const [rockColor, rockNormal, rockRoughness, rockAo, dirtColor, dirtNormal] = await bootStage('Beach: rock and dirt textures', () => Promise.all([
     load('rock/Rock030_2K-JPG_Color.jpg', true),
     load('rock/Rock030_2K-JPG_NormalGL.jpg', false),
     load('rock/Rock030_2K-JPG_Roughness.jpg', false),
     load('rock/Rock030_2K-JPG_AmbientOcclusion.jpg', false),
     load('dirt/Ground037_2K-JPG_Color.jpg', true),
     load('dirt/Ground037_2K-JPG_NormalGL.jpg', false),
-  ]);
+  ]));
   const rockTextures: RockTextures = { map: rockColor, normalMap: rockNormal, roughnessMap: rockRoughness, aoMap: rockAo };
   const cliffTextures: CliffTextures = { rockColor, rockNormal, rockRoughness, dirtColor, dirtNormal };
 
@@ -133,8 +134,8 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
   const field = new IslandField(7, 6, -3.2);
   // @important `?sandMaps=drawn` keeps the procedural maps, as the control for the authored set.
   const authoredSand = new URLSearchParams(window.location.search).get('sandMaps') !== 'drawn';
-  if (authoredSand) useSandLayerMaps(await loadSandLayerMaps());
-  const island = createIsland({ field, textures: cliffTextures });
+  if (authoredSand) useSandLayerMaps(await bootStage('Beach: sand layer maps', () => loadSandLayerMaps()));
+  const island = await bootStage('Beach: island', () => createIsland({ field, textures: cliffTextures }));
   scene.add(island.group);
   applyMobility(island.group, Mobility.Static);
 
@@ -191,9 +192,11 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
       field.addStamp(spec.x, spec.z, (box.max.x - box.min.x) * 0.42, (box.max.z - box.min.z) * 0.42, rock.position.y + box.max.y * 0.9);
     }
   };
-  for (const spec of rimRocks) place(spec, dryRock, false);
-  for (const spec of rightRocks) place(spec, dryRock, false);
-  for (const spec of waterRocks) place(spec, wetRock, true);
+  await bootStage('Beach: rocks', () => {
+    for (const spec of rimRocks) place(spec, dryRock, false);
+    for (const spec of rightRocks) place(spec, dryRock, false);
+    for (const spec of waterRocks) place(spec, wetRock, true);
+  });
   scene.add(rocks);
   applyMobility(rocks, Mobility.Static);
 
@@ -206,7 +209,7 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
     { x: 1.0, z: -3.3, h: 3.7, lean: -0.3, seed: 44 },
   ];
   for (const spec of palmSpecs) {
-    const palm = createPalm({ seed: spec.seed, height: spec.h, lean: spec.lean, environment });
+    const palm = await bootStage(`Beach: palm ${palms.length + 1} of ${palmSpecs.length}`, () => createPalm({ seed: spec.seed, height: spec.h, lean: spec.lean, environment }));
     palm.group.position.set(spec.x, field.height(spec.x, spec.z) - 0.05, spec.z);
     // Lean toward the water (−x), which is where the light and the camera are.
     palm.group.rotation.y = Math.PI + (random() - 0.5) * 0.6;
@@ -228,7 +231,7 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
     { x: 5.2, z: 1.3, r: 0.45, kind: 'fan', seed: 58 },
   ];
   for (const spec of shrubSpecs) {
-    const shrub = createShrub({ seed: spec.seed, radius: spec.r, kind: spec.kind, environment });
+    const shrub = await bootStage(`Beach: undergrowth ${shrubs.length + 1} of ${shrubSpecs.length}`, () => createShrub({ seed: spec.seed, radius: spec.r, kind: spec.kind, environment }));
     shrub.group.position.set(spec.x, field.height(spec.x, spec.z) - 0.03, spec.z);
     shrub.group.rotation.y = random() * Math.PI * 2;
     scene.add(shrub.group);
@@ -238,14 +241,14 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
 
   let van: Van | null = null;
   if (search.get('van') !== '0') {
-    van = await createVan({
+    van = await bootStage('Beach: the van', () => createVan({
       x: 3.3,
       z: 2.3,
       headingRadiansFromNoseTowardPositiveZ: Math.PI * 0.08,
       scale: 0.92,
       ground: (x, z) => field.height(x, z),
       doors: parseDoors(search.get('doors')),
-    });
+    }));
     scene.add(van.group);
     applyMobility(van.group, Mobility.Static);
     const handle = van;
@@ -263,7 +266,7 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
 
   // --- water and backdrop (outside the GI) -------------------------------------
   // The bed the water runs over is the geometry itself, rendered from above once.
-  const bathymetry = bakeBathymetry({ renderer, objects: [rocks], base: field.toTexture(512, true), half: field.half, size: 512 });
+  const bathymetry = await bootStage('Beach: bathymetry', () => bakeBathymetry({ renderer, objects: [rocks], base: field.toTexture(512, true), half: field.half, size: 512 }));
   // The shallow-water solver runs live on its own thread and its own WebGPU device
   // (simWorker.ts): off the frame it costs, it no longer has to be frozen to stay
   // inside the budget. `?waterSim=main` or `=1` puts it back in the frame live — the
@@ -289,7 +292,7 @@ export async function createBeachScene(renderer: THREE.WebGPURenderer, environme
   (window as unknown as Record<string, unknown>).__ball = { pose: () => ball.pose(), reading: () => ball.reading() };
   // The worker's device has to come up and run its 6 s preroll before the first
   // frame, or the lagoon is drawn as a dry bed for the first second of the session.
-  await water.ready;
+  await bootStage('Beach: settling the water simulation', () => water.ready);
   // `?water=0` leaves the water out: what is left is the diorama the water is drawn over.
   if (new URLSearchParams(window.location.search).get('water') !== '0') scene.add(water.group);
   const backdrop = createBackdrop({ islandBottom: field.bottom, islandHalf: field.half });

@@ -6,6 +6,7 @@ import { createNoise, seededRandom } from '../../shared/lib/noise';
  * unless overridden, so the same options always produce the same mesh.
  */
 export interface RockGeometryOptions {
+  detail?: number;
   seed: number;
   /** Nominal radius in metres (before anisotropic stretch). */
   radius: number;
@@ -78,7 +79,7 @@ export function createRockGeometry(options: RockGeometryOptions): THREE.BufferGe
 
   // r182 PolyhedronGeometry: 20 * (detail + 1)^2 triangles, already non-indexed.
   // detail 31 → 20480 tris, detail 23 → 11520 tris.
-  const detail = radius < 0.4 ? 23 : 31;
+  const detail = options.detail === undefined ? (radius < 0.4 ? 23 : 31) : Math.max(2, Math.min(31, Math.round(options.detail)));
   const indexed = weldIcosphere(new THREE.IcosahedronGeometry(1, detail));
   const pos = indexed.getAttribute('position') as THREE.BufferAttribute;
   const count = pos.count;

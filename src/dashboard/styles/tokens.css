@@ -1,0 +1,109 @@
+/**
+ * Design tokens — the whole visual language of the dashboard in one place.
+ *
+ * Light is the default and is meant to be the confident one; dark is a second
+ * full set, not a filter over the first. Colour is near-monochrome by design:
+ * one accent, and one loud semantic (problem). Everything else separates by
+ * background VALUE and elevation rather than by borders.
+ */
+
+:root {
+  color-scheme: light dark;
+
+  /* ---- type ----------------------------------------------------------- */
+  --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
+    system-ui, "Segoe UI", Roboto, sans-serif;
+
+  /* Five sizes for the whole page, with decisive jumps between them. */
+  --fs-hero: clamp(30px, 3.4vw, 40px);
+  --fs-lede: 19px;
+  --fs-body: 17px;
+  --fs-meta: 13px;
+
+  /* ---- the column: ~63 characters of 17px body ------------------------- */
+  --col-wide: 620px;
+  --gutter: 24px;
+
+  --lh-tight: 1.1;
+  --lh-body: 1.58;
+
+  /* SF tightens optically as it grows; these are close to Apple's own tracking
+     table for SF Pro Display / Text at these sizes. */
+  --ls-hero: -0.028em;
+  --ls-body: -0.012em;
+
+  /* ---- space: one rhythm, used everywhere ----------------------------- */
+  --s3: 12px;
+  --s4: 16px;
+  --s5: 24px;
+  --s6: 32px;
+  --s7: 48px;
+  --s8: 64px;
+  --s9: 88px;
+
+  /* ---- radii scale with the element ----------------------------------- */
+  --r-xs: 7px;
+  --r-m: 15px;
+  --r-l: 20px;
+  --r-xl: 26px;
+  --r-full: 999px;
+
+  /* ---- light ---------------------------------------------------------- */
+  --canvas: #ececed;
+  --surface: #ffffff;
+  --surface-lift: none;
+
+  --ink: #1d1d1f;
+  --ink-2: #55555c;
+  --ink-3: #86868b;
+
+  --fill-1: rgba(0, 0, 0, 0.045);
+  --hairline: rgba(0, 0, 0, 0.07);
+
+  --accent: #0068d6;
+  --accent-soft: rgba(0, 104, 214, 0.1);
+
+  --loud: #d1361a;
+  --loud-ink: #ffffff;
+  --quiet-good: #2b7a4b;
+
+  --shadow-1: 0 1px 1.5px rgba(0, 0, 0, 0.05), 0 10px 24px -14px rgba(0, 0, 0, 0.22);
+  --shadow-2: 0 2px 4px rgba(0, 0, 0, 0.06), 0 22px 48px -22px rgba(0, 0, 0, 0.3);
+  --ring: 0 0 0 3.5px var(--accent-soft);
+
+  --chrome-bg: rgba(236, 236, 237, 0.72);
+  --media-bg: #dededf;
+  --wash: rgba(0, 104, 214, 0.055);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --canvas: #08080a;
+    --surface: #17171a;
+    /* In dark there is no light to cast a shadow with, so the card lifts off the
+       canvas with a hairline of light along its top edge instead. */
+    --surface-lift: inset 0 1px 0 rgba(255, 255, 255, 0.055);
+
+    --ink: #f4f4f6;
+    --ink-2: #a2a2a8;
+    --ink-3: #77777e;
+
+    --fill-1: rgba(255, 255, 255, 0.055);
+    --hairline: rgba(255, 255, 255, 0.08);
+
+    --accent: #4c9dff;
+    --accent-soft: rgba(76, 157, 255, 0.16);
+
+    --loud: #ff543a;
+    --loud-ink: #1a0603;
+    --quiet-good: #4bbd74;
+
+    --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.55);
+    --shadow-2: 0 2px 6px rgba(0, 0, 0, 0.6), 0 24px 50px -28px rgba(0, 0, 0, 0.9);
+    --ring: 0 0 0 3.5px var(--accent-soft);
+
+    --chrome-bg: rgba(8, 8, 10, 0.68);
+    --media-bg: #0e0e11;
+    --wash: rgba(76, 157, 255, 0.05);
+  }
+}

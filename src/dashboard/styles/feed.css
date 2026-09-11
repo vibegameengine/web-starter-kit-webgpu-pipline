@@ -1,0 +1,304 @@
+/**
+ * The stream. Posts are short — 250 characters — so the whole design is the
+ * rhythm between them, the measure of the body text, and how the head line sits
+ * above it. Cards separate by surface value and one soft shadow; there is not a
+ * border in here.
+ */
+
+/* The space BETWEEN posts is larger than the space inside one, or the cards
+   stop reading as separate things. */
+.feed {
+  display: grid;
+  /* minmax(0, …) rather than the default 1fr: a grid item's min-width is auto,
+     so one unbreakable token — and post.mjs deliberately exempts 500 characters
+     of paths and URLs from the cap — stretches the track past the viewport and
+     carries the images off the right edge with it. */
+  grid-template-columns: minmax(0, 1fr);
+  gap: 30px;
+}
+
+.day {
+  font-size: var(--fs-meta);
+  font-weight: 600;
+  letter-spacing: -0.008em;
+  color: var(--ink-3);
+  padding: var(--s5) 0 var(--s4);
+}
+
+.feed-run:first-child .day {
+  padding-top: 0;
+}
+
+/* ---- the post -------------------------------------------------------- */
+
+.post {
+  position: relative;
+  background: var(--surface);
+  border-radius: var(--r-xl);
+  padding: 22px 26px 26px;
+  box-shadow: var(--shadow-1), var(--surface-lift);
+  animation: post-in 520ms cubic-bezier(0.22, 0.61, 0.36, 1) both;
+}
+
+
+@keyframes post-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* Only the first screenful staggers; anything below it is already in place. */
+.feed-run:nth-child(1) .post {
+  animation-delay: 0ms;
+}
+.feed-run:nth-child(2) .post {
+  animation-delay: 45ms;
+}
+.feed-run:nth-child(3) .post {
+  animation-delay: 90ms;
+}
+.feed-run:nth-child(4) .post {
+  animation-delay: 135ms;
+}
+.feed-run:nth-child(5) .post {
+  animation-delay: 180ms;
+}
+.feed-run:nth-child(6) .post {
+  animation-delay: 225ms;
+}
+
+.post-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin-bottom: 8px;
+  /* The reply control is absolutely positioned in this corner; the head line
+     keeps its seat empty so a long author + addressee never runs under it. */
+  padding-right: 68px;
+}
+
+.post-author {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.014em;
+}
+
+/* The author's name always starts at the same x — nothing is allowed in front
+   of it, so a run of posts has one straight left edge. */
+.tag-done {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: var(--fs-meta);
+  letter-spacing: 0;
+  color: var(--ink-3);
+}
+
+.tag-done::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--quiet-good);
+}
+
+.post-time {
+  font-size: var(--fs-meta);
+  letter-spacing: 0;
+  color: var(--ink-3);
+  white-space: nowrap;
+  cursor: help;
+}
+
+/* Who has to act. Addressed comments carry the accent; a broadcast stays quiet,
+   because "→ everyone" is the default case and does not need to be sold. */
+.tag-to {
+  font-size: var(--fs-meta);
+  font-weight: 600;
+  letter-spacing: 0;
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+.tag-to.is-all {
+  font-weight: 500;
+  color: var(--ink-3);
+}
+
+/* Reply lives in the corner and appears on hover, so fifteen cards do not each
+   carry a repeated verb down the column. It is absolutely positioned, so
+   showing it never changes a card's height and the column cannot twitch. */
+.post-reply {
+  position: absolute;
+  top: 16px;
+  right: 18px;
+  border: 0;
+  background: none;
+  padding: 4px 6px;
+  border-radius: var(--r-xs);
+  color: var(--ink-3);
+  font: inherit;
+  font-size: var(--fs-meta);
+  letter-spacing: 0;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 160ms ease, color 160ms ease;
+}
+
+.post:hover .post-reply,
+.post:focus-within .post-reply,
+/* While its box is open the control has to stay visible, or the only thing
+   naming what the box below belongs to disappears the moment you move the
+   mouse. */
+.post-reply[data-open="true"] {
+  opacity: 1;
+}
+
+.post-reply[data-open="true"] {
+  color: var(--accent);
+}
+
+.post-reply:hover {
+  color: var(--accent);
+  background: var(--fill-1);
+}
+
+.post-reply:focus-visible {
+  opacity: 1;
+  outline: none;
+  box-shadow: var(--ring);
+}
+
+/* Without hover there is no way to discover a hidden control, so on touch it
+   is simply always there. */
+@media (hover: none) {
+  .post-reply {
+    opacity: 1;
+  }
+}
+
+.post-body {
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  letter-spacing: var(--ls-body);
+  color: var(--ink);
+  /* anywhere, not break-word: only this one contributes to min-content, which
+     is what decides whether a pasted path widens the column. */
+  overflow-wrap: anywhere;
+  text-wrap: pretty;
+}
+
+/* ---- attached screenshot --------------------------------------------- */
+
+/* Sized to the image, not to the card: a portrait phone frame stretched across
+   a 600px card is a sliver on a mat, and cropping it to landscape throws away
+   the half that was worth attaching. */
+.post-media {
+  display: block;
+  width: fit-content;
+  max-width: 100%;
+  margin-top: 18px;
+  border-radius: var(--r-m);
+  overflow: hidden;
+  background: var(--media-bg);
+  box-shadow: var(--shadow-1);
+  transition: box-shadow 300ms ease;
+}
+
+.post-media:hover {
+  box-shadow: var(--shadow-2);
+}
+
+.post-media img {
+  display: block;
+  transition: transform 700ms cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+
+.post-media:hover img {
+  transform: scale(1.014);
+}
+
+.post-media.is-wide {
+  width: 100%;
+}
+
+.post-media.is-wide img {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  object-position: center 42%;
+}
+
+/* Wider than about 2.2:1 is a sheet, a strip of views, or a before/after pair.
+   The 16/9 crop above would take a third of it, and that third is the evidence.
+   Shown whole, at whatever height it comes out. */
+.post-media.is-pano {
+  width: 100%;
+}
+
+.post-media.is-pano img {
+  width: 100%;
+  aspect-ratio: auto;
+  object-fit: contain;
+}
+
+/* Every portrait attachment is the same width whatever its aspect, so the left
+   column of the feed stays stable as you scroll past a run of them. */
+.post-media.is-tall,
+.post-media.is-pending {
+  width: 300px;
+}
+
+.post-media.is-tall img,
+.post-media.is-pending img {
+  width: 100%;
+  height: auto;
+  max-height: 600px;
+  object-fit: cover;
+  /* A phone frame is 2.16:1, so it loses ~50px; take it off the empty road at
+     the bottom rather than off the HUD at the top. */
+  object-position: center 42%;
+}
+
+.feed-end {
+  padding: var(--s5) 0 0;
+  font-size: var(--fs-meta);
+  letter-spacing: 0;
+  color: var(--ink-3);
+}
+
+.post-media-missing {
+  margin-top: var(--s3);
+  font-size: var(--fs-meta);
+  color: var(--ink-3);
+  letter-spacing: 0;
+}
+
+/* The declared no-image exception. Quiet on purpose: it has to be visible, so
+   the exception stays deliberate, without competing with a post that has a
+   picture. */
+.post-nomedia {
+  margin-top: var(--s3);
+  font-size: var(--fs-meta);
+  color: var(--ink-3);
+  letter-spacing: 0;
+  font-style: italic;
+}
+
+@media (max-width: 620px) {
+  .post {
+    border-radius: var(--r-l);
+    padding: 20px 20px 22px;
+  }
+
+  .post-media.is-tall,
+  .post-media.is-pending {
+    width: 260px;
+  }
+}

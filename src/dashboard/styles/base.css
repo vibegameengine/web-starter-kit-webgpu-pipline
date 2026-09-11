@@ -1,0 +1,120 @@
+/** Reset, page defaults, and the two shared primitives: button and badge. */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--canvas);
+  color: var(--ink);
+  font-family: var(--font-ui);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  letter-spacing: var(--ls-body);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-variant-numeric: tabular-nums;
+}
+
+h1,
+h2,
+p,
+figure {
+  margin: 0;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  text-decoration-thickness: 1px;
+}
+
+:focus-visible {
+  outline: none;
+  box-shadow: var(--ring);
+  border-radius: var(--r-xs);
+}
+
+/* Continuous corners where the browser can draw them; plain radii elsewhere. */
+@supports (corner-shape: superellipse(1.6)) {
+  .post,
+  .btn,
+  .post-media {
+    corner-shape: superellipse(1.6);
+  }
+}
+
+/* ---- button ---------------------------------------------------------- */
+
+.btn {
+  appearance: none;
+  border: 0;
+  font: inherit;
+  font-size: var(--fs-meta);
+  font-weight: 500;
+  letter-spacing: 0;
+  color: var(--ink-2);
+  background: transparent;
+  border-radius: var(--r-full);
+  padding: 6px 13px;
+  cursor: pointer;
+  transition:
+    background 200ms ease,
+    color 200ms ease,
+    transform 200ms cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+
+.btn:hover {
+  background: var(--fill-1);
+  color: var(--ink);
+}
+
+.btn:active {
+  transform: scale(0.96);
+}
+
+/* ---- the one loud thing on the page ---------------------------------- */
+
+.badge-problem {
+  display: inline-flex;
+  align-items: center;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  padding: 2px 9px 3px;
+  border-radius: var(--r-full);
+  line-height: 1.55;
+  white-space: nowrap;
+  color: var(--loud-ink);
+  background: var(--loud);
+}
+
+/* ---- states ---------------------------------------------------------- */
+
+.empty {
+  color: var(--ink-3);
+  font-size: var(--fs-meta);
+  padding: var(--s7) 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

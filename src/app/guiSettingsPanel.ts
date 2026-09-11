@@ -12,10 +12,11 @@ import {
   storeSettingsProfile,
   writeSettings,
   SETTINGS_PROFILES,
+  type ProfileSource,
   type SettingsProfile,
 } from './guiSettings.ts';
 
-const CONFIRM_MS = 5000;
+const WRITTEN_MS = 2500;
 const PROFILE_HINT: Record<SettingsProfile, string> = {
   merged: 'shared file, then this scene on top',
   shared: 'shared file only',
@@ -27,8 +28,10 @@ type SettingsUi = { showError(error: unknown): void };
 type Undo = { label: string; restore: () => Promise<void> } | null;
 
 type Row = { name(text: string): Row; disable(state?: boolean): Row; domElement: HTMLElement };
+export type PanelStart = { profile: SettingsProfile; source: ProfileSource };
 
-export function addGuiSettingsControls(gui: GUI, scene: string, profile: SettingsProfile, ui: SettingsUi): void {
+export function addGuiSettingsControls(gui: GUI, scene: string, start: PanelStart, ui: SettingsUi): void {
+  const { profile, source } = start;
   const folder = gui.addFolder('Settings file');
   const state = { profile, inForce: '', sharedFile: '', sceneFile: '' };
   let undo: Undo = null;
@@ -51,25 +54,27 @@ export function addGuiSettingsControls(gui: GUI, scene: string, profile: Setting
   undoRow.disable(true);
   describe(undoRow, 'Puts the last file this panel wrote back exactly as it was before that write.');
 
-  addConfirmButton(folder, {
+  addWriteButton(folder, {
     label: `write ${settingsFileName()}`,
-    hint: 'Writes every value in this panel to the shared file. Every scene starts from it. Nothing is written until you press twice.',
-    describeAction: async () => `overwrite ${countValues(panelState(gui))} values for all scenes?`,
+    hint: 'Writes every value in this panel to the shared file, which every scene starts from. The row above puts it back.',
     run: async () => {
       undo = await undoFor(undefined, settingsFileName());
-      await writeSettings(panelState(gui));
+      const settings = panelState(gui);
+      await writeSettings(settings);
+      return `${countValues(settings)} values written`;
     },
     after: refresh,
     ui,
   });
 
-  addConfirmButton(folder, {
+  addWriteButton(folder, {
     label: `write ${settingsFileName(scene)}`,
-    hint: 'Writes only the values that differ from the shared file, for this scene alone. Other scenes are untouched. Nothing is written until you press twice.',
-    describeAction: async () => `store ${countValues(differenceFrom(panelState(gui), await readSettings()))} overrides for "${scene}"?`,
+    hint: 'Writes the values that differ from the shared file, for this scene alone. Other scenes are untouched. The row above puts it back.',
     run: async () => {
       undo = await undoFor(scene, settingsFileName(scene));
-      await writeSettings(differenceFrom(panelState(gui), await readSettings()), scene);
+      const overrides = differenceFrom(panelState(gui), await readSettings());
+      await writeSettings(overrides, scene);
+      return `${countValues(overrides)} overrides written`;
     },
     after: refresh,
     ui,
@@ -92,11 +97,17 @@ export function addGuiSettingsControls(gui: GUI, scene: string, profile: Setting
 
   async function refresh(): Promise<void> {
     const [shared, local] = await Promise.all([readSettings(), readSettings(scene)]);
-    state.inForce = PROFILE_HINT[state.profile];
+    state.inForce = state.profile === profile ? describeStart(profile, source) : PROFILE_HINT[state.profile];
     state.sharedFile = describeFile(countValues(shared), 'value');
     state.sceneFile = describeFile(countValues(local), 'override');
     undoRow.name(undo ? undo.label : 'nothing to undo').disable(!undo);
   }
+}
+
+function describeStart(profile: SettingsProfile, source: ProfileSource): string {
+  if (source.kind === 'url') return `${PROFILE_HINT[profile]} (${source.parameter})`;
+  if (source.kind === 'ablation') return `${PROFILE_HINT[profile]} — URL has ${source.parameters.join(', ')}; add ?settings=1 to use the files`;
+  return PROFILE_HINT[profile];
 }
 
 function describeFile(count: number, noun: string): string {
@@ -114,45 +125,29 @@ function describe(row: Row, text: string): void {
   row.domElement.title = text;
 }
 
-type ConfirmButton = {
+type WriteButton = {
   label: string;
   hint: string;
-  describeAction: () => Promise<string>;
-  run: () => Promise<void>;
+  run: () => Promise<string>;
   after: () => Promise<void>;
   ui: SettingsUi;
 };
 
 /**
- * @important Both buttons overwrite a file, so the first press only asks: it renames
- * itself to what would be written and waits. A single stray click changes nothing.
+ * @important One press writes. A confirm step was tried first and was worse: the armed
+ * label read as an error message, the user pressed once and nothing was saved. Undo is
+ * what makes a stray press harmless, so the press itself stays immediate.
  */
-function addConfirmButton(folder: GUI, button: ConfirmButton): void {
+function addWriteButton(folder: GUI, button: WriteButton): void {
   const row = folder.add({ press: () => press() }, 'press').name(button.label) as unknown as Row;
   describe(row, button.hint);
-  let armed = false;
-  let timer = 0;
-
-  function disarm(): void {
-    armed = false;
-    window.clearTimeout(timer);
-    row.name(button.label);
-  }
 
   function press(): void {
-    if (armed) {
-      disarm();
-      void button.run()
-        .then(() => { row.name('written'); window.setTimeout(() => row.name(button.label), 1500); })
-        .then(button.after)
-        .catch(button.ui.showError);
-      return;
-    }
-    void button.describeAction()
-      .then((question) => {
-        armed = true;
-        row.name(`press again: ${question}`);
-        timer = window.setTimeout(disarm, CONFIRM_MS);
+    void button.run()
+      .then(async (result) => {
+        await button.after();
+        row.name(result);
+        window.setTimeout(() => row.name(button.label), WRITTEN_MS);
       })
       .catch(button.ui.showError);
   }
