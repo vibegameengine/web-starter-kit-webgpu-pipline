@@ -1,0 +1,30 @@
+import { chromium } from 'playwright';
+const GATE = Number(process.env.GATE_MS ?? 300000);
+setTimeout(() => { console.error('gate'); process.exit(2); }, GATE);
+const scene = process.env.SCENE ?? 'midsee-village';
+const from = process.env.FROM ?? 'Compiling shaders';
+const browser = await chromium.launch({ channel: 'chrome', headless: false, args: ['--enable-unsafe-webgpu', '--ignore-gpu-blocklist'] });
+const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+const cdp = await page.context().newCDPSession(page);
+await page.goto(`http://127.0.0.1:${process.env.PORT ?? '5188'}/?scene=${scene}&hud=0`);
+await page.waitForFunction((label) => document.querySelector('#loading-message')?.textContent?.includes(label), from, { timeout: GATE - 60000, polling: 200 });
+await cdp.send('Profiler.enable');
+await cdp.send('Profiler.setSamplingInterval', { interval: 2000 });
+await cdp.send('Profiler.start');
+await page.waitForFunction(() => document.querySelector('#loading-overlay')?.hidden, null, { timeout: GATE - 60000, polling: 200 });
+const { profile } = await cdp.send('Profiler.stop');
+const byId = new Map(profile.nodes.map((n) => [n.id, n]));
+const self = new Map();
+const total = profile.endTime - profile.startTime;
+for (let i = 0; i < profile.samples.length; i++) {
+  const node = byId.get(profile.samples[i]);
+  if (!node) continue;
+  const f = node.callFrame;
+  const key = `${f.functionName || '(anonymous)'}  ${(f.url || '').split('/').slice(-1)[0]}:${f.lineNumber + 1}`;
+  self.set(key, (self.get(key) ?? 0) + (profile.timeDeltas[i] ?? 0));
+}
+const rows = [...self.entries()].sort((a, b) => b[1] - a[1]);
+const sum = rows.reduce((a, r) => a + r[1], 0);
+console.log(`profiled window ${(total / 1e6).toFixed(1)}s  sampled ${(sum / 1e6).toFixed(1)}s`);
+for (const [key, us] of rows.slice(0, 22)) console.log(`  ${(us / 1e6).toFixed(2).padStart(7)}s  ${key}`);
+await browser.close();
