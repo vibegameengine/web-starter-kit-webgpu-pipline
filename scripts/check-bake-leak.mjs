@@ -30,6 +30,7 @@ async function boot(query) {
   await page.goto(base + query);
   await page.waitForFunction(() => window.__leak?.stages().length >= 3, null, { timeout: 120000 });
   const complete = await page.waitForFunction(() => window.__leak?.stages().includes('resident') === true, null, { timeout: 30000 }).then(() => true, () => false);
+  if (complete) await page.waitForFunction(() => document.querySelector('#loading-overlay')?.hidden === true, null, { timeout: 120000 }).catch(() => console.log('  the loader never cleared; the pane shots show the overlay'));
   if (complete) await settle(30);
   const report = await page.evaluate(() => (window.__leak ? {
     stages: window.__leak.stages(),
@@ -55,7 +56,10 @@ for (const change of run.changes) {
   const where = change.world ? change.world.map((v) => v.toFixed(2)).join(',') : 'no g-buffer';
   console.log(`  ${change.from} -> ${change.to}: ${change.changed} texels moved, max ${change.maxDelta} at texel ${change.at.join(',')} chart ${change.chart} world ${where}`);
 }
-for (const stage of run.invented) console.log(`  ${stage.stage} lit ${stage.count} texels the previous stage measured black`);
+for (const stage of run.invented) {
+  const worst = stage.worst?.world ? ` brightest at texel ${stage.worst.texel.join(',')} chart ${stage.worst.chart} world ${stage.worst.world.map((v) => v.toFixed(2)).join(',')}` : '';
+  console.log(`  ${stage.stage} lit ${stage.count} texels the previous stage had measured black, demoted ${stage.overwrittenMeasured} measured texels;${worst || ' no lit texel'}`);
+}
 if (run.complete) await shootStages([...run.stages, `diff:${run.stages[run.stages.length - 1]}`], 'run');
 const runErrors = errors.slice();
 

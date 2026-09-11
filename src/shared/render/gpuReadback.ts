@@ -19,6 +19,12 @@ export async function readFloatTexture(renderer: THREE.WebGPURenderer, texture: 
   return { width, height, data: floats };
 }
 
+export async function readFloatAttachment(renderer: THREE.WebGPURenderer, target: THREE.RenderTarget, index: number) {
+  const { width, height } = target;
+  const raw = await renderer.readRenderTargetPixelsAsync(target, 0, 0, width, height, index);
+  return raw instanceof Uint16Array ? Float32Array.from(raw, THREE.DataUtils.fromHalfFloat) : Float32Array.from(raw);
+}
+
 export async function readValidationTexture(renderer: THREE.WebGPURenderer, texture: THREE.Texture) {
   const { width, height, data } = await readFloatTexture(renderer, texture);
   const bytes = new Uint8Array(data.buffer);
