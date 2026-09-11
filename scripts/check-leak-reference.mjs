@@ -45,10 +45,10 @@ const origin = process.env.LEAK_CHECK_ORIGIN ?? 'http://127.0.0.1:5188';
 const outdoorTolerance = (relativeNoise) => Math.max(5 * relativeNoise, 0.005);
 /* @important The renderer's sun, read back from a page in an earlier run: setupSun overwrites whatever the
    scene asked for from the panorama's sun search, and tau must exist before the first page loads. */
-const SUN_GUESS = { direction: [0.484, 0.800, 0.355], intensity: 2 };
+
 const MEASURED_ALPHA = 0.75;
 const PROBE_REACH_METRES = 0.05;
-const SEALED_TEXELS_ABOVE_TAU = 0;
+const SEALED_LARGEST_RUN = 3;
 /* @important 0.005 of the lit reference is the design's own number, section 07: tau = max(5 sigma, 0.005 L_ref).
    0.001 was mine and arbitrary, and the sealed room failed it at 123 % of tolerance. */
 const INTERIOR_FLOOR = 0.005;
@@ -75,11 +75,6 @@ function frameMean(png) {
   return sum / (img.width * img.height);
 }
 
-/* tau has to exist before the region is asked how many texels exceed it, and it depends on the lit
-   reference, so it is computed once from the reference at the sunward probe rather than from the
-   run being measured. */
-const tolerance = INTERIOR_FLOOR * indirectAtPoint(leakRoomGeometry({ gap: 0, scale }), PROBES[3].at, PROBES[3].normal, { paths: 8192, sun: SUN_GUESS.direction, intensity: SUN_GUESS.intensity });
-
 async function bakedAt(gap) {
   const query = `&leak=1&hud=0&inspector=0&still=1&aa=none&grain=0&exposure=1${mutation}`;
   await page.goto(`${origin}/?scene=leak-room&cam=outside&gap=${gap}${query}&env=0${scale === 1 ? '' : `&scale=${scale}`}`);
@@ -102,32 +97,50 @@ async function bakedAt(gap) {
      earlier can hand the reference a scene with no light at all. */
   const light = await page.evaluate(() => ({ position: window.__probe().sunPos, intensity: window.__probe().sunIntensity }));
   if (!(light.intensity > 0)) throw new Error(`the sun read back as ${light.intensity}`);
-  const interiorRegion = await page.evaluate(([box, tau]) => window.__leak.region(box[0], box[1], 'resident', tau), [INTERIOR_BOX, tolerance]);
+  /* @important tau is computed here, from the sun this page actually used, and the same number is
+     handed to the region and printed. It used to come from a constant guess of the sun made before
+     any page loaded, so ?sun=4 moved the count of texels over tau from 22 to 862 without the physics
+     changing, and ?leakMutation=atlasHalf turned the criterion green. */
+  const tau = INTERIOR_FLOOR * indirectAtPoint(leakRoomGeometry({ gap: 0, scale }), PROBES[3].at, PROBES[3].normal,
+    { paths, sun: light.position.map((v) => v / Math.hypot(...light.position)), intensity: light.intensity, seed: 1 + 3 * 7919 });
+  const interiorRegion = await page.evaluate(([box, threshold]) => window.__leak.region(box[0], box[1], 'resident', threshold), [INTERIOR_BOX, tau]);
   if (!interiorRegion || interiorRegion.texels === 0) throw new Error('the interior region is empty: nothing was measured inside the room');
   const png = await page.screenshot();
   await writeFile(`${out}/gap-${gap}mm${mutation ? '-mutated' : ''}.png`, png);
   const length = Math.hypot(...light.position);
-  return { probes, interiorRegion, sun: light.position.map((v) => v / length), intensity: light.intensity, frame: frameMean(png) };
+  return { probes, interiorRegion, tau, sun: light.position.map((v) => v / length), intensity: light.intensity, frame: frameMean(png) };
 }
 
-const rows = [];
-const regions = [];
-let sunUsed = null;
-let darkestFrame = Infinity;
-for (const gap of gaps) {
-  const { probes: baked, interiorRegion, sun, intensity, frame } = await bakedAt(gap);
-  regions.push({ gap, ...interiorRegion });
-  sunUsed = { sun, intensity };
-  darkestFrame = Math.min(darkestFrame, frame);
-  const bodies = leakRoomGeometry({ gap: gap / 1000, scale });
-  for (const [index, probe] of PROBES.entries()) {
-    const options = { paths, sun, intensity, seed: 1 + index * 7919 };
-    const reference = indirectAtPoint(bodies, probe.at, probe.normal, options);
-    const half = indirectAtPoint(bodies, probe.at, probe.normal, { ...options, paths: Math.floor(paths / 2), seed: 104729 + index });
-    rows.push({ gap, probe: probe.name, indoors: probe.indoors, reference, noise: Math.abs(reference - half), ...baked[index] });
+/* @important Any throw used to leave through node with code 1 - the same code as "the bake
+   leaks". A bake that never finished then read as a bake that failed the measurement, which is
+   the one confusion this separation exists to prevent. A timeout is 3, an unsound run is 2. */
+try {
+  const rows = [];
+  const regions = [];
+  const taus = [];
+  let sunUsed = null;
+  let darkestFrame = Infinity;
+  for (const gap of gaps) {
+    const { probes: baked, interiorRegion, tau, sun, intensity, frame } = await bakedAt(gap);
+    taus.push(tau);
+    regions.push({ gap, ...interiorRegion });
+    sunUsed = { sun, intensity };
+    darkestFrame = Math.min(darkestFrame, frame);
+    const bodies = leakRoomGeometry({ gap: gap / 1000, scale });
+    for (const [index, probe] of PROBES.entries()) {
+      const options = { paths, sun, intensity, seed: 1 + index * 7919 };
+      const reference = indirectAtPoint(bodies, probe.at, probe.normal, options);
+      const half = indirectAtPoint(bodies, probe.at, probe.normal, { ...options, paths: Math.floor(paths / 2), seed: 104729 + index });
+      rows.push({ gap, probe: probe.name, indoors: probe.indoors, reference, noise: Math.abs(reference - half), ...baked[index] });
+    }
   }
+  await browser.close();
+} catch (error) {
+  await browser.close().catch(() => {});
+  const timedOut = String(error).includes('Timeout');
+  console.error(`${timedOut ? 'timed out' : 'the run could not complete'}: ${String(error).slice(0, 200)}`);
+  process.exit(timedOut ? 3 : 2);
 }
-await browser.close();
 
 const outdoor = rows.filter((row) => !row.indoors && row.luma !== null);
 const ratios = outdoor.map((row) => row.luma / row.reference);
@@ -138,7 +151,7 @@ for (const row of rows) {
   const ratio = row.luma === null || row.reference < 1e-9 ? 'ref 0' : `x${(row.luma / row.reference).toFixed(2)}`;
   console.log(`  gap ${String(row.gap).padStart(2)} mm  ${row.probe.padEnd(22)} baked ${baked}  reference ${row.reference.toFixed(5)} ±${row.noise.toFixed(5)}  ${ratio}  ${row.metres === null ? 'no texel' : `${(row.metres * 100).toFixed(1)} cm`}`);
 }
-for (const region of regions) console.log(`  gap ${String(region.gap).padStart(2)} mm  interior region ${region.texels} texels, mean ${region.mean.toFixed(6)}, p99 ${region.p99.toFixed(6)}, max ${region.max.toFixed(6)}`);
+for (const region of regions) console.log(`  gap ${String(region.gap).padStart(2)} mm  interior region ${region.texels} texels, mean ${region.mean.toFixed(6)}, p99 ${region.p99.toFixed(6)}, max ${region.max.toFixed(6)}, ${region.above} over tau, longest run ${region.largestRun}`);
 
 const unmeasured = rows.filter((row) => !row.measured);
 const noiseFloor = Math.max(...outdoor.map((row) => row.noise));
@@ -152,7 +165,7 @@ const litReference = outdoor[0]?.reference ?? 0;
    outdoor probe made tau twenty times wider than the thing it judges. The interior probes carry
    their own noise; the sealed region has no repeat measurement, so its tolerance is the design's
    0.005 L_ref alone. */
-const interiorFloor = INTERIOR_FLOOR * litReference;
+const interiorFloor = taus[0];
 const interior = rows.filter((row) => row.indoors);
 const interiorMatches = interior.every((row) => Math.abs(row.luma - row.reference) <= Math.max(4 * row.noise, 0.2 * row.reference, interiorFloor));
 /* @important Only the sealed room is judged by its region: with a gap open the truth inside is neither zero nor
@@ -161,7 +174,11 @@ const sealedRegion = regions.find((region) => region.gap === 0);
 /* @important p99 over 23684 texels discards the top 236, and 236 texels is a one-texel line eight metres long -
    the whole seam where floor meets wall. The design bounds the width of a connected leak separately
    for exactly this reason, so the count above tau is what the gate uses, not the percentile alone. */
-const regionWithin = sealedRegion !== undefined && sealedRegion.p99 <= interiorFloor && sealedRegion.above <= SEALED_TEXELS_ABOVE_TAU;
+/* p99 and the width of a connected leak, which is what the design bounds - not a count of texels
+   over tau. That count is max in disguise: it read 20/20/21/22/22/23/25 across seven bakes of the
+   same scene, so a gate on it is a coin toss, while a one-texel line eight metres long still passed
+   the percentile. A run of four or more adjacent texels over tau is a seam; three is a speckle. */
+const regionWithin = sealedRegion !== undefined && sealedRegion.p99 <= interiorFloor && sealedRegion.largestRun <= SEALED_LARGEST_RUN;
 const relativeNoise = litReference > 0 ? noiseFloor / litReference : 1;
 const gate = outdoorTolerance(relativeNoise);
 const outdoorAgrees = ratios.length > 0 && ratios.every((r) => Math.abs(r - 1) <= gate);
@@ -176,7 +193,7 @@ console.log(`every probe on a measured texel: ${unmeasured.length === 0 ? 'PASS'
 console.log(`reference noise under 5%: ${referenceIsSharp ? 'PASS' : 'FAIL'} (${(100 * relativeNoise).toFixed(1)}%)`);
 console.log(`each outdoor probe within ${(100 * gate).toFixed(1)}% (5 sigma of the reference): ${outdoorAgrees ? 'PASS' : 'FAIL'}`);
 console.log(`interior probes within tau: ${interiorMatches ? 'PASS' : 'FAIL'}`);
-console.log(`sealed interior under tau ${interiorFloor.toFixed(6)}: ${regionWithin ? 'PASS' : 'FAIL'}${sealedRegion ? ` (p99 uses ${(100 * sealedRegion.p99 / interiorFloor).toFixed(0)}%, ${sealedRegion.above} texels above it, max ${(100 * sealedRegion.max / interiorFloor).toFixed(0)}%)` : ', NO SEALED RUN - this criterion was not exercised'}`);
+console.log(`sealed interior under tau ${interiorFloor.toFixed(6)}: ${regionWithin ? 'PASS' : 'FAIL'}${sealedRegion ? ` (p99 uses ${(100 * sealedRegion.p99 / interiorFloor).toFixed(0)}%, ${sealedRegion.above} texels above it in a longest run of ${sealedRegion.largestRun}, max ${(100 * sealedRegion.max / interiorFloor).toFixed(0)}%)` : ', NO SEALED RUN - this criterion was not exercised'}`);
 console.log(`frame written for a human to look at: ${out}/gap-*.png`);
 
 /* @important The health of the run and the measurement are different things. A mutation "caught" by
@@ -189,5 +206,13 @@ const healthy = unmeasured.length === 0 && litReference > 0 && referenceIsSharp 
 const measures = outdoorAgrees && interiorMatches && regionWithin;
 console.log(`run is healthy: ${healthy ? 'PASS' : 'FAIL'}; measurements agree: ${measures ? 'PASS' : 'FAIL'}`);
 if (!healthy) { console.log('the run itself is unsound; no verdict on the bake'); process.exit(2); }
-console.log(mutation ? `with ${mutation} a measurement must go red: ${measures ? 'FAIL, it stayed green' : 'PASS, it failed as it must'}` : `verdict: ${measures ? 'PASS' : 'FAIL'}`);
-process.exit(mutation ? (measures ? 1 : 0) : (measures ? 0 : 1));
+/* @important A mutation proves the gate is alive only when the gate is green without it. While the
+   base run is red, "it failed as it must" is true of every parameter including ones the code does
+   not have - ?triTEps=1e-5 does not exist and was reported caught. So the mutation mode refuses to
+   judge until the base is green, rather than printing a success it cannot have earned. */
+if (mutation && !measures) {
+  console.log(`the base run of this bake is already red, so ${mutation} proves nothing: fix the bake first`);
+  process.exit(2);
+}
+console.log(mutation ? `with ${mutation} a measurement must go red: FAIL, it stayed green` : `verdict: ${measures ? 'PASS' : 'FAIL'}`);
+process.exit(mutation ? 1 : (measures ? 0 : 1));

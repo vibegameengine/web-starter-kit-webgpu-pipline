@@ -125,17 +125,24 @@ has to catch is `?leakMutation=atlasHalf`, which halves what the bake writes: ou
 against a reference of 0.01443 and the check goes red. A check that has not been shown to fail is
 not evidence.
 
-**The reference check is red, and it is right to be.** The sealed room's interior holds 21 texels
-above tau - p99 uses 73 % of it, but the worst texel is 145 % - and they are connected, along the
-seams where the walls meet the floor and the ceiling. That is the design's other constraint in
-section 07, the width of a connected leak, and the first two versions of this check could not see it:
-p99 over 23684 texels discards the top 236, and 236 texels is a one-texel line eight metres long.
-239 texels at full sunlight would have passed.
+**The reference check is red, and it is right to be.** The sealed room's interior holds about two
+dozen texels above tau, in a connected run of ten, and p99 uses 72 % of it. That is the design's
+other constraint in section 07 - the width of a connected leak - and the first versions of this check
+could not see it: p99 over 23684 texels discards the top 236, and 236 texels is a one-texel line
+eight metres long. 239 texels at full sunlight would have passed.
 
-Where they come from: raw. The transport leaves 172 texels above tau, the denoise brings that to 21,
-and nothing downstream moves it. So the residue is the bake's own rays at a concave corner, not the
-filter, and it is what design sections 02 and 03 still have open - the contact split and the
-watertight intersection. The gate stays red until one of them closes it.
+**The residue is on the ceiling, not at the wall feet.** Two commits said "along the seams where the
+floor meets the wall" and a critic measured it by layer: y 1.9-2.0 holds 22 of the 25, the floor 3,
+and the entire middle of every wall exactly 0. It also does not move when the gap opens, which a
+seam leak would. The ceiling is the one face whose outside is lit near-normal by a 53-degree sun
+through a 0.2 m slab.
+
+Where it enters: raw. The transport leaves 172 texels above tau, the denoise brings that to 21, and
+nothing downstream moves it - so the filter is not making it. That is design sections 02 and 03,
+still open. The gate stays red until one of them closes it.
+
+The count of texels over tau was itself the wrong statistic: seven bakes of the same scene gave
+20/20/21/22/22/23/25. It is max in disguise. The gate is on p99 and on the longest connected run.
 
 Reading the sun back matters. The scene sets its own sun and `setupSun` then replaces both direction
 and intensity from the GUI's light config, which is seeded from the panorama's sun search: assuming

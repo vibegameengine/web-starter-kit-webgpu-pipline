@@ -219,9 +219,10 @@ export class BakeLeakStages {
      texel hid under a tolerance derived from the lit reference, and a critic found it by arithmetic
      rather than by the check. This returns every charted texel whose sample stands inside a box. */
   region(min: [number, number, number], max: [number, number, number], stageName = 'resident', threshold = 0) {
-    const stage = this.stages.find((entry) => entry.name === stageName);
-    if (!stage) return null;
+    const found = this.stages.find((entry) => entry.name === stageName);
+    if (!found) return null;
     const values: number[] = [];
+    const stage = found;
     for (let slot = 0; slot < this.slots; slot++) {
       const texel = this.texelOfSlot[slot];
       if (!this.hasGeometry(texel)) continue;
@@ -238,7 +239,44 @@ export class BakeLeakStages {
       p99: values[Math.min(values.length - 1, Math.floor(values.length * REGION_PERCENTILE))],
       max: values[values.length - 1],
       above: values.filter((v) => v > threshold).length,
+      largestRun: this.largestRunAbove(min, max, stage, threshold),
     };
+  }
+
+  /* @important Design section 07 bounds the p99 AND the width of a connected leak. A count of texels
+     over tau is neither: it is max in disguise, it moved 20/20/21/22/22/23/25 across seven bakes of
+     the same scene, and a single outlier blocks while a one-texel line eight metres long does not.
+     This walks the four-neighbourhood in atlas space and returns the largest connected run over tau. */
+  private largestRunAbove(min: [number, number, number], max: [number, number, number], stage: LeakStage, threshold: number): number {
+    const hot = new Set<number>();
+    for (let slot = 0; slot < this.slots; slot++) {
+      const texel = this.texelOfSlot[slot];
+      if (!this.hasGeometry(texel) || stage.values[slot * 4 + 3] < MEASURED_ALPHA) continue;
+      const i = texel * 4;
+      if (![0, 1, 2].every((axis) => this.world[i + axis] >= min[axis] && this.world[i + axis] <= max[axis])) continue;
+      if (luma(stage.values, slot * 4) > threshold) hot.add(texel);
+    }
+    let largest = 0;
+    const seen = new Set<number>();
+    for (const start of hot) {
+      if (seen.has(start)) continue;
+      let size = 0;
+      const queue = [start];
+      seen.add(start);
+      while (queue.length > 0) {
+        const texel = queue.pop() as number;
+        size++;
+        const x = texel % this.size;
+        for (const step of [x > 0 ? -1 : 0, x < this.size - 1 ? 1 : 0, -this.size, this.size]) {
+          const next = texel + step;
+          if (step === 0 || next < 0 || next >= this.slotOfTexel.length || seen.has(next) || !hot.has(next)) continue;
+          seen.add(next);
+          queue.push(next);
+        }
+      }
+      if (size > largest) largest = size;
+    }
+    return largest;
   }
 
   firstChange(tolerance = DEFAULT_TOLERANCE): LeakStageChange[] {
