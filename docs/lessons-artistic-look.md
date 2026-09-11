@@ -2,8 +2,10 @@
 
 Work of 2026-09-11, implementing [public/lighting-look-development.html](../public/lighting-look-development.html)
 (R2, §02 sun bug, §05 artist controls, §06 implementation contract, §09 acceptance).
-Checks: `npx tsx scripts/sun-direction-fixture.ts` (CPU) and `node scripts/check-look.mjs`
-(headed Chrome; `LOOK_SCENE`/`LOOK_CAM` pick the scene).
+Checks, all headed except the two CPU fixtures: `npx tsx scripts/sun-direction-fixture.ts`,
+`npx tsx scripts/sun-direction-real-hdr.ts`, `node scripts/check-look.mjs` and
+`node scripts/look-isolation.mjs` (`LOOK_SCENE`/`LOOK_CAM` pick the scene; both default to the
+village diorama that the document's own A/B images show).
 
 ## What landed
 
@@ -29,6 +31,16 @@ Two more corrections came with it, both from §02:
 
 Measured by the fixture on the document's own 8×4 synthetic panorama: float32 and half now
 agree to 0.01° (az 112.50, el 67.50); before, half gave el 0.91°.
+
+**And on the panorama this project actually ships, the bug moves the sun by 0.03°.**
+`pizzo_pernice_puresky_2k.hdr`, 2048×1024, HalfFloat: reading raw bit patterns gives
+azimuth 36.22 / elevation 53.11, decoding gives 36.25 / 53.13. Half-float bit patterns rise
+monotonically with the value they encode, so on a sky whose sun is a broad bright lobe the
+centroid barely moves; the synthetic case breaks only because a single 100× pixel sits on a
+uniform background. This answers §02's open question in the direction the document
+suspected but could not test: **the HDR bug is real and worth fixing, and it is not why
+this frame is dark.** Anyone about to compensate a "wrong sun" with a global lift should
+read this line first.
 
 **The look layer itself** is `src/shared/render/look.ts` plus
 `src/shared/render/outputStage.ts`, wired through `FrameGraph.setLook()` and the `Look`
@@ -84,6 +96,54 @@ reflections and the probe update still jitter between frames, so "neutral is ide
 verified to that floor and not to the 1e-4 relative figure §09 asks for. A version of this
 check on a still scene without reflections would tighten it.
 
+## The document's own scene, measured (§03, §04)
+
+`node scripts/look-isolation.mjs`, village diorama, `?cam=front&hud=0&still=1&grain=0`,
+1280×720, median scene-linear luminance per region (the grey studio backdrop is listed on
+purpose, as the thing that must be excluded from an artistic judgement):
+
+| step | sunlit facade | shadowed facade | terrace stone | water | foliage | backdrop |
+|---|---|---|---|---|---|---|
+| as shipped (auto exposure, glare on) | 0.0832 | 0.0243 | 0.0769 | 0.0974 | 0.0389 | 0.2110 |
+| glare off | 0.0831 | 0.0206 | 0.0759 | 0.0953 | 0.0369 | 0.2113 |
+| locked exposure E₀ = 0.5383 | 0.0840 | 0.0210 | 0.0772 | 0.0960 | 0.0371 | 0.2121 |
+| E₀ +0.5 stop | 0.1252 | 0.0299 | 0.1200 | 0.1525 | 0.0533 | 0.3180 |
+| E₀ +1 stop | 0.1882 | 0.0446 | 0.1884 | 0.2319 | 0.0784 | 0.4680 |
+| E₀ + diffuse indirect +0.35 EV | 0.0935 | 0.0226 | 0.0782 | 0.0964 | 0.0403 | 0.2121 |
+| first artistic probe | 0.1402 | 0.0347 | 0.1269 | 0.1528 | 0.0592 | 0.3272 |
+| probe with the scene glare back on | 0.1405 | 0.0412 | 0.1297 | 0.1554 | 0.0635 | 0.3236 |
+| restored profile, neutral look | 0.0824 | 0.0246 | 0.0787 | 0.0973 | 0.0393 | 0.2110 |
+
+What it says:
+
+- **The studio backdrop is 2.5× brighter than the sunlit facades** (0.211 against 0.083)
+  and it fills most of the frame. The histogram meter has no subject mask, so the village
+  is metered against its own background — §03's suspicion, now with numbers.
+- **Locking the settled meter reproduces the shipped frame** (0.0840 against 0.0832, under
+  1%), which is what makes the rest of the ladder a diagnosis rather than a new picture.
+  Restoring the profile at the end lands back on 0.0824.
+- **Veiling glare is a shadow lift, not a highlight bloom here**: turning it off drops the
+  shadowed facade by 15% (0.0243 → 0.0206) and leaves the sunlit facade untouched
+  (0.0832 → 0.0831). That is exactly the local-contrast loss §03 describes.
+- **The diffuse indirect gain is not a brightness slider.** +0.35 EV at a locked exposure
+  raises the sunlit facade 11% and the foliage 9%, and moves the water by 0.4% and the
+  terrace by 0.1% — the water has its own pass and the terrace reads mostly direct light.
+- **The exposure ladder does not double in the displayed frame**: +1 stop measures ×2.24
+  here because these medians are read after the Neutral tone mapper. The exact ×2 lives
+  directly after exposure, which is what `check-look.mjs` measures with `lookOutput=linear`
+  (2.001). Reading a stop off the final PNG is the §04 mistake.
+- Against the shipped frame the first artistic probe lifts the sunlit facades 69% and the
+  shadows 43% while the backdrop rises 55% — the subject gains on the background, but not
+  by much. Separating the two needs the subject mask or a darker backdrop, not a bigger
+  gain.
+
+Shots: `shots/look/isolation/00-baseline.png` … `06-restored.png`.
+
+**Trap:** `__fog.exposure()` read straight after boot returns a meter that is still
+adapting — 0.8469 on the first run against 0.5383 settled, and locking the early value made
+the "baseline" 1.68× brighter than the frame it was supposed to reproduce. The script now
+polls until two readings agree within 0.2% before it calls anything E₀.
+
 ## Not done
 
 - **Bake provenance and the stale flag** (§08): changing the sun or the environment does
@@ -92,10 +152,10 @@ check on a still scene without reflections would tighten it.
 - **Lighting settings read before `staticLight.prepare()`** (§04, the `guiSettings` trap):
   still unfixed, so a first fresh bake can use different env/quality values than the ones
   the panel shows afterwards.
-- **The beach did not boot** during this work: `padLightmapCharts` throws
-  `chart 13713 has no measured texels` from another session's in-flight edits to
-  `staticLight.ts` / `beachScene.ts`. The look layer was therefore accepted on the
-  corridor. Nothing here touches the chart padding.
+- **The beach does not boot** at the moment: `padLightmapCharts` throws
+  `chart 13713 has no measured texels`, from another session's in-flight work on
+  `beachScene.ts`. Nothing here touches the chart padding. The village and the corridor
+  both boot, and the village is the scene the document's A/B images show.
 - **Frame cost is not measured.** §09 wants baseline / neutral look / working look at 4K
   with p50/p95/p99. The look adds ALU in the existing composite and no new pass, but that
   is an argument, not a measurement.

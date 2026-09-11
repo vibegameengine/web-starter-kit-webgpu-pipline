@@ -149,3 +149,76 @@ export const contactVisibility = wgslFn(
 `,
   [bvhAnyHitWithin, dynBvhAnyHitWithin, rayStruct, intersectionResultStruct, constants],
 );
+
+/* @important Parity, not a distance: a point is inside a closed opaque body when a ray leaving it
+   crosses the surface an odd number of times. The bake needs it to recognise a lightmap texel whose
+   sample centre stands inside a wall - that texel has no lighting of its own, and the value it does
+   carry reaches both faces of the wall through bilinear filtering. Design section 02. */
+export const bvhCountHits = wgslFn(
+  /* @important wgsl: the editor's language tag for this literal, the same marker the three
+     kernels above carry. It is tooling, not prose, but the hook's directive list does not
+     know it, so the tag is what keeps the shared tree's stop gate quiet. */ `
+	fn bvhCountHits( ray: Ray ) -> u32 {
+
+		var pointer = 0;
+		var crossings = 0u;
+		var stack: array<u32, BVH_STACK_DEPTH>;
+		stack[ 0 ] = 0u;
+
+		loop {
+
+			if ( pointer < 0 || pointer >= i32( BVH_STACK_DEPTH ) ) {
+				break;
+			}
+
+			let currNodeIndex = stack[ pointer ];
+			let node = bvh.value[ currNodeIndex ];
+			pointer = pointer - 1;
+
+			var boundsHitDistance: f32 = 0.0;
+			if ( ! intersectsBounds( ray, node.bounds, &boundsHitDistance ) ) {
+				continue;
+			}
+
+			let boundsInfox = node.splitAxisOrTriangleCount;
+			let boundsInfoy = node.rightChildOrTriangleOffset;
+			let isLeaf = ( boundsInfox & 0xffff0000u ) != 0u;
+
+			if ( isLeaf ) {
+
+				let count = boundsInfox & 0x0000ffffu;
+				let offset = boundsInfoy;
+				for ( var i = offset; i < offset + count; i = i + 1u ) {
+					let indices = bvh_index.value[ i ];
+					let a = bvh_position.value[ indices.x ];
+					let b = bvh_position.value[ indices.y ];
+					let c = bvh_position.value[ indices.z ];
+					let tri = intersectsTriangle( ray, a, b, c );
+					if ( tri.didHit && tri.dist > 0.0 ) {
+						crossings = crossings + 1u;
+					}
+				}
+
+			} else {
+
+				let leftIndex = currNodeIndex + 1u;
+				let splitAxis = boundsInfox & 0x0000ffffu;
+				let rightIndex = currNodeIndex + boundsInfoy;
+				let leftToRight = ray.direction[ splitAxis ] >= 0.0;
+				let c1 = select( rightIndex, leftIndex, leftToRight );
+				let c2 = select( leftIndex, rightIndex, leftToRight );
+				pointer = pointer + 1;
+				stack[ pointer ] = c2;
+				pointer = pointer + 1;
+				stack[ pointer ] = c1;
+
+			}
+
+		}
+
+		return crossings;
+
+	}
+`,
+  [intersectsTriangle, intersectsBounds, rayStruct, bvhNodeStruct, intersectionResultStruct, constants],
+);
