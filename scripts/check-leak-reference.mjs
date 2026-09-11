@@ -22,19 +22,27 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { PNG } from 'pngjs';
 import { indirectAtPoint, leakRoomGeometry } from './lib/leakReference.mjs';
 
-setTimeout(() => { console.error('gate: 5 minutes, abort'); process.exit(2); }, 300000);
+/* The gate has to outlast what the run is allowed to wait for, or the script kills itself before its
+   own timeouts can report anything: two gaps at 120 + 90 seconds each is 420, under a 300-second
+   axe. It is computed from the waits now, and it exits 3 so a timeout is not read as an unsound run. */
+const RESIDENT_WAIT = 120000;
+const OVERLAY_WAIT = 90000;
 const out = 'shots/leak-reference';
 await mkdir(out, { recursive: true });
 const gaps = (process.argv[2] ?? '0,20').split(',').map(Number);
 const paths = Number(process.argv[3] ?? 32768);
 const mutation = process.argv[4] ?? '';
 const scale = Number(process.argv[5] ?? 1);
+setTimeout(() => { console.error('gate: the run outlasted its own waits, abort'); process.exit(3); }, gaps.length * (RESIDENT_WAIT + OVERLAY_WAIT) + 60000);
 /* @important The shared dev server on 5188 froze one module in its transform cache: three kinds of write and a
    commit all left it serving the same bytes, so a run against it measures whatever it last cached.
    LEAK_CHECK_ORIGIN points the check at a server that is known to be fresh. */
 const origin = process.env.LEAK_CHECK_ORIGIN ?? 'http://127.0.0.1:5188';
 
-const OUTDOOR_TOLERANCE = 0.1;
+/* The design's tolerance, applied relatively: max(5 sigma, 0.005). At 32768 paths the reference's
+   own repeat spread is about 2 % of the mean, so five of those is ten - the hard-coded 0.1 this
+   replaces happened to be right at this path count and would have been wrong at any other. */
+const outdoorTolerance = (relativeNoise) => Math.max(5 * relativeNoise, 0.005);
 /* @important The renderer's sun, read back from a page in an earlier run: setupSun overwrites whatever the
    scene asked for from the panorama's sun search, and tau must exist before the first page loads. */
 const SUN_GUESS = { direction: [0.484, 0.800, 0.355], intensity: 2 };
@@ -75,7 +83,7 @@ const tolerance = INTERIOR_FLOOR * indirectAtPoint(leakRoomGeometry({ gap: 0, sc
 async function bakedAt(gap) {
   const query = `&leak=1&hud=0&inspector=0&still=1&aa=none&grain=0&exposure=1${mutation}`;
   await page.goto(`${origin}/?scene=leak-room&cam=outside&gap=${gap}${query}&env=0${scale === 1 ? '' : `&scale=${scale}`}`);
-  await page.waitForFunction(() => window.__leak?.stages().includes('resident') === true, null, { timeout: 120000 });
+  await page.waitForFunction(() => window.__leak?.stages().includes('resident') === true, null, { timeout: RESIDENT_WAIT });
   const probes = await page.evaluate(([points, reach, measured]) => points.map((probe) => {
     const report = window.__leak.atWorld(probe.at[0], probe.at[1], probe.at[2], reach);
     const value = report?.stages?.resident;
@@ -86,8 +94,8 @@ async function bakedAt(gap) {
       measured: value ? value[3] >= measured : false,
       luma: value ? 0.2126 * value[0] + 0.7152 * value[1] + 0.0722 * value[2] : null,
     };
-  }), [PROBES, PROBE_REACH_METRES, MEASURED_ALPHA]);
-  await page.waitForFunction(() => document.querySelector('#loading-overlay')?.hidden === true, null, { timeout: 90000 });
+  }), [PROBES, PROBE_REACH_METRES * scale, MEASURED_ALPHA]);
+  await page.waitForFunction(() => document.querySelector('#loading-overlay')?.hidden === true, null, { timeout: OVERLAY_WAIT });
   await page.evaluate(() => new Promise((r) => { let i = 0; const g = () => (++i >= 20 ? r() : requestAnimationFrame(g)); requestAnimationFrame(g); }));
   /* Read the sun only once the frame is running: the hooks are installed after the bake, and the
      probe bake's sky pass sets the light's intensity to zero and restores it, so reading it any
@@ -154,8 +162,10 @@ const sealedRegion = regions.find((region) => region.gap === 0);
    the whole seam where floor meets wall. The design bounds the width of a connected leak separately
    for exactly this reason, so the count above tau is what the gate uses, not the percentile alone. */
 const regionWithin = sealedRegion !== undefined && sealedRegion.p99 <= interiorFloor && sealedRegion.above <= SEALED_TEXELS_ABOVE_TAU;
-const outdoorAgrees = ratios.length > 0 && ratios.every((r) => Math.abs(r - 1) <= OUTDOOR_TOLERANCE);
-const referenceIsSharp = litReference > 0 && noiseFloor / litReference < OUTDOOR_TOLERANCE / 2;
+const relativeNoise = litReference > 0 ? noiseFloor / litReference : 1;
+const gate = outdoorTolerance(relativeNoise);
+const outdoorAgrees = ratios.length > 0 && ratios.every((r) => Math.abs(r - 1) <= gate);
+const referenceIsSharp = litReference > 0 && relativeNoise < 0.05;
 /* The frame criterion is gone. It read the mean of the whole shot, and the sky is a quarter of it at
    149/255: with every surface in the scene forced black the mean was still 42 against a threshold of
    1. It never judged the bake, and a criterion that cannot fail is worse than none. What the frame
@@ -163,8 +173,8 @@ const referenceIsSharp = litReference > 0 && noiseFloor / litReference < OUTDOOR
 const litSurfacesShow = true;
 console.log(`errors ${errors.length}${errors.length ? ': ' + errors.slice(0, 2).join(' | ').slice(0, 300) : ''}`);
 console.log(`every probe on a measured texel: ${unmeasured.length === 0 ? 'PASS' : `FAIL (${unmeasured.map((row) => row.probe).join(', ')})`}`);
-console.log(`reference noise under half the gate: ${referenceIsSharp ? 'PASS' : 'FAIL'} (${(100 * noiseFloor / (litReference || 1)).toFixed(1)}%)`);
-console.log(`each outdoor probe within ${100 * OUTDOOR_TOLERANCE}%: ${outdoorAgrees ? 'PASS' : 'FAIL'}`);
+console.log(`reference noise under 5%: ${referenceIsSharp ? 'PASS' : 'FAIL'} (${(100 * relativeNoise).toFixed(1)}%)`);
+console.log(`each outdoor probe within ${(100 * gate).toFixed(1)}% (5 sigma of the reference): ${outdoorAgrees ? 'PASS' : 'FAIL'}`);
 console.log(`interior probes within tau: ${interiorMatches ? 'PASS' : 'FAIL'}`);
 console.log(`sealed interior under tau ${interiorFloor.toFixed(6)}: ${regionWithin ? 'PASS' : 'FAIL'}${sealedRegion ? ` (p99 uses ${(100 * sealedRegion.p99 / interiorFloor).toFixed(0)}%, ${sealedRegion.above} texels above it, max ${(100 * sealedRegion.max / interiorFloor).toFixed(0)}%)` : ', NO SEALED RUN - this criterion was not exercised'}`);
 console.log(`frame written for a human to look at: ${out}/gap-*.png`);

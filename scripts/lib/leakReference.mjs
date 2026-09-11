@@ -8,6 +8,10 @@
 
 const EPSILON = 1e-12;
 
+/* @important No default sun. The scene asks for one and setupSun overwrites both its direction and
+   its intensity from the panorama's sun search, so any constant here would be a quiet lie - 22
+   degrees and 6 against the renderer's 53.1 and 2.0, which is what put an earlier comparison at
+   ratios 0.205 and 0.637. The caller reads the sun off the page and passes it. */
 export const LEAK_ROOM = {
   inner: 2,
   wall: 0.2,
@@ -15,8 +19,6 @@ export const LEAK_ROOM = {
   ground: 12,
   shellAlbedo: srgbToLinear(0x8f / 255),
   groundAlbedo: srgbToLinear(0x9a / 255),
-  sunElevationDegrees: 22,
-  sunIntensity: 6,
 };
 
 function srgbToLinear(c) {
@@ -45,12 +47,7 @@ export function leakRoomGeometry({ gap = 0, scale = 1 } = {}) {
   ];
 }
 
-export function sunDirection({ elevationDegrees = LEAK_ROOM.sunElevationDegrees } = {}) {
-  const elevation = (elevationDegrees * Math.PI) / 180;
-  const position = [Math.cos(elevation) * 30, Math.sin(elevation) * 30, 6];
-  const length = Math.hypot(...position);
-  return position.map((v) => v / length);
-}
+
 
 function nearestSlabHit(body, origin, direction, tMax) {
   let near = EPSILON;
@@ -151,10 +148,11 @@ export function indirectAtPoint(bodies, point, normal, options = {}) {
     paths = 4096,
     maxBounces = 6,
     seed = 1,
-    sun = sunDirection(),
-    intensity = LEAK_ROOM.sunIntensity,
+    sun,
+    intensity,
     sky = 0,
   } = options;
+  if (!Array.isArray(sun) || !(intensity > 0)) throw new Error('indirectAtPoint needs the sun the renderer actually used: pass { sun, intensity } read off the page');
   const random = mulberry32(seed);
   let total = 0;
   for (let path = 0; path < paths; path++) {
