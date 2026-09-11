@@ -95,8 +95,23 @@ commit rather than dressed up.
 node scripts/check-leak-room.mjs contact 0,1,5,20            # A1, A2 - green
 node scripts/check-leak-room.mjs contact 0 "&lm=64"          # A4, one texel spans the wall base - green
 node scripts/check-bake-leak.mjs corridor floor              # section 01 capture and its mutation - green
+node scripts/check-leak-reference.mjs 0,20                    # the independent reference - green
 node scripts/check-leak-room.mjs contact 0 "&scale=0.001"    # A3 - RED, see below
 ```
+
+**The bake agrees with an independent path tracer to within 3 %.** `scripts/lib/leakReference.mjs`
+shares no code with the renderer - its own geometry, its own intersection, its own integrator, double
+precision - and the run is `?env=0` so the only light is the analytic sun, whose direction and
+intensity the check reads back from the page rather than assuming. Outdoor indirect, baked against
+reference: 0.01895 / 0.01864 sunward and 0.01464 / 0.01426 on the +Z side, ratios 1.017 and 1.027.
+The sealed interior is zero on both sides, and at a 20 mm gap both sit on the reference's own noise
+floor. This is what the sealed box alone could never show: not that the bake stops leaking, but that
+it computes the right number.
+
+Reading the sun back matters. The scene sets its own sun and `setupSun` then replaces both direction
+and intensity from the GUI's light config, which is seeded from the panorama's sun search: assuming
+the scene's 6 at 22 degrees instead of the renderer's 2.0 at (0.484, 0.800, 0.355) put the same
+comparison at ratios 0.205 and 0.637 and would have been read as the renderer being wrong.
 
 Sealed room at the fine atlas: 0.00007 peak against 0.2592 for the sunlit ground, a 20 mm gap adds
 0.00027, all three criteria pass. At 0.23 m per texel it reads 0.00001, from 0.0313 when this
