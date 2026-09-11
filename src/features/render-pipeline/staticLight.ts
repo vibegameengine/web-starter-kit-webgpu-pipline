@@ -227,6 +227,7 @@ export class StaticLight {
         dilate: 0,
         dynamicReceivers: true,
         denoiseIgnoresSurface: this.url.get('leakMutation') === 'denoiseAll',
+        atlasGain: this.url.get('leakMutation') === 'atlasHalf' ? 0.5 : 1,
         filterLinks: this.url.flag('filterLinks', true) ? contactTree : null,
         onStage: this.leak ? (name, pixels) => this.leak!.recordPage(name, page, pixels) : undefined,
         onProgress: (fraction, iteration) => bootNote(`Baking lightmap page ${page + 1}/${pages} ${(fraction * 100).toFixed(0)}% · pass ${iteration}`),

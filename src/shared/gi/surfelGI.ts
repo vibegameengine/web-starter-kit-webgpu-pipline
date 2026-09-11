@@ -1326,6 +1326,7 @@ export class SurfelGI {
       /** Keep webgiya's lifecycle running beside the baked atlas for moving receivers. */
       dynamicReceivers?: boolean;
       denoiseIgnoresSurface?: boolean;
+      atlasGain?: number;
       filterLinks?: ContactBVHBundle | null;
       height?: number;
       freshSurfels?: boolean;
@@ -1349,6 +1350,7 @@ export class SurfelGI {
       denoise,
       dilate,
       denoiseIgnoresSurface,
+      atlasGain,
       filterLinks,
       height = size,
       freshSurfels,
@@ -1435,7 +1437,7 @@ export class SurfelGI {
     const planeEpsilon =
       bounds.getSize(new THREE.Vector3()).length() * 0.0025;
     const useLinks = filterLinks !== null && filterLinks !== undefined;
-    await lm.writeAtlas(renderer, gbuffer, { denoise, dilate, planeEpsilon, denoiseIgnoresSurface, useLinks, onStage });
+    await lm.writeAtlas(renderer, gbuffer, { denoise, dilate, planeEpsilon, denoiseIgnoresSurface, atlasGain, useLinks, onStage });
     const stats = await lm.readStats(renderer);
     this.integrate.setExactReuse(false);
     this.setBaseSampleCount(this.runtimeSampleCount);

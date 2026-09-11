@@ -95,7 +95,8 @@ commit rather than dressed up.
 node scripts/check-leak-room.mjs contact 0,1,5,20            # A1, A2 - green
 node scripts/check-leak-room.mjs contact 0 "&lm=64"          # A4, one texel spans the wall base - green
 node scripts/check-bake-leak.mjs corridor floor              # section 01 capture and its mutation - green
-node scripts/check-leak-reference.mjs 0,20                    # the independent reference - green
+node scripts/check-leak-reference.mjs 0,20                              # the independent reference - green
+node scripts/check-leak-reference.mjs 0 32768 "&leakMutation=atlasHalf"  # and it must go red - green
 node scripts/check-leak-room.mjs contact 0 "&scale=0.001"    # A3 - RED, see below
 ```
 
@@ -107,6 +108,22 @@ reference: 0.01895 / 0.01864 sunward and 0.01464 / 0.01426 on the +Z side, ratio
 The sealed interior is zero on both sides, and at a 20 mm gap both sit on the reference's own noise
 floor. This is what the sealed box alone could never show: not that the bake stops leaking, but that
 it computes the right number.
+
+The first version of this check passed every fault put to it, and a second harsh critic took it
+apart. The interior tolerance was divided by the outdoor scale, so a bake fifteen times too bright
+forgave itself by exactly that factor; a third tolerance term sat above every interior value, so the
+interior could not fail; the outdoor gate accepted 0.7 to 1.4 while the commit claimed three per
+cent; the reference's own noise at 4096 paths is 3.8 % of the mean, larger than the agreement being
+claimed from it; and the screenshot it wrote was black and never looked at. Four mutations were put
+to it - `?atlasHits=0`, `?triTEps=1e-5`, `?spawnEps=radius`, `?lmi=0.15` - and all four passed.
+
+Now: the interior is compared in absolute units, the tolerance is the design's own
+`max(5 sigma, 0.005 L_ref)` and the run prints how much of it the worst probe uses (26 %), the
+outdoor gate is ten per cent, 32768 paths put the reference's noise at 2.5 %, every probe must land
+on a measured texel within 1.8 cm of itself, and the frame is checked for being black. The fault it
+has to catch is `?leakMutation=atlasHalf`, which halves what the bake writes: outdoor goes 0.00724
+against a reference of 0.01443 and the check goes red. A check that has not been shown to fail is
+not evidence.
 
 Reading the sun back matters. The scene sets its own sun and `setupSun` then replaces both direction
 and intensity from the GUI's light config, which is seeded from the panorama's sun search: assuming

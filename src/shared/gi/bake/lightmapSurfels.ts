@@ -97,6 +97,11 @@ export function createLightmapSurfels(pool: SurfelPool, size: number, height = s
   const U_SURFACE_TEST = uniform(1);
   const U_USE_LINKS = uniform(0);
   const U_PLACEMENT = uniform(0);
+  /* @important A fault injected into the producer, for the acceptance to catch. ?leakMutation=atlasHalf
+     halves what the bake writes, which is the one thing a check that reads the atlas and compares it
+     against an independent tracer must not miss - and the first version of that check did not, because
+     nothing it measured could move. Design section 07. */
+  const U_ATLAS_GAIN = uniform(1);
   const linkAttr = new THREE.StorageBufferAttribute(new Uint32Array(texelCount), 1);
 
   let seedNode: THREE.ComputeNode | null = null;
@@ -264,7 +269,7 @@ export function createLightmapSurfels(pool: SurfelPool, size: number, height = s
   async function writeAtlas(
     renderer: THREE.WebGPURenderer,
     gbuffer: LightmapGBuffer,
-    options: { denoise?: number; dilate?: number; planeEpsilon?: number; denoiseIgnoresSurface?: boolean; useLinks?: boolean; onStage?: (name: string, pixels: Float32Array) => void } = {},
+    options: { denoise?: number; dilate?: number; planeEpsilon?: number; denoiseIgnoresSurface?: boolean; useLinks?: boolean; atlasGain?: number; onStage?: (name: string, pixels: Float32Array) => void } = {},
   ): Promise<boolean> {
     const momentsAttr = pool.getMomentsAttr();
     const surfelAttr = pool.getSurfelAttr();
@@ -277,7 +282,7 @@ export function createLightmapSurfels(pool: SurfelPool, size: number, height = s
        of its own - design section 02's split, which is not built - not a wider filter, which is the
        leak. ?filterLinks=0 is the other side of the trade: at 0.23 m/texel the sealed room reads
        0.00001 with links and 0.02965 without. */
-    const { useLinks = false, denoise = 2, dilate = 4, planeEpsilon = 0.02, denoiseIgnoresSurface = false, onStage } = options;
+    const { useLinks = false, denoise = 2, dilate = 4, planeEpsilon = 0.02, denoiseIgnoresSurface = false, atlasGain = 1, onStage } = options;
     const capacity = surfelAttr.count;
 
     if (!writeNode) {
@@ -305,7 +310,7 @@ export function createLightmapSurfels(pool: SurfelPool, size: number, height = s
 
         If(sid.greaterThanEqual(int(0)), () => {
           const m = moments.element(sid.add(int(U_READ_OFFSET)));
-          out.assign(vec4(m.get('irradiance').xyz, float(1)));
+          out.assign(vec4(m.get('irradiance').xyz.mul(U_ATLAS_GAIN), float(1)));
         });
 
         atlas.element(tid.add(int(U_DST))).assign(out);
@@ -460,6 +465,7 @@ export function createLightmapSurfels(pool: SurfelPool, size: number, height = s
     U_PLANE_EPS.value = planeEpsilon;
     U_SURFACE_TEST.value = denoiseIgnoresSurface ? 0 : 1;
     U_USE_LINKS.value = useLinks ? 1 : 0;
+    U_ATLAS_GAIN.value = atlasGain;
 
     // Ping-pong through the two halves; `half` always names the one holding the
     // current result, which is what readStats and the blit must both read.
