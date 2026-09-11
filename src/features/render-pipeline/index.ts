@@ -10,6 +10,7 @@ import { giLightSummary } from '../../shared/gi/surfel/sceneLights.ts';
 import { addDynamicDemoObject, type DynamicObject } from '../../shared/gi/surfel/content.ts';
 import { hook, readUrlParams, type PipelineUi, type RenderPipeline, type SceneHost, type UrlParams } from './host.ts';
 import { setupSun, type SunControls } from './sun.ts';
+import { CINE_CAMERAS, DEFAULT_CINE_CAMERA, applyCineCamera, horizontalFovDeg, relativeStops } from './cineCamera.ts';
 import { StaticLight } from './staticLight.ts';
 import { leakHookApi } from '../../shared/gi/bake/leakStages.ts';
 import { TraceStages } from './traceStages.ts';
@@ -17,6 +18,9 @@ import { PostStages } from './postStages.ts';
 import { gpuPasses } from './audit.ts';
 import { LodLab } from '../../widgets/lod-lab/index.ts';
 import { bootStage } from '../../shared/ui/bootProgress.ts';
+import { ReflectionCache, deriveReflectionVolume, type ReflectionVolume } from '../../shared/gi/reflect/cache/index.ts';
+import type { ContactBVHBundle } from '../../shared/gi/contact/contactBvh.ts';
+import { addReflectionFixture } from './reflectionFixture.ts';
 
 export type { SceneHost, PipelineUi, RenderPipeline } from './host.ts';
 
@@ -26,6 +30,45 @@ const HALF_GBUFFER = 0.5;
 export async function createRenderPipeline(renderer: THREE.WebGPURenderer): Promise<RenderPipeline> {
   const gi = await bootStage('Loading GI assets', () => SurfelGI.create(renderer));
   return { gi, envTexture: gi.envTexture, run: (host, gui, runUi) => runPipeline(renderer, gi, host, gui, runUi) };
+}
+
+
+interface CachedReflectionDeps {
+  contactTree: ContactBVHBundle | null;
+  probes: ProbeVolume | null;
+  trace: TraceStages;
+  frameGraph: FrameGraph;
+  url: UrlParams;
+}
+
+function installReflectionCache(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: SceneHost, deps: CachedReflectionDeps): ReflectionCache | null {
+  const { contactTree, probes, trace, frameGraph, url } = deps;
+  if (!contactTree || !probes || !gi.dynamicBvhBundle || !gi.diffuseArrayTexture) {
+    console.warn('[reflections] cached mode needs the contact tree, the probe volume and the GI material array; staying on legacy');
+    return null;
+  }
+  const faceSize = url.num('reflectionFace') ?? 128;
+  const volumes: ReflectionVolume[] = host.reflectionVolumes?.length
+    ? host.reflectionVolumes.map((spec, index) => ({ ...deriveReflectionVolume(host.scene, spec), id: index + 1 }))
+    : [deriveReflectionVolume(host.scene, { faceSize })];
+  const cache = new ReflectionCache(renderer, volumes, {
+    staticBvh: contactTree,
+    dynamicBvh: gi.dynamicBvhBundle,
+    diffuseArray: gi.diffuseArrayTexture,
+    environment: gi.envTexture,
+    probes,
+  }, {
+    intensity: url.num('reflectionsStrength') ?? 1,
+    prefilterSamples: (url.num('reflectionPrefilter') ?? 64) as 64,
+    stableMaxSamples: url.num('reflectionSpp') ?? 64,
+    maxFootprintTaps: url.num('reflectionTaps') ?? 8,
+    depthCorrection: url.flag('reflectionDepth', true),
+    freezeUpdates: url.flag('reflectionFreeze', false),
+  });
+  if (cache.errors.length > 0) console.warn(`[reflections] preparation: ${cache.errors.join(', ')}`);
+  console.log(`[reflections] cached profile, ${volumes.length} volume(s), face ${volumes[0].faceSize}, ${cache.memoryReport}`);
+  trace.installReflectionCache(cache, frameGraph);
+  return cache;
 }
 
 function addMovers(host: SceneHost, url: UrlParams): { movers: DynamicObject[]; update(t: number): void } | null {
@@ -75,6 +118,7 @@ interface Pipeline {
   staticLight: StaticLight; trace: TraceStages; post: PostStages; sun: SunControls; live: { on: boolean }; giScale: () => number;
   dynamic: ReturnType<typeof addMovers>; world: WorldState; stats: CacheStats; hud: Hud | null;
   lab: LodLab | null;
+  cine: { name: string };
 }
 
 function openLodLab(renderer: THREE.WebGPURenderer, staticLight: StaticLight, camera: THREE.PerspectiveCamera, frameGraph: FrameGraph): LodLab | null {
@@ -91,6 +135,30 @@ function openLodLab(renderer: THREE.WebGPURenderer, staticLight: StaticLight, ca
   camera.updateProjectionMatrix();
   frameGraph.setSize(window.innerWidth / 2, window.innerHeight);
   return lab;
+}
+
+function bindCineGui(gui: GUI, p: Pipeline): void {
+  const folder = gui.addFolder('Cine camera');
+  const state = { preset: p.cine.name, focalMm: CINE_CAMERAS[p.cine.name].focalMm, stops: '', frame: '' };
+  const describe = () => {
+    const cine = CINE_CAMERAS[state.preset];
+    state.stops = `${relativeStops(cine) >= 0 ? '+' : ''}${relativeStops(cine).toFixed(2)} EV vs ISO 800 T2.8 180°`;
+    state.frame = `${horizontalFovDeg({ ...cine, focalMm: state.focalMm }).toFixed(1)}° horizontal · ${cine.note}`;
+  };
+  const apply = () => {
+    const cine = CINE_CAMERAS[state.preset];
+    p.cine.name = state.preset;
+    applyCineCamera(p.host.camera, cine, state.focalMm);
+    p.post.motionBlur.settings.shutter = cine.shutterAngleDeg / 360;
+    describe();
+  };
+  folder.add(state, 'preset', Object.keys(CINE_CAMERAS)).name('camera and lens').onChange((name: string) => { state.focalMm = CINE_CAMERAS[name].focalMm; apply(); });
+  folder.add(state, 'focalMm', 12, 135, 1).name('focal length (mm)').listen().onChange(apply);
+  folder.add(state, 'frame').name('frame').listen().disable();
+  folder.add(state, 'stops').name('exposure vs reference').listen().disable();
+  folder.add({ addStops: () => { p.post.look.state.exposureEV = +relativeStops(CINE_CAMERAS[state.preset]).toFixed(2); p.post.syncLook(); } }, 'addStops').name('put that stop difference in the Look');
+  describe();
+  folder.close();
 }
 
 function bindLightingGui(gui: GUI, p: Pipeline, ui: PipelineUi): void {
@@ -170,6 +238,16 @@ function installHooks(p: Pipeline, state: { paused: boolean; stepOnce: boolean; 
   hook('__gpuPasses', (frames = 60) => gpuPasses(renderer, frames));
   if (p.staticLight.leak) hook('__leak', leakHookApi(p.staticLight.leak, () => frameGraph.setSplitView(SplitView.Leak)));
   hook('__fog', { ...p.post.hooks(), ...p.trace.hooks(frameGraph) });
+  hook('__cine', (name?: string, focalMm?: number) => {
+    if (name) {
+      if (!(name in CINE_CAMERAS)) throw new Error(`unknown cine camera ${name}; have ${Object.keys(CINE_CAMERAS).join(', ')}`);
+      p.cine.name = name;
+      applyCineCamera(p.host.camera, CINE_CAMERAS[name], focalMm);
+      p.post.motionBlur.settings.shutter = CINE_CAMERAS[name].shutterAngleDeg / 360;
+    }
+    const cine = CINE_CAMERAS[p.cine.name];
+    return { name: p.cine.name, label: cine.label, focalMm: focalMm ?? cine.focalMm, horizontalFovDeg: +horizontalFovDeg({ ...cine, focalMm: focalMm ?? cine.focalMm }).toFixed(2), verticalFovDeg: +p.host.camera.fov.toFixed(2), shutter: p.post.motionBlur.settings.shutter, stops: +relativeStops(cine).toFixed(2) };
+  });
   hook('__freeze', (t: number) => { p.dynamic?.update(t); state.frozen = true; return true; });
   installAuditHooks(p, state);
 }
@@ -365,6 +443,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   gi.rigidSurfels = url.flag('rigidSurfels', true);
   gi.setLeafTransmit(url.flag('giLeafTransmit', true));
   const sun = setupSun(gui, host, { envTexture: gi.envTexture, blueNoise: gi.blueNoiseTexture }, url);
+  if (url.flag('reflectionLab', false)) addReflectionFixture(host);
   const staticLight = new StaticLight(renderer, gi, scene, host.sun, url);
   await staticLight.unwrap();
   const dynamic = addMovers(host, url);
@@ -382,16 +461,27 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   const contactTree = await bootStage('Building the contact BVH', () => trace.buildTree(scene));
   await staticLight.prepare(frameGraph, { contactTree, interiorVolumes: host.interiorVolumes });
   const live = { on: url.flag('surfelGi', false) };
-  if (staticLight.probes && url.flag('probeSpecular', true)) {
+  const cachedReflections = trace.mode === 'cached'
+    ? installReflectionCache(renderer, gi, host, { contactTree, probes: staticLight.probes, trace, frameGraph, url })
+    : null;
+  if (staticLight.probes && url.flag('probeSpecular', true) && !cachedReflections) {
     const volume = staticLight.probes;
     frameGraph.setProbeRadiance((worldPosition, direction) => volume.irradianceAt(worldPosition, direction));
   }
   const giScale = () => (live.on ? 1 : (url.num('giScale') ?? HALF_GBUFFER));
   staticLight.setLiveChainServesReceivers(live.on);
   const lab = url.flag('lodLab', false) ? openLodLab(renderer, staticLight, camera, frameGraph) : null;
-  const p: Pipeline = { renderer, gi, host, url, frameGraph, staticLight, trace, post, sun, live, dynamic, world, stats, hud, giScale, lab };
+  const requestedCine = url.get('cine');
+  const cine = { name: requestedCine && requestedCine in CINE_CAMERAS ? requestedCine : DEFAULT_CINE_CAMERA };
+  if (requestedCine) {
+    applyCineCamera(host.camera, CINE_CAMERAS[cine.name]);
+    post.motionBlur.settings.shutter = CINE_CAMERAS[cine.name].shutterAngleDeg / 360;
+    console.log(`[cine] ${CINE_CAMERAS[cine.name].label}, ${horizontalFovDeg(CINE_CAMERAS[cine.name]).toFixed(1)}° horizontal`);
+  }
+  const p: Pipeline = { renderer, gi, host, url, frameGraph, staticLight, trace, post, sun, live, dynamic, world, stats, hud, giScale, lab, cine };
   gi.resize(renderer, giScale());
   bindLightingGui(gui, p, ui);
+  bindCineGui(gui, p);
   bindLeakGui(gui, p);
   host.bindGui?.(gui);
   post.bindGui(gui);

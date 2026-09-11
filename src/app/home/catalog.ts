@@ -52,7 +52,12 @@ export const SCENES: Entry[] = [
     description: 'В работе: средиземноморская деревня по концепту. Дома на террасах, колокольня, бухта и кафе на набережной. Превью обновляется по мере сборки.',
     href: '/?scene=midsee-village',
     open: 'Смотреть текущую сцену',
-    chips: withLodLab('midsee-village', ['front', 'side', 'rear', 'quay', 'roofs']),
+    chips: [
+      { label: 'ALEXA 35 · 32mm', href: '/?scene=midsee-village&cam=front&cine=alexa35-32' },
+      { label: 'анаморфот 2x', href: '/?scene=midsee-village&cam=front&cine=anamorphic-2x-40' },
+      { label: 'IMAX 65', href: '/?scene=midsee-village&cam=front&cine=imax65-50' },
+      ...withLodLab('midsee-village', ['front', 'side', 'rear', 'quay', 'roofs']),
+    ],
   },
   {
     title: 'Комната протечек',
@@ -143,4 +148,9 @@ export const FLAGS: { key: string; effect: string }[] = [
   { key: '?lodLab=1', effect: 'Лаба LOD: слева сцена, справа атлас с чартами по требуемому mip. Нужен адрес сцены: /?scene=corridor&cam=bench&lod=1&lodLab=1' },
   { key: '?lod=1', effect: 'LOD лайтмапы: GPU-пул страниц + рабочий атлас, собираемый под вид. ?lodAtlas= размер атласа, ?lodPage= страница, ?lodCopies= копий за кадр.' },
   { key: '?pipeline=legacy', effect: 'Старый конвейер с живыми сурфелями.' },
+  { key: '?look=0', effect: 'Отключить художественный слой целиком (папка Look в GUI).' },
+  { key: '?cine=', effect: 'Пресет реальной киношной камеры: alexa35-32, alexa-lf-40, venice2-24, raptor-50, anamorphic-2x-40, imax65-50. Сенсор и фокусное задают кадр, угол обтюратора — смаз. Папка Cine camera в GUI.' },
+  { key: '?exposureEV=', effect: 'Компенсация экспозиции поверх действующей E_camera(t), в стопах.' },
+  { key: '?indirectEV=', effect: 'Усиление рассеянного непрямого света у получателей, в стопах. Бейк не трогает.' },
+  { key: '?lookOutput=', effect: 'Output transform: neutral (по умолчанию), agx, linear для диагностики.' },
 ];

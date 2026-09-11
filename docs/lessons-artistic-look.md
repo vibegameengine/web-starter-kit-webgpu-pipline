@@ -144,6 +144,46 @@ adapting — 0.8469 on the first run against 0.5383 settled, and locking the ear
 the "baseline" 1.68× brighter than the frame it was supposed to reproduce. The script now
 polls until two readings agree within 0.2% before it calls anything E₀.
 
+## The route, in motion (§09)
+
+`node scripts/check-look-route.mjs`, village, animation running, the camera's own exposure
+profile left alone, 420 frames around the five poses, then a hard cut to the opposite side:
+
+- the meter adapts along the route without a jump: largest step 1.0% per 150 ms, E drifting
+  0.634 → 0.616 (neutral) and 0.610 → 0.595 (working look);
+- after the cut it climbs 0.615 → 2.650 over eight samples and settles (last step 0.7%);
+- no page errors in either case;
+- mid-route, with the meter free to fight back, the working look still leaves the frame
+  1.49x brighter in mean luminance than neutral.
+
+Shots in `shots/look/route/`.
+
+## Cine camera presets (asked for on the day, not from the document)
+
+`src/features/render-pipeline/cineCamera.ts` carries six real bodies and lenses with their
+published sensor sizes: ARRI ALEXA 35 (27.99 x 19.22) with a 32 mm Master Prime, ALEXA LF
+(36.70 x 25.54) with a 40 mm Signature, Sony VENICE 2 (35.9 x 24.0) at 24 mm and 172.8°,
+RED V-RAPTOR 8K VV (40.96 x 21.60) at 50 mm, an ALEXA Mini LF with a 2x Cooke anamorphic,
+and the IMAX MSM 9802 65 mm gate at 50 mm. A preset sets `camera.filmGauge` to the sensor
+width and calls `setFocalLength`, so the horizontal field is the sensor's and the vertical
+follows the window - which is what shooting a wider aspect on that sensor does. The 2x
+squeeze is the gauge doubled, which is exactly the horizontal field an anamorphic sees, and
+needs no projection-matrix surgery. The shutter angle goes to the motion blur (180° = 0.5,
+VENICE's 172.8° = 0.48).
+
+The photometric difference between presets is **reported, never applied**: ISO and T-stop
+against a reference of ISO 800 / T2.8 / 180° give the ALEXA 35 at T1.3 a +2.21 EV
+difference, the IMAX at ISO 500 −0.68 EV. A preset does not take the exposure away from the
+camera's own meter; a button in the GUI puts that stop difference into the Look if the
+person wants it. `?cine=<name>`, GUI folder Cine camera, hook `__cine(name, focalMm)`, and
+three chips on the village card.
+
+`node scripts/check-cine-cameras.mjs` switches all six in one page and checks each
+projection against `2·atan(sensor·squeeze / 2f)`: 47.24° for the ALEXA 35 at 32 mm, 73.59°
+for the VENICE at 24 mm, 76.76° for the anamorphic, 70.30° for IMAX against 44.55° for
+vista vision at the same 50 mm. One assertion in the first run was wrong and the code was
+right - the anamorphic is wider than IMAX because its lens is 40 mm, not 50.
+
 ## Not done
 
 - **Bake provenance and the stale flag** (§08): changing the sun or the environment does
@@ -158,5 +198,8 @@ polls until two readings agree within 0.2% before it calls anything E₀.
   both boot, and the village is the scene the document's A/B images show.
 - **Frame cost is not measured.** §09 wants baseline / neutral look / working look at 4K
   with p50/p95/p99. The look adds ALU in the existing composite and no new pass, but that
-  is an argument, not a measurement.
+  is an argument, not a measurement. The user stopped this one on 2026-09-11: four agents
+  were driving their own browsers on this machine, so a millisecond measured here would be
+  theirs as much as ours. `scripts/check-look-route.mjs` therefore reports no frame times
+  at all - it walks the route and asks only what the light does.
 - Water and foliage controls (§05's last rows) are untouched.
