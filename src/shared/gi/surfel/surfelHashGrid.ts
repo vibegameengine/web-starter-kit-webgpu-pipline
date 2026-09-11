@@ -35,6 +35,7 @@ import {
   atomicStore,
 } from 'three/tsl';
 import { SurfelStruct, type SurfelPool } from './surfelPool';
+import { giKnobs } from './knobs';
 
 import {
   CASCADES,
@@ -132,9 +133,12 @@ export const get_surfel_grid_box_min_max = Fn(([pRel]: [THREE.Node]) => {
   return result;
 });
 
+const CELL_DIAMETER = giKnobs.surfelCellDiameter() || SURFEL_GRID_CELL_DIAMETER;
+const BASE_RADIUS = giKnobs.surfelBaseRadius() || SURFEL_BASE_RADIUS;
+
 // Helper: Position -> Integer Grid Coordinate
 export const surfel_pos_to_grid_coord = Fn(([pos]: [THREE.Node]) => {
-  return floor(pos.div(SURFEL_GRID_CELL_DIAMETER)).toIVec3();
+  return floor(pos.div(CELL_DIAMETER)).toIVec3();
 });
 
 // Helper: Grid Coordinate -> Cascade Level (float)
@@ -166,7 +170,7 @@ export const surfel_grid_coord_center = Fn(
     // We convert uvec3 to vec3 for float math
     const gridPos = coord.xyz.toVec3().add(0.5).sub(float(SURFEL_CS).div(2.0));
 
-    const posInCascade = gridPos.mul(SURFEL_GRID_CELL_DIAMETER);
+    const posInCascade = gridPos.mul(CELL_DIAMETER);
 
     // We compute the cascade scale factor (2^cascade)
     const cascadeScale = float(uint(1).shiftLeft(coord.w));
@@ -203,11 +207,11 @@ export const surfel_grid_coord_to_hash = Fn(([coord]: [THREE.Node]) => {
 export const surfel_radius_for_pos = Fn(
   ([pos, camPos]: [THREE.Node, THREE.Node]) => {
     const dist = length(pos.sub(camPos));
-    const cascadeRadius = float(SURFEL_GRID_CELL_DIAMETER)
+    const cascadeRadius = float(CELL_DIAMETER)
       .mul(SURFEL_CS)
       .mul(0.5); // like SURFEL_GRID_CASCADE_RADIUS
     // return 0.1;
-    return float(SURFEL_BASE_RADIUS).mul(
+    return float(BASE_RADIUS).mul(
       max(float(1.0), dist.div(cascadeRadius)),
     );
   },

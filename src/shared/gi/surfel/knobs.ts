@@ -78,6 +78,15 @@ export const giKnobs = {
   /** @important `?bakeHidden=1` marks texels whose centre a parity ray calls inside a closed body; see filterLinks. */
   bakeHiddenTexels: () => flag('bakeHidden', false),
 
+  /* @important The hash grid cell and the surfel radius are lengths in metres, so the cache has a
+     size of its own and a scene built at a different one does not fit it. Design section 07's A3 is
+     the test: the sealed room at 0.001 reads 0.047 of the sunlit ground inside a closed box. Scaling
+     both with the room was the obvious explanation and it is wrong - normalised, the same room reads
+     0.055, slightly worse. These stay as the ablation that ruled the cache out; whatever is still
+     scale-bound is unnamed. */
+  surfelCellDiameter: () => num('surfelCell', 0),
+  surfelBaseRadius: () => num('surfelRadius', 0),
+
   /** Base surfel pool capacity, before any growth. */
   surfelBase: () => num('surfels', 0),
 

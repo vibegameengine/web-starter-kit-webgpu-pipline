@@ -104,8 +104,11 @@ started.
 
 **A3 is red and stays red.** At `?scale=0.001` the sealed interior reads 0.047 against 0.2503 for the
 sunlit ground - 18.8 %, against the script's own tolerance of 0.00025. The spawn offset was the
-dominant term and is fixed; what remains is scale-bound in the cache itself. Do not read the three
-green commands as "the acceptance is green".
+dominant term and is fixed. The obvious explanation for the rest was the surfel cache, whose hash cell
+and radius are lengths in metres, and that explanation is **wrong**: `?surfelCell=0.0002
+&surfelRadius=0.00024` scales both with the room and the same interior reads 0.055, slightly worse.
+Whatever is still scale-bound is unnamed; the knobs stay as the ablation that ruled the cache out.
+Do not read the three green commands as "the acceptance is green".
 
 ## What a harsh critic found afterwards
 
