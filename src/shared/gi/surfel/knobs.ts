@@ -54,6 +54,17 @@ export const giKnobs = {
   /** Triangle budget override, so budget behaviour can be exercised on a small scene. */
   bvhBudget: () => num('bvhBudget', 0),
 
+  /* @important Weight below which a reused surfel was handed over without a visibility test. The
+     weights are normalised afterwards, so a single untested donor at 0.01 carrying 50 becomes the
+     whole answer: the threshold bounded nothing. `?donorGate=0.02` restores it as the ablation.
+     Design section 04, source fragment C1. */
+  donorVisibilityGate: () => num('donorGate', 0),
+
+  /* @important The bake traces the segment from a hit to each surfel it reuses, instead of trusting
+     the radial-depth moments. Two surfaces sharing a hash cell are what the moments cannot separate,
+     and the weights are normalised afterwards. `?bakeExactReuse=0` is the ablation. Design section 04. */
+  exactBakeReuse: () => flag('bakeExactReuse', false),
+
   /** Base surfel pool capacity, before any growth. */
   surfelBase: () => num('surfels', 0),
 

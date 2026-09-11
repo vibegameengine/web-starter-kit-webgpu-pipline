@@ -1380,6 +1380,7 @@ export class SurfelGI {
     if (seeded === 0) return null;
 
     this.setBaseSampleCount(raysPerSurfel);
+    this.integrate.setExactReuse(giKnobs.exactBakeReuse());
 
     // A fixed viewpoint at the centre of the static world. Nothing is rendered from
     // it — it exists because the hash grid and the bounce lookup are parameterised
@@ -1435,6 +1436,7 @@ export class SurfelGI {
     }
     await lm.writeAtlas(renderer, gbuffer, { denoise, dilate, planeEpsilon, denoiseIgnoresSurface, useLinks, onStage });
     const stats = await lm.readStats(renderer);
+    this.integrate.setExactReuse(false);
     this.setBaseSampleCount(this.runtimeSampleCount);
 
     // Pin the atlas, so the lifecycle can be left running for everything that is not in

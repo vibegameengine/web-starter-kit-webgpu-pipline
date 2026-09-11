@@ -4,6 +4,7 @@ import * as THREE from 'three/webgpu';
 import { storage, uniform, wgslFn, wgsl, sampler, texture } from 'three/tsl';
 import type { SurfelPool } from './surfelPool';
 import type { SceneBVHBundle } from './sceneBvh';
+import { bvhAnyHitWithin } from '../contact/boundedTrace.ts';
 import { SurfelMoments, SurfelStruct } from './surfelPool';
 import {
   bvhIntersectFirstHit,
@@ -70,6 +71,7 @@ import { giKnobs } from './knobs';
 const MAX_SURFELS_PER_CELL_LOOKUP = 32;
 
 export type SurfelIntegratePass = {
+  setExactReuse: (on: boolean) => void;
   invalidate: () => void;
   /**
    * The baked irradiance atlas, or null to read every hit from the surfel cache.
@@ -649,6 +651,7 @@ export function createSurfelIntegratePass(
    * integrator to move a level selection by a fraction of a mip. `?giLod=` overrides it.
    */
   const U_DIFFUSE_LOD_SCALE = uniform(giKnobs.diffuseLodScale());
+  const U_EXACT_REUSE = uniform(0);
   /**
    * Ablation switch. With it off, movers are still in the scene, still rastered, still
    * spawn surfels and still take pool slots — only the rays stop seeing them. That is
@@ -817,7 +820,8 @@ export function createSurfelIntegratePass(
         grid_origin: vec3f,
         readOffset: u32,
         occParams: vec4f,
-        samplePhase: f32
+        samplePhase: f32,
+        exactVisibility: f32
       ) -> vec3f {
         // Position relative to camera, matches grid build
         let pRel = pt_ws - grid_origin;
@@ -888,12 +892,9 @@ export function createSurfelIntegratePass(
           }
 
 
-          // ----------------------------------------------------------------
-          // NEW: MSM visibility gate (0..1)
-          // ----------------------------------------------------------------
-          // Optional perf guard: only run MSM if the geometric weight matters
-          // (tune threshold: 0.01–0.05 tends to be safe for “secondary bounce”)
-          if (weight > 0.02) {
+          // Every admitted donor is tested. The weights are normalised below, so one
+          // untested candidate is not a small error - it is the whole answer.
+          if (weight > ${giKnobs.donorVisibilityGate().toFixed(4)}) {
             let vis = surfel_radial_occlusion_rw(
               u32(sid),
               dirWS,
@@ -903,6 +904,21 @@ export function createSurfelIntegratePass(
             );
             weight *= vis;
             if (weight <= 0.0) { continue; }
+          }
+
+          if (exactVisibility > 0.5) {
+            // The radial-depth estimate is a set of moments; between two surfaces that
+            // share a cell it is a guess, and the weights are normalised afterwards, so
+            // one wrong donor is not a small error. Trace the segment instead.
+            var link: Ray;
+            let lift = max(1e-4, dist * 0.01);
+            link.origin = pt_ws + normal_ws * lift;
+            let toDonor = (sPos + sNor * lift) - link.origin;
+            let span = length(toDonor);
+            if (span > 1e-6) {
+              link.direction = toDonor / span;
+              if (bvhAnyHitWithin(link, span * 0.99)) { continue; }
+            }
           }
 
           let readSid = u32(sid) + readOffset;
@@ -962,6 +978,7 @@ export function createSurfelIntegratePass(
           dynTrace: f32,
           dynBounds: vec4f,
           diffuseLodScale: f32,
+          exactReuse: f32,
           medium: vec4f,
 ${bakedAtlas ? `          bakeUvTex: texture_2d<f32>,
           atlasTex: texture_2d<f32>,
@@ -1293,8 +1310,8 @@ ${bakedAtlas ? `                var fromAtlas = false;
                     gi = textureSampleLevel(atlasTex, atlasSampler, atlasUv, 0.0).rgb * atlasIntensity;
                   }
                 }
-                if (!fromAtlas) { gi = lookupSurfelGI(hitPoint, hitNormal, camPos, gridOrigin, readOffset, occParams, lightU); }
-` : `                gi = lookupSurfelGI(hitPoint, hitNormal, camPos, gridOrigin, readOffset, occParams, lightU);
+                if (!fromAtlas) { gi = lookupSurfelGI(hitPoint, hitNormal, camPos, gridOrigin, readOffset, occParams, lightU, exactReuse); }
+` : `                gi = lookupSurfelGI(hitPoint, hitNormal, camPos, gridOrigin, readOffset, occParams, lightU, exactReuse);
 `}
                 bounceLi += gi * hitAlbedo * giFromIndirect;
               } else {
@@ -1428,6 +1445,7 @@ ${bakedAtlas ? `                var fromAtlas = false;
 
           // cache lookup + color
           lookupSurfelGI,
+          bvhAnyHitWithin,
           gridHelpers,
           colorHelpers,
           msmeHelpers,
@@ -1471,6 +1489,7 @@ ${bakedAtlas ? `                var fromAtlas = false;
         lightSamples: U_GI_LIGHT_SAMPLES,
         emissiveBase: U_GI_EMISSIVE_BASE,
         emissiveScale: U_GI_EMISSIVE_SCALE,
+        exactReuse: U_EXACT_REUSE,
         medium: U_GI_MEDIUM,
         // Only bound when the atlas exists; without it the kernel has no such
         // parameters and every hit walks the surfel cache.
@@ -1513,6 +1532,7 @@ ${bakedAtlas ? `                var fromAtlas = false;
       computeNode?.dispose();
       computeNode = null;
     },
+    setExactReuse: (on: boolean) => { U_EXACT_REUSE.value = on ? 1 : 0; },
     setBaseSampleCount: (count: number) => {
       U_BASE_SAMPLE_COUNT.value = Math.max(1, Math.floor(count));
     },

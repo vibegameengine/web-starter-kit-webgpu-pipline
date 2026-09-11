@@ -84,8 +84,8 @@ export function createLeakRoomScene(renderer: THREE.WebGPURenderer): LeakRoomSce
   const shell = matte(0x8f8f8f);
   const half = INNER / 2 + WALL / 2;
   scene.add(slab('wall-x-minus', new THREE.Vector3(WALL, HEIGHT, OUTER), new THREE.Vector3(-half, HEIGHT / 2, 0), shell));
-  scene.add(slab('wall-z-minus', new THREE.Vector3(INNER, HEIGHT, WALL), new THREE.Vector3(0, HEIGHT / 2, -half), shell));
-  scene.add(slab('wall-z-plus', new THREE.Vector3(INNER, HEIGHT, WALL), new THREE.Vector3(0, HEIGHT / 2, half), shell));
+  scene.add(slab('wall-z-minus', new THREE.Vector3(OUTER, HEIGHT, WALL), new THREE.Vector3(0, HEIGHT / 2, -half), shell));
+  scene.add(slab('wall-z-plus', new THREE.Vector3(OUTER, HEIGHT, WALL), new THREE.Vector3(0, HEIGHT / 2, half), shell));
   scene.add(slab('ceiling', new THREE.Vector3(OUTER, WALL, OUTER), new THREE.Vector3(0, HEIGHT + WALL / 2, 0), shell));
   scene.add(slab('wall-x-plus', new THREE.Vector3(WALL, HEIGHT, OUTER), new THREE.Vector3(half, gapMetres + HEIGHT / 2, 0), shell));
 
