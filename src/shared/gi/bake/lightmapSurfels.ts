@@ -6,6 +6,9 @@ import {
   Loop,
   atomicAdd,
   atomicMax,
+  bitAnd,
+  shiftLeft,
+  uint,
   float,
   instanceIndex,
   int,
@@ -92,6 +95,8 @@ export function createLightmapSurfels(pool: SurfelPool, size: number, height = s
   /** How far off a texel's own plane a neighbour may sit and still be averaged in. */
   const U_PLANE_EPS = uniform(0.02);
   const U_SURFACE_TEST = uniform(1);
+  const U_USE_LINKS = uniform(0);
+  const linkAttr = new THREE.StorageBufferAttribute(new Uint32Array(texelCount), 1);
 
   let seedNode: THREE.ComputeNode | null = null;
   let writeNode: THREE.ComputeNode | null = null;
@@ -217,13 +222,13 @@ export function createLightmapSurfels(pool: SurfelPool, size: number, height = s
   async function writeAtlas(
     renderer: THREE.WebGPURenderer,
     gbuffer: LightmapGBuffer,
-    options: { denoise?: number; dilate?: number; planeEpsilon?: number; denoiseIgnoresSurface?: boolean; onStage?: (name: string, pixels: Float32Array) => void } = {},
+    options: { denoise?: number; dilate?: number; planeEpsilon?: number; denoiseIgnoresSurface?: boolean; useLinks?: boolean; onStage?: (name: string, pixels: Float32Array) => void } = {},
   ): Promise<boolean> {
     const momentsAttr = pool.getMomentsAttr();
     const surfelAttr = pool.getSurfelAttr();
     if (!momentsAttr || !surfelAttr) return false;
 
-    const { denoise = 2, dilate = 4, planeEpsilon = 0.02, denoiseIgnoresSurface = false, onStage } = options;
+    const { denoise = 2, dilate = 4, planeEpsilon = 0.02, denoiseIgnoresSurface = false, useLinks = false, onStage } = options;
     const capacity = surfelAttr.count;
 
     if (!writeNode) {
@@ -234,6 +239,7 @@ export function createLightmapSurfels(pool: SurfelPool, size: number, height = s
         'readOnly',
       );
       const atlas = storage(atlasAttr, 'vec4', texelCount * 2);
+      const links = storage(linkAttr, 'uint', texelCount).setAccess('readOnly');
       const positionTex = texture(gbuffer.position);
       const normalTex = texture(gbuffer.normal);
 
@@ -280,6 +286,7 @@ export function createLightmapSurfels(pool: SurfelPool, size: number, height = s
         If(self.w.lessThan(0.75), () => {
           atlas.element(tid.add(int(U_DST))).assign(self);
         }).Else(() => {
+          const linkMask = links.element(tid);
           const uv = texelUv(x, y);
           const p0 = positionTex.sample(uv).xyz;
           const n0 = normalTex.sample(uv).xyz.normalize();
@@ -292,12 +299,15 @@ export function createLightmapSurfels(pool: SurfelPool, size: number, height = s
             const dy = i.div(int(3)).sub(int(1));
             const nx = x.add(dx);
             const ny = y.add(dy);
+            const bit = i.lessThan(int(4)).select(i, i.sub(int(1)));
+            const linked = bitAnd(linkMask, shiftLeft(uint(1), uint(bit))).notEqual(uint(0));
 
             If(
               dx
                 .equal(int(0))
                 .and(dy.equal(int(0)))
                 .not()
+                .and(linked.or(U_USE_LINKS.lessThan(0.5)))
                 .and(nx.greaterThanEqual(int(0)))
                 .and(nx.lessThan(int(size)))
                 .and(ny.greaterThanEqual(int(0)))
@@ -399,6 +409,7 @@ export function createLightmapSurfels(pool: SurfelPool, size: number, height = s
     U_READ_OFFSET.value = pool.getOffsets().readOffset;
     U_PLANE_EPS.value = planeEpsilon;
     U_SURFACE_TEST.value = denoiseIgnoresSurface ? 0 : 1;
+    U_USE_LINKS.value = useLinks ? 1 : 0;
 
     // Ping-pong through the two halves; `half` always names the one holding the
     // current result, which is what readStats and the blit must both read.
@@ -487,5 +498,5 @@ export function createLightmapSurfels(pool: SurfelPool, size: number, height = s
     return seeded;
   }
 
-  return { lightmap, seed, writeAtlas, readStats, countSeeded, readHalf, texelSurfel: texelSurfelAttr };
+  return { lightmap, seed, writeAtlas, readStats, countSeeded, readHalf, links: linkAttr, texelSurfel: texelSurfelAttr };
 }

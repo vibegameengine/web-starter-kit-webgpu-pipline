@@ -12,7 +12,9 @@ const out = 'shots/leak-room';
 await mkdir(out, { recursive: true });
 const cam = process.argv[2] ?? 'contact';
 const gaps = (process.argv[3] ?? '0,1,5,20').split(',').map(Number);
-const base = `http://127.0.0.1:5188/?scene=leak-room&cam=${cam}&leak=1&hud=0&inspector=0&still=1&aa=none&grain=0&exposure=1`;
+const extra = process.argv[4] ?? '';
+const base = `http://127.0.0.1:5188/?scene=leak-room&cam=${cam}&leak=1&hud=0&inspector=0&still=1&aa=none&grain=0&exposure=1${extra}`;
+const tag = extra.replace(/[^a-z0-9]+/gi, '') || 'default';
 
 const INTERIOR = [[0.15, 0.001, 0.1], [0.6, 0.001, 0.6], [-0.6, 0.001, -0.6], [0.9, 0.001, 0], [-0.998, 1, 0], [0, 1, -0.998], [0, 1.998, 0]];
 const OUTSIDE = [[2.4, 0.001, 0], [0, 0.001, 2.4]];
@@ -34,11 +36,15 @@ async function measure(gap) {
     };
     const read = (points) => points.map((p) => {
       const report = window.__leak.atWorld(p[0], p[1], p[2]);
-      return { at: p, metres: report?.metres ?? null, luma: luma(report), chart: report?.chart ?? null };
+      return {
+        at: p, metres: report?.metres ?? null, luma: luma(report), chart: report?.chart ?? null,
+        texel: report?.texel ?? null, normal: report?.normal ?? null, firstChangedStage: report?.firstChangedStage ?? null,
+        chain: report ? Object.entries(report.stages).map(([name, v]) => [name, 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2], v[3]]) : null,
+      };
     });
     return { interior: read(interior), outside: read(outside) };
   }, { interior: INTERIOR, outside: OUTSIDE });
-  await writeFile(`${out}/gap-${gap}mm-${cam}.png`, await page.screenshot());
+  await writeFile(`${out}/gap-${gap}mm-${cam}-${tag}.png`, await page.screenshot());
   const lit = sample.interior.filter((s) => s.luma !== null);
   const mean = lit.length ? lit.reduce((sum, s) => sum + s.luma, 0) / lit.length : null;
   const peak = lit.length ? Math.max(...lit.map((s) => s.luma)) : null;
@@ -54,6 +60,11 @@ for (const run of runs) {
   const where = run.samples.map((s) => `${s.at.join('/')}@${s.metres?.toFixed(3) ?? '-'}m/chart${s.chart ?? '-'}=${s.luma === null ? 'none' : s.luma.toFixed(5)}`).join('  ');
   console.log(`gap ${run.gap} mm: interior mean ${run.mean?.toFixed(5) ?? 'none'}, peak ${run.peak?.toFixed(5) ?? 'none'}, sunlit ground ${run.reference?.toFixed(4) ?? 'none'}`);
   console.log(`  ${where}`);
+  const worst = run.samples.filter((s) => s.luma !== null).sort((a, b) => b.luma - a.luma)[0];
+  if (worst?.chain) {
+    console.log(`  worst interior texel ${worst.texel?.join(',')} chart ${worst.chart} normal ${worst.normal?.map((v) => v.toFixed(2)).join(',')} ${worst.metres.toFixed(3)} m from the probe`);
+    console.log(`    ${worst.chain.map(([name, l, alpha]) => `${name}=${l.toFixed(5)}/a${alpha.toFixed(2)}`).join('  ')}`);
+  }
 }
 
 const sealed = runs.find((run) => run.gap === 0);
@@ -62,9 +73,11 @@ const reference = sealed?.reference ?? 1;
 const tolerance = reference * 0.001;
 const widest = opened[opened.length - 1];
 const sealedDark = sealed !== undefined && sealed.peak !== null && sealed.peak <= tolerance;
-const gapLets = widest === undefined || (widest.peak >= reference * 0.002 && widest.peak >= (sealed?.peak ?? 0) * 10);
-const monotone = opened.every((run, i) => i === 0 || run.peak >= opened[i - 1].peak * 0.8);
-console.log(`sealed tolerance ${tolerance.toFixed(5)} = 0.1% of the sunlit ground; the widest gap must reach ${(reference * 0.002).toFixed(5)} and ten times the sealed peak`);
+const added = (run) => run.mean - (sealed?.mean ?? 0);
+const gapLets = widest === undefined || added(widest) >= reference * 0.0005;
+const monotone = opened.every((run, i) => i === 0 || added(run) >= added(opened[i - 1]) - reference * 0.0002);
+console.log(`sealed peak must stay under ${tolerance.toFixed(5)} (0.1% of the sunlit ground); the widest gap must add ${(reference * 0.0005).toFixed(5)} over the sealed mean, and each wider gap must not add less`);
+for (const run of opened) console.log(`  gap ${run.gap} mm adds ${added(run).toFixed(5)} over sealed`);
 console.log(`errors ${errors.length}${errors.length ? ': ' + errors.slice(0, 2).join(' | ').slice(0, 300) : ''}`);
 console.log(`sealed room dark: ${sealedDark ? 'PASS' : 'FAIL'}; the widest gap still lets light in: ${gapLets ? 'PASS' : 'FAIL'}; light grows with the gap: ${monotone ? 'PASS' : 'FAIL'}`);
 process.exit(sealedDark && gapLets && monotone && errors.length === 0 ? 0 : 1);

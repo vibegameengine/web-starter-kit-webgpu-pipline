@@ -4,6 +4,8 @@ import { Layer } from '../world/index.ts';
 import { createSurfelImmortaliser } from './immortalise.ts';
 import { createCacheAtlas } from './cacheAtlas.ts';
 import { createLightmapSurfels } from './bake/lightmapSurfels.ts';
+import { createFilterLinks } from './bake/filterLinks.ts';
+import type { ContactBVHBundle } from './contact/contactBvh.ts';
 import {
   createGeometrySeeder,
   sampleStaticSurfaces,
@@ -1174,6 +1176,7 @@ export class SurfelGI {
   }
 
   private geometrySeeder: ReturnType<typeof createGeometrySeeder> | null = null;
+  private lightmapFilterLinks: ReturnType<typeof createFilterLinks> | null = null;
 
   /**
    * Builds the candidate set the hole fill tests for coverage.
@@ -1323,6 +1326,7 @@ export class SurfelGI {
       /** Keep webgiya's lifecycle running beside the baked atlas for moving receivers. */
       dynamicReceivers?: boolean;
       denoiseIgnoresSurface?: boolean;
+      filterLinks?: ContactBVHBundle | null;
       height?: number;
       freshSurfels?: boolean;
       onStage?: (name: string, pixels: Float32Array) => void;
@@ -1345,6 +1349,7 @@ export class SurfelGI {
       denoise,
       dilate,
       denoiseIgnoresSurface,
+      filterLinks,
       height = size,
       freshSurfels,
       onStage,
@@ -1416,7 +1421,16 @@ export class SurfelGI {
     // small scene or reject valid neighbours in a large one.
     const planeEpsilon =
       bounds.getSize(new THREE.Vector3()).length() * 0.0025;
-    await lm.writeAtlas(renderer, gbuffer, { denoise, dilate, planeEpsilon, denoiseIgnoresSurface, onStage });
+    let useLinks = false;
+    if (filterLinks) {
+      if (!this.lightmapFilterLinks) this.lightmapFilterLinks = createFilterLinks(size, lm.links);
+      const support = bounds.getSize(new THREE.Vector3()).length() * 0.05;
+      this.lightmapFilterLinks.run(renderer, gbuffer, filterLinks, { supportMetres: support });
+      const stats = await this.lightmapFilterLinks.readStats(renderer);
+      console.log(`[lightmap] filter links: ${stats.links} allowed, ${stats.blocked} blocked across ${stats.texels} texels, support ${support.toFixed(2)} m`);
+      useLinks = true;
+    }
+    await lm.writeAtlas(renderer, gbuffer, { denoise, dilate, planeEpsilon, denoiseIgnoresSurface, useLinks, onStage });
     const stats = await lm.readStats(renderer);
     this.setBaseSampleCount(this.runtimeSampleCount);
 

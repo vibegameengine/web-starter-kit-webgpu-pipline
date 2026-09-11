@@ -91,7 +91,7 @@ export class StaticLight {
     this.ready = false;
     try {
       frameGraph.setGiTextures(null, null);
-      const atlas = await this.prepareAtlas(frameGraph, options.forceBake === true);
+      const atlas = await this.prepareAtlas(frameGraph, options.forceBake === true, options.contactTree ?? null);
       this.atlasPixels = atlas.pixels;
       this.enableLod(atlas.pixels);
       this.atlasIntensity.value = this.atlasParams.intensity;
@@ -104,7 +104,7 @@ export class StaticLight {
     }
   }
 
-  private async prepareAtlas(frameGraph: FrameGraph, forceBake: boolean): Promise<AtlasResult> {
+  private async prepareAtlas(frameGraph: FrameGraph, forceBake: boolean, contactTree: ContactBVHBundle | null): Promise<AtlasResult> {
     const cache = this.bakeCache;
     Object.assign(cache, { source: 'none', storage: 'none', saved: false, error: '', probes: 'none' });
     if (this.leak) console.log('[leak] stage capture on: this bake is fresh and is neither read from nor written to the saved cache');
@@ -126,7 +126,7 @@ export class StaticLight {
         console.warn(`[bake-cache] cannot reuse saved data: ${error}`);
       }
     }
-    const baked = await this.bakeAtlas(frameGraph);
+    const baked = await this.bakeAtlas(frameGraph, contactTree);
     Object.assign(cache, { source: 'baked', storage: 'computed' });
     return { ...baked, fresh: true };
   }
@@ -166,7 +166,7 @@ export class StaticLight {
     return this.layout?.atlasHeight ?? this.atlasSize;
   }
 
-  private async bakeAtlas(frameGraph: FrameGraph): Promise<{ pixels: Float32Array; surfels: FrozenSurfelData }> {
+  private async bakeAtlas(frameGraph: FrameGraph, contactTree: ContactBVHBundle | null): Promise<{ pixels: Float32Array; surfels: FrozenSurfelData }> {
     if (!this.layout) throw new Error('lightmap: unwrap before baking');
     const size = this.atlasSize;
     const pages = Math.max(1, this.layout.pages);
@@ -194,6 +194,7 @@ export class StaticLight {
         dilate: 0,
         dynamicReceivers: true,
         denoiseIgnoresSurface: this.url.get('leakMutation') === 'denoiseAll',
+        filterLinks: this.url.flag('filterLinks', true) ? contactTree : null,
         onStage: this.leak ? (name, pixels) => this.leak!.recordPage(name, page, pixels) : undefined,
         onProgress: (fraction, iteration) => bootNote(`Baking lightmap page ${page + 1}/${pages} ${(fraction * 100).toFixed(0)}% · pass ${iteration}`),
       });
