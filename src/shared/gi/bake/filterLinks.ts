@@ -9,9 +9,11 @@ import {
   intersectsTriangle,
   rayStruct,
 } from '../bvh/webgpu/index.js';
-import { bvhAnyHitWithin } from '../contact/boundedTrace.ts';
+import { bvhAnyHitWithin, bvhCountHits } from '../contact/boundedTrace.ts';
 import type { ContactBVHBundle } from '../contact/contactBvh.ts';
 import type { LightmapGBuffer } from './lightmapGBuffer.ts';
+
+export const HIDDEN_BIT = 256;
 
 /* @important Which neighbours a lightmap texel may be filtered with, decided by geometry once and
    not by brightness. The denoise used to accept a neighbour on normal and plane distance alone, and
@@ -24,18 +26,25 @@ const KERNEL = /* wgsl */ `
     normalTex: texture_2d<f32>,
     size: f32,
     supportScale: f32,
-    normalCos: f32
+    normalCos: f32,
+    hiddenTest: f32
   ) -> void {
     let side = u32( size );
     let i = instanceIndex;
     if ( i >= side * side ) { return; }
     let px = vec2i( i32( i % side ), i32( i / side ) );
-    let self = textureLoad( positionTex, px, 0 );
-    if ( self.w < 0.5 ) { links.value[ i ] = 0u; return; }
+    let centre = textureLoad( positionTex, px, 0 );
+    if ( centre.w < 0.5 ) { links.value[ i ] = 0u; return; }
 
-    let p0 = self.xyz;
+    let p0 = centre.xyz;
     let n0 = normalize( textureLoad( normalTex, px, 0 ).xyz );
     var mask = 0u;
+    if ( hiddenTest > 0.5 ) {
+      var parity: Ray;
+      parity.origin = p0 + n0 * 1e-4;
+      parity.direction = normalize( vec3f( 0.3612, 0.8677, 0.3413 ) );
+      if ( ( bvhCountHits( parity ) & 1u ) == 1u ) { links.value[ i ] = 256u; return; }
+    }
     var bit = 0u;
     for ( var dy = -1; dy <= 1; dy = dy + 1 ) {
       for ( var dx = -1; dx <= 1; dx = dx + 1 ) {
@@ -76,7 +85,7 @@ function buildKernel(
   texelCount: number,
   gbuffer: LightmapGBuffer,
   bvh: ContactBVHBundle,
-  uniforms: { size: unknown; support: unknown; normalCos: unknown },
+  uniforms: { size: unknown; support: unknown; normalCos: unknown; hiddenTest: unknown },
 ): THREE.ComputeNode {
   const fn = wgslFn(KERNEL, [
     rayStruct,
@@ -86,6 +95,7 @@ function buildKernel(
     intersectsBounds,
     intersectsTriangle,
     bvhAnyHitWithin,
+    bvhCountHits,
     bvh.bvhNode,
     bvh.positionNode,
     bvh.indexNode,
@@ -97,6 +107,7 @@ function buildKernel(
     size: uniforms.size,
     supportScale: uniforms.support,
     normalCos: uniforms.normalCos,
+    hiddenTest: uniforms.hiddenTest,
   })
     .compute(texelCount)
     .setName('Lightmap filter links');
@@ -106,13 +117,15 @@ async function readLinkStats(renderer: THREE.WebGPURenderer, attr: THREE.Storage
   const data = new Uint32Array(await renderer.getArrayBufferAsync(attr));
   let texels = 0;
   let links = 0;
+  let hidden = 0;
   for (let i = 0; i < texelCount; i++) {
     const mask = data[i];
+    if (mask & HIDDEN_BIT) { hidden++; continue; }
     if (mask === 0) continue;
     texels++;
     for (let bit = 0; bit < 8; bit++) if (mask & (1 << bit)) links++;
   }
-  return { texels, links, blocked: texels * 8 - links };
+  return { texels, links, hidden, blocked: texels * 8 - links };
 }
 
 export function createFilterLinks(size: number, attr: THREE.StorageBufferAttribute) {
@@ -120,17 +133,19 @@ export function createFilterLinks(size: number, attr: THREE.StorageBufferAttribu
   const uSize = uniform(size);
   const uSupport = uniform(1);
   const uNormalCos = uniform(0.9);
+  const uHiddenTest = uniform(1);
   let kernel: THREE.ComputeNode | null = null;
 
   function run(
     renderer: THREE.WebGPURenderer,
     gbuffer: LightmapGBuffer,
     bvh: ContactBVHBundle,
-    options: { supportMetres?: number; normalCos?: number } = {},
+    options: { supportMetres?: number; normalCos?: number; hiddenTest?: boolean } = {},
   ): void {
     uSupport.value = options.supportMetres ?? 1;
     uNormalCos.value = options.normalCos ?? 0.9;
-    if (!kernel) kernel = buildKernel(attr, texelCount, gbuffer, bvh, { size: uSize, support: uSupport, normalCos: uNormalCos });
+    uHiddenTest.value = options.hiddenTest === false ? 0 : 1;
+    if (!kernel) kernel = buildKernel(attr, texelCount, gbuffer, bvh, { size: uSize, support: uSupport, normalCos: uNormalCos, hiddenTest: uHiddenTest });
     renderer.compute(kernel);
   }
 

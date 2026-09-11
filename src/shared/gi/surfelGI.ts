@@ -1427,7 +1427,7 @@ export class SurfelGI {
       const support = bounds.getSize(new THREE.Vector3()).length() * 0.05;
       this.lightmapFilterLinks.run(renderer, gbuffer, filterLinks, { supportMetres: support });
       const stats = await this.lightmapFilterLinks.readStats(renderer);
-      console.log(`[lightmap] filter links: ${stats.links} allowed, ${stats.blocked} blocked across ${stats.texels} texels, support ${support.toFixed(2)} m`);
+      console.log(`[lightmap] filter links: ${stats.links} allowed, ${stats.blocked} blocked across ${stats.texels} texels, ${stats.hidden} hidden inside solids, support ${support.toFixed(2)} m`);
       useLinks = true;
     }
     await lm.writeAtlas(renderer, gbuffer, { denoise, dilate, planeEpsilon, denoiseIgnoresSurface, useLinks, onStage });
