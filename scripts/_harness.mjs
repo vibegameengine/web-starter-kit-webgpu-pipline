@@ -12,8 +12,9 @@ export function watchPipelineError(page) {
 
 export async function bootOrFail(page, timeout = 300000) {
   const failed = watchPipelineError(page);
-  await Promise.race([failed, page.waitForFunction(
-    () => window.__audit && document.querySelector('#loading-overlay')?.hidden, null, { timeout },
-  )]);
+  await Promise.race([failed, page.waitForFunction(() => {
+    const overlay = document.querySelector('#loading-overlay');
+    return Boolean(window.__audit) && (!overlay || overlay.hidden || !overlay.offsetParent);
+  }, null, { timeout })]);
   return failed;
 }

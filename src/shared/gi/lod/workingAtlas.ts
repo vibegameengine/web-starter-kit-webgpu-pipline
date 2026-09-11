@@ -30,7 +30,7 @@ export class WorkingAtlas {
   private readonly columns: number;
   private readonly rows: number;
   private readonly resident = new Map<number, Residency>();
-  private readonly sourceAtlasSize = uniform(1);
+  private readonly sourceAtlasSize = uniform(new THREE.Vector2(1, 1));
   private frame = 0;
   private tableDirty = true;
   private rootCells = 0;
@@ -41,14 +41,14 @@ export class WorkingAtlas {
     private readonly renderer: THREE.WebGPURenderer,
     private readonly pool: PagePool,
     private readonly chartOrigins: { x: number; y: number; width: number; height: number }[],
-    sourceAtlasSize: number,
+    sourceAtlasSize: { width: number; height: number },
     size: number,
   ) {
     this.size = size;
     this.columns = Math.floor(size / CELL);
     this.rows = Math.floor(size / CELL);
     this.cells = new Uint8Array(this.columns * this.rows);
-    this.sourceAtlasSize.value = sourceAtlasSize;
+    this.sourceAtlasSize.value = new THREE.Vector2(sourceAtlasSize.width, sourceAtlasSize.height);
 
     this.target = new THREE.RenderTarget(size, size, {
       type: THREE.HalfFloatType, format: THREE.RGBAFormat, depthBuffer: false, generateMipmaps: false,
@@ -134,9 +134,9 @@ export class WorkingAtlas {
     const cellsHigh = Math.ceil((slice.height + 2 * PAGE_GUTTER) / CELL);
     let spot = this.findFree(cellsWide, cellsHigh);
     if (!spot) { this.evictOldest(cellsWide * cellsHigh, chart); spot = this.findFree(cellsWide, cellsHigh); }
-    // @important The old level is given up only once the new one has a home. Releasing
-    // first is the failure §05 of the design names: a chart lit correctly at mip 2 asks
-    // for mip 1, the four cells are not there, and the surface drops to its 1x1 root.
+    /** @important The old level is given up only once the new one has a home. Releasing
+     * first is the failure §05 of the design names: a chart lit correctly at mip 2 asks
+     * for mip 1, the four cells are not there, and the surface drops to its 1x1 root. */
     if (!spot) return false;
     this.release(chart);
     spot = this.findFree(cellsWide, cellsHigh) ?? spot;
@@ -238,7 +238,7 @@ export class WorkingAtlas {
       const rootColour = vec3(textureLoad(this.texture, ivec2(int(root.x), int(root.y))));
 
       const scale = exp2(entry.x);
-      const localTexel = vec2(uv1).mul(sourceSize).sub(geometry.xy).div(scale);
+      const localTexel = vec2(uv1).mul(vec2(sourceSize)).sub(geometry.xy).div(scale);
       const levelSize = vec2(geometry.zw).div(scale).max(vec2(1));
       const clamped = localTexel.clamp(vec2(0.5), levelSize.sub(vec2(0.5)));
       const physical = vec2(entry.y, entry.z).add(clamped).div(atlasSize);

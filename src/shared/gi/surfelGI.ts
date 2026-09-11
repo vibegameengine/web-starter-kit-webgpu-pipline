@@ -1363,7 +1363,10 @@ export class SurfelGI {
     // do it, because `resetCache` has already thrown the runtime cache away.
     this.ensurePoolCapacity(renderer, Math.min(MAX_SURFELS, size * height));
 
-    if (freshSurfels) this.lightmapSurfels = null;
+    /** @important The filter links belong to the page's own surfel set: keeping the
+     * first page's buffer while `lm` was rebuilt wrote a later beach page entirely
+     * black - 19206 texels seeded, 19206 black, integration 3.5 s against 77 s. */
+    if (freshSurfels) { this.lightmapSurfels = null; this.lightmapFilterLinks = null; }
     if (!this.lightmapSurfels) {
       this.lightmapSurfels = createLightmapSurfels(this.pool, size, height);
     }

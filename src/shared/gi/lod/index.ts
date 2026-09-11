@@ -29,7 +29,7 @@ export class LightmapLod {
     private readonly settings: LodSettings,
   ) {
     this.pool = new PagePool(renderer, pixels, layout.atlasSize, layout.regions, settings.pageSize);
-    this.atlas = new WorkingAtlas(renderer, this.pool, layout.regions.map(toOrigin), layout.atlasSize, settings.atlasSize);
+    this.atlas = new WorkingAtlas(renderer, this.pool, layout.regions.map(toOrigin), { width: layout.atlasSize, height: layout.atlasHeight }, settings.atlasSize);
     applyLightmap(scene, this.atlas.texture, intensity, this.atlas.sampler());
     console.log(
       `[lod] ${layout.regions.length} charts in ${this.pool.pages.length} source page(s) of ${settings.pageSize}² ` +

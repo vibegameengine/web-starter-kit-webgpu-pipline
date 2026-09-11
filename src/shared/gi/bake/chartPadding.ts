@@ -25,9 +25,16 @@ export function padLightmapCharts(pixels: Float32Array, size: number, regions: L
     if (pixels[i * 4 + 3] >= .75) { queue[tail++] = i; seeds[owners[i]]++; }
     else pixels.fill(0, i * 4, i * 4 + 4);
   }
-  for (let id = 0; id < seeds.length; id++) {
-    if (seeds[id] === 0) throw new Error(`Lightmap chart ${id} has no measured texels; cannot invent its lighting`);
+  /** @important A chart the GPU rasterisation missed used to throw and take the whole
+   * scene down with it. The CPU coverage test in the unwrap and the rasteriser's own
+   * fill rule disagree on a sliver now and then - one chart in 13713 on the beach - and
+   * a dead scene is a worse answer than one unlit sliver. Many of them still throw:
+   * that is a broken unwrap, not a rounding difference. */
+  const unmeasured = seeds.reduce((count, seeded) => count + (seeded === 0 ? 1 : 0), 0);
+  if (unmeasured > Math.max(4, regions.length * 0.01)) {
+    throw new Error(`${unmeasured} of ${regions.length} lightmap charts have no measured texels; the unwrap is wrong, not the rasteriser`);
   }
+  if (unmeasured > 0) console.warn(`[lightmap] ${unmeasured} chart(s) of ${regions.length} rasterised no texel and stay unlit`);
   for (let head = 0; head < tail; head++) {
     const i = queue[head], x = i % size;
     for (let side = 0; side < 4; side++) {

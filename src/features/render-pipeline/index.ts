@@ -64,6 +64,7 @@ function installReflectionCache(renderer: THREE.WebGPURenderer, gi: SurfelGI, ho
     maxFootprintTaps: url.num('reflectionTaps') ?? 8,
     depthCorrection: url.flag('reflectionDepth', true),
     freezeUpdates: url.flag('reflectionFreeze', false),
+    debugView: (url.get('reflectionDebug') ?? 'off') as 'off',
   });
   if (cache.errors.length > 0) console.warn(`[reflections] preparation: ${cache.errors.join(', ')}`);
   console.log(`[reflections] cached profile, ${volumes.length} volume(s), face ${volumes[0].faceSize}, ${cache.memoryReport}`);
@@ -273,6 +274,31 @@ function installLodHooks(p: Pipeline): void {
         return counts;
       }, {}),
     };
+  });
+  hook('__pages', () => {
+    const layout = staticLight.layout;
+    const pixels = staticLight.atlasPixels;
+    if (!layout || !pixels) return null;
+    const size = staticLight.atlasSize;
+    return [...Array(layout.pages).keys()].map((page) => {
+      const charts = layout.placements.filter((placement) => placement.page === page);
+      let sum = 0;
+      let texels = 0;
+      const meshes = new Map<string, number>();
+      for (const placement of charts) {
+        meshes.set(placement.mesh.name || placement.mesh.geometry.type, (meshes.get(placement.mesh.name || placement.mesh.geometry.type) ?? 0) + 1);
+        const { x, y, width, height } = placement.region;
+        for (let row = 0; row < height; row++) {
+          for (let column = 0; column < width; column++) {
+            const index = ((y + row) * size + x + column) * 4;
+            sum += (pixels[index] + pixels[index + 1] + pixels[index + 2]) / 3;
+            texels++;
+          }
+        }
+      }
+      return { page, charts: charts.length, mean: +(sum / Math.max(texels, 1)).toFixed(5),
+        meshes: [...meshes].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([name, count]) => `${name}:${count}`) };
+    });
   });
   hook('__chartLight', (name = 'bench') => {
     const layout = staticLight.layout;
