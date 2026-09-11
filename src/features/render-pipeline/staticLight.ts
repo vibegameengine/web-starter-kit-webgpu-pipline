@@ -65,6 +65,7 @@ export class StaticLight {
   private busy = false;
   private bakedProvenance: LightingProvenance | null = null;
   private digests = { environment: 'pending', transport: 'pending' };
+  bakedWith: { passes: number; rays: number; atlasIntensity: number; atlasSize: number } | null = null;
 
   constructor(
     private readonly renderer: THREE.WebGPURenderer,
@@ -198,6 +199,8 @@ export class StaticLight {
 
   private async bakeAtlas(frameGraph: FrameGraph, contactTree: ContactBVHBundle | null): Promise<{ pixels: Float32Array; surfels: FrozenSurfelData }> {
     if (!this.layout) throw new Error('lightmap: unwrap before baking');
+    this.bakedWith = { passes: this.bakeParams.passes, rays: this.bakeParams.rays, atlasIntensity: this.atlasParams.intensity, atlasSize: this.atlasSize };
+    console.log(`[bake] ${this.bakedWith.passes} passes, ${this.bakedWith.rays} rays, atlas mul ${this.bakedWith.atlasIntensity}`);
     const size = this.atlasSize;
     const pages = Math.max(1, this.layout.pages);
     const stacked = new Float32Array(size * size * pages * 4);

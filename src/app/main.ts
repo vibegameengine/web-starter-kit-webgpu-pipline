@@ -67,7 +67,7 @@ async function boot(): Promise<void> {
   const settingsScene = settingsSceneName(params);
   const profile = settingsProfile(params);
   const saved = await loadGuiSettings(settingsScene, profile);
-  const ui = { setLoading, clearLoading, showError, showChrome, applySavedSettings: (target: GUI) => applyGuiSettings(target, saved) };
+  const ui = { setLoading, clearLoading, showError, showChrome, savedSettings: saved, applySavedSettings: (target: GUI) => applyGuiSettings(target, saved) };
   const pipeline = params.get('pipeline') === 'legacy'
     ? await createLightingPipeline(renderer, ui)
     : await createRenderPipeline(renderer, ui);

@@ -1,5 +1,6 @@
 import type * as THREE from 'three/webgpu';
 import type GUI from 'lil-gui';
+import type { GuiSettings } from '../../app/guiSettings.ts';
 import type { VolumetricFogSettings } from '../../shared/render/index.ts';
 import type { ContactOcclusionSettings } from '../../shared/gi/contact/contactOcclusionPass.ts';
 import type { ReflectionSettings } from '../../shared/gi/reflect/reflectionPass.ts';
@@ -32,6 +33,7 @@ export interface PipelineUi {
   showError(error: unknown): void;
   showChrome: boolean;
   applySavedSettings?(gui: GUI): void;
+  savedSettings?: GuiSettings | null;
 }
 
 export interface RenderPipeline {
