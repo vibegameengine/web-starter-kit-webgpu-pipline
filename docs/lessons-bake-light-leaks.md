@@ -92,15 +92,59 @@ commit rather than dressed up.
 ## Where the acceptance stands
 
 ```bash
-node scripts/check-leak-room.mjs contact 0,1,5,20            # A1, A2
-node scripts/check-leak-room.mjs contact 0 "&lm=64"          # A4, one texel spans the wall base
-node scripts/check-leak-room.mjs contact 0 "&scale=0.001"    # A3
-node scripts/check-bake-leak.mjs corridor floor              # section 01 capture and its mutation
+node scripts/check-leak-room.mjs contact 0,1,5,20            # A1, A2 - green
+node scripts/check-leak-room.mjs contact 0 "&lm=64"          # A4, one texel spans the wall base - green
+node scripts/check-bake-leak.mjs corridor floor              # section 01 capture and its mutation - green
+node scripts/check-leak-room.mjs contact 0 "&scale=0.001"    # A3 - RED, see below
 ```
 
 Sealed room at the fine atlas: 0.00007 peak against 0.2592 for the sunlit ground, a 20 mm gap adds
 0.00027, all three criteria pass. At 0.23 m per texel it reads 0.00001, from 0.0313 when this
 started.
+
+**A3 is red and stays red.** At `?scale=0.001` the sealed interior reads 0.047 against 0.2503 for the
+sunlit ground - 18.8 %, against the script's own tolerance of 0.00025. The spawn offset was the
+dominant term and is fixed; what remains is scale-bound in the cache itself. Do not read the three
+green commands as "the acceptance is green".
+
+## What a harsh critic found afterwards
+
+An independent agent re-ran this work with no memory of writing it. Confirmed and fixed:
+
+- **The shadow map was 8192 for every scene, not for the corridor.** `MIN_SHADOW_EXTENT = 15` forces a
+  30 m shadow camera however small the scene, and a 4 mm target texel asks 8192 of 30 m every time -
+  the Cornell box and the beach printed the same line while the commit message said "the corridor gets
+  8192". The floor is 6 m now: Cornell takes 4096 over 16 m, the corridor 8192 over 26.
+- **Two of three verdicts in `check-leak-room.mjs` could not fail on a single-gap run.** With no gap,
+  `opened` is empty, `widest` is undefined and `every` on an empty array is true, so both halves of
+  the paired test printed PASS without opening anything. Two of the four documented commands are
+  single-gap. They print SKIPPED now.
+- **`captured` in `check-bake-leak.mjs` was half a tautology** - `firstChange()` emits one entry per
+  stage pair by construction. It checks stage names and world positions instead.
+- **Two `@important` comments were lying**: one claimed 1.5 shadow texels where the code had 0.3, the
+  other blamed the determinant and the distance for the same measurement in consecutive paragraphs.
+  The determinant guard at 1e-12 still has no measurement behind it.
+- **A JS `return` inside a TSL `If` is not a `continue`.** The placement loop read its own texel as a
+  neighbour at `i = 4`, which `bit = i < 4 ? i : i - 1` turned into the left neighbour's bit.
+- **The parity test marking texels "inside solids" was worse than useless.** It called 76107 of the
+  corridor's 662784 charted texels inside and cut each out of the filter, leaving the raw transport's
+  noise. Parity means nothing in an open sheet and those walls are sheets. Three directions vote and
+  an exhausted traversal abstains; that moved the count by two. Off by default, `?bakeHidden=1`.
+- **`0 allowed, 0 blocked, 0 texels` printed for both a dead kernel and an atlas where everything is
+  blocked** - the very line this file offers as the guarantee against the first. Isolated texels are
+  counted apart and a pass that writes nothing throws.
+
+Confirmed and kept as a trade: **the links cost visible noise at contacts** - vertical second
+difference on the Cornell cube edge 2.84 with them, 2.04 without, and four denoise passes instead of
+two only reach 2.81. Kept because the other side is the sealed room reading 0.02965 without links
+against 0.00001 with them. The contact texel needs its own domain, which is the split in Not done.
+
+Its one false finding, retracted by itself: "the beach never reaches a frame". It does, in about
+183 s of page time; the capture harness was timing out. That retraction is why the report is worth
+reading.
+
+Still open from the critique: `?triTEps=` and `?triDetEps=` on needle triangles - the beach's foliage
+and the forest's ez-tree - because another session was editing the tree while it measured.
 
 ## Not done
 

@@ -179,11 +179,11 @@ export function createLightmapSurfels(pool: SurfelPool, size: number, height = s
           Loop(int(9), ({ i }) => {
             const dx = i.mod(int(3)).sub(int(1));
             const dy = i.div(int(3)).sub(int(1));
-            If(dx.equal(int(0)).and(dy.equal(int(0))), () => { return; });
             const nx = x.add(dx);
             const ny = y.add(dy);
             If(
-              nx.greaterThanEqual(int(0)).and(nx.lessThan(int(size)))
+              dx.equal(int(0)).and(dy.equal(int(0))).not()
+                .and(nx.greaterThanEqual(int(0))).and(nx.lessThan(int(size)))
                 .and(ny.greaterThanEqual(int(0))).and(ny.lessThan(int(height))),
               () => {
                 const nUv = vec2(
@@ -270,7 +270,14 @@ export function createLightmapSurfels(pool: SurfelPool, size: number, height = s
     const surfelAttr = pool.getSurfelAttr();
     if (!momentsAttr || !surfelAttr) return false;
 
-    const { denoise = 2, dilate = 4, planeEpsilon = 0.02, denoiseIgnoresSurface = false, useLinks = false, onStage } = options;
+    /* @important The links buy a real leak and cost visible noise, and more passes do not pay it off.
+       At a contact a texel keeps few allowed neighbours, so its Monte-Carlo variance survives: on the
+       Cornell cube edge the vertical second difference is 2.84 with links and 2.04 without, and four
+       passes instead of two moved it to 2.81. What that texel needs is its own domain with neighbours
+       of its own - design section 02's split, which is not built - not a wider filter, which is the
+       leak. ?filterLinks=0 is the other side of the trade: at 0.23 m/texel the sealed room reads
+       0.00001 with links and 0.02965 without. */
+    const { useLinks = false, denoise = 2, dilate = 4, planeEpsilon = 0.02, denoiseIgnoresSurface = false, onStage } = options;
     const capacity = surfelAttr.count;
 
     if (!writeNode) {
@@ -367,7 +374,8 @@ export function createLightmapSurfels(pool: SurfelPool, size: number, height = s
                       .dot(nj)
                       .greaterThan(0.9)
                       .and(pj.sub(p0).dot(n0).abs().lessThan(U_PLANE_EPS))
-                      .or(U_SURFACE_TEST.lessThan(0.5)),
+                      .or(U_SURFACE_TEST.lessThan(0.5))
+                      .or(U_USE_LINKS.greaterThan(0.5)),
                     () => {
                       sum.addAssign(s.xyz);
                       count.addAssign(1);

@@ -196,7 +196,7 @@ export class BakeLeakStages {
     };
   }
 
-  atWorld(x: number, y: number, z: number): LeakTexelReport | null {
+  atWorld(x: number, y: number, z: number, withinMetres = Infinity): LeakTexelReport | null {
     let best = -1;
     let nearest = Infinity;
     for (let slot = 0; slot < this.slots; slot++) {
@@ -208,7 +208,7 @@ export class BakeLeakStages {
       nearest = distance;
       best = slot;
     }
-    if (best < 0) return null;
+    if (best < 0 || Math.sqrt(nearest) > withinMetres) return null;
     const report = this.reportOfSlot(best);
     return report && { ...report, metres: +Math.sqrt(nearest).toFixed(4) } as LeakTexelReport;
   }
@@ -268,7 +268,7 @@ export function leakHookApi(leak: BakeLeakStages, onShown?: () => void) {
     show: (option: string) => { const ok = leak.show(option); if (ok) onShown?.(); return ok; },
     gain: (value: number) => { leak.diffGain = value; return leak.show(leak.shown); },
     inspect: (x: number, y: number) => leak.inspect(x, y),
-    atWorld: (x: number, y: number, z: number) => leak.atWorld(x, y, z),
+    atWorld: (x: number, y: number, z: number, withinMetres?: number) => leak.atWorld(x, y, z, withinMetres),
     firstChange: (tolerance?: number) => leak.firstChange(tolerance),
     inventedLight: (blackLevel?: number) => leak.inventedLight(blackLevel),
   };

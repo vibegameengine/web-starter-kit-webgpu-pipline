@@ -4,7 +4,10 @@
    measured as black. The mutation is ?leakMutation=denoiseAll, which drops the denoise plane/normal
    test: its invented-light count must rise, or the capture is not reading the stage it claims to.
    The capture is installed the moment the recorder exists, so it still reports when a later stage
-   of the bake throws - which is what a diagnostic is for. Headed, per the project rule.
+   of the bake throws - which is what a diagnostic is for. The capture is judged by the stage names it
+   actually produced and by each transition carrying a world position, not by the count of
+   transitions: firstChange emits one per pair by construction, so counting them proved nothing.
+   Headed, per the project rule.
    Exit 3 = the capture passed but the bake could not finish for an unrelated reason. */
 import { chromium } from 'playwright';
 import { mkdir, writeFile } from 'node:fs/promises';
@@ -70,7 +73,10 @@ const movedIn = (report) => denoiseStages.reduce((n, name) => n + (report.change
 if (mutated.complete) await shootStages(denoiseStages, 'mutated');
 await browser.close();
 
-const captured = run.stages.length >= 3 && run.changes.length === run.stages.length - 1;
+const EXPECTED_STAGES = ['raw', 'denoise 1', 'denoise 2', 'blit', 'padded', 'resident'];
+const missing = EXPECTED_STAGES.filter((name) => !run.stages.includes(name));
+const captured = missing.length === 0 && run.changes.every((change) => change.world !== null);
+if (missing.length) console.log(`missing stages: ${missing.join(', ')}`);
 const mutationBites = inventedIn(mutated) > inventedIn(run) || movedIn(mutated) > movedIn(run);
 console.log(`denoise: ${movedIn(run)} texels moved / ${inventedIn(run)} invented; with the surface test removed ${movedIn(mutated)} / ${inventedIn(mutated)}`);
 console.log(`errors ${runErrors.length}${runErrors.length ? ': ' + runErrors.slice(0, 2).join(' | ').slice(0, 300) : ''}`);

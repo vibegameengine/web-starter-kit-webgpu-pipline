@@ -1377,9 +1377,10 @@ export class SurfelGI {
     if (filterLinks) {
       if (!this.lightmapFilterLinks) this.lightmapFilterLinks = createFilterLinks(size, lm.links);
       const reach = this.staticBounds(scene).getSize(new THREE.Vector3()).length() * 0.05;
-      this.lightmapFilterLinks.run(renderer, gbuffer, filterLinks, { supportMetres: reach });
+      this.lightmapFilterLinks.run(renderer, gbuffer, filterLinks, { supportMetres: reach, hiddenTest: giKnobs.bakeHiddenTexels() });
       const linkStats = await this.lightmapFilterLinks.readStats(renderer);
-      console.log(`[lightmap] filter links: ${linkStats.links} allowed, ${linkStats.blocked} blocked across ${linkStats.texels} texels, ${linkStats.hidden} hidden inside solids, support ${reach.toFixed(2)} m`);
+      console.log(`[lightmap] filter links: ${linkStats.links} allowed, ${linkStats.blocked} blocked across ${linkStats.texels} texels, ${linkStats.isolated} isolated, ${linkStats.hidden} hidden inside solids, support ${reach.toFixed(2)} m`);
+      if (linkStats.texels === 0) throw new Error('[lightmap] the filter-link pass wrote nothing: every texel is isolated, which is what a kernel that failed to compile also leaves behind');
     }
     lm.setPlacement(filterLinks ? giKnobs.bakePlacement() : 0);
     if (!lm.seed(renderer, gbuffer)) return null;

@@ -31,11 +31,15 @@ function shadowMapSizeFor(extent: number): number {
 /* @important A constant depth bias is what put a hard white line along every wall-floor contact in
    the corridor - reproduced at ?scene=corridor&cam=bench, and still there with the lightmap forced
    to zero, so it was never the bake. -0.0003 pushes the comparison toward the light and the floor
-   texels at the wall foot escape the wall's shadow. The offset is along the surface normal instead,
-   1.5 shadow texels wide, which cures the acne it was hiding without moving anything toward the
-   light: measured clean at 1 and 1.5 texels, acne returns at 0. Design section 06. */
+   texels at the wall foot escape the wall's shadow. The offset goes along the surface normal
+   instead, and 0.3 of a texel is what the acne actually needs once the map is sized to the scene:
+   the sunlit patch reads 80.7 against 48.3 with no offset at all. Design section 06. */
 const SHADOW_NORMAL_BIAS_TEXELS = 0.3;
-const MIN_SHADOW_EXTENT = 15;
+/* @important The floor used to be 15 m, which is a 30 m shadow camera for every scene however small,
+   and with a 4 mm target texel that asks for 8192 every time - the Cornell box and the beach printed
+   the same line. The floor exists so a scene whose static bounds miss its movers still has margin,
+   not to set the resolution. */
+const MIN_SHADOW_EXTENT = 6;
 
 export type SunControls = ReturnType<typeof createLightControls>;
 

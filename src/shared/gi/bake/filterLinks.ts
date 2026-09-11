@@ -20,6 +20,7 @@ export const HIDDEN_BIT = 256;
    a floor that runs under a wall satisfies both on the far side of it: in the sealed room at
    0.23 m/texel that filter took an interior texel from 0.0013 to 0.0310, twelve per cent of the
    sunlit ground, in one pass. Design section 05. */
+
 const KERNEL = /* wgsl */ `
   fn filterLinkKernel(
     positionTex: texture_2d<f32>,
@@ -40,10 +41,29 @@ const KERNEL = /* wgsl */ `
     let n0 = normalize( textureLoad( normalTex, px, 0 ).xyz );
     var mask = 0u;
     if ( hiddenTest > 0.5 ) {
-      var parity: Ray;
-      parity.origin = p0 + n0 * 1e-4;
-      parity.direction = normalize( vec3f( 0.3612, 0.8677, 0.3413 ) );
-      if ( ( bvhCountHits( parity ) & 1u ) == 1u ) { links.value[ i ] = 256u; return; }
+      /* @important Off by default, and this is why. Parity only means anything inside a closed
+         opaque body, and the corridor's walls are open sheets: the test called 76107 of its 662784
+         charted texels "inside solids" and cutting each of them out of the filter left them with the
+         raw transport's noise. Three directions vote and an exhausted traversal abstains, which
+         changed that count by two. The test is sound for closed solids and useless without a way to
+         know which bodies are closed; ?bakeHidden=1 turns it on. Design section 02. */
+      var directions = array<vec3f, 3>(
+        vec3f( 0.3612, 0.8677, 0.3413 ),
+        vec3f( -0.7071, 0.5774, 0.4082 ),
+        vec3f( 0.5145, -0.6172, 0.5952 )
+      );
+      var inside = 0u;
+      var voted = 0u;
+      for ( var v = 0u; v < 3u; v = v + 1u ) {
+        var parity: Ray;
+        parity.origin = p0 + n0 * max( 1e-7, length( p0 ) * 1e-5 );
+        parity.direction = directions[ v ];
+        let crossings = bvhCountHits( parity );
+        if ( crossings == 0xffffffffu ) { continue; }
+        voted = voted + 1u;
+        if ( ( crossings & 1u ) == 1u ) { inside = inside + 1u; }
+      }
+      if ( voted >= 2u && inside * 2u > voted ) { links.value[ i ] = 256u; return; }
     }
     var bit = 0u;
     for ( var dy = -1; dy <= 1; dy = dy + 1 ) {
@@ -113,19 +133,24 @@ function buildKernel(
     .setName('Lightmap filter links');
 }
 
+/* @important `isolated` is counted apart from everything else because a kernel that never ran and an
+   atlas where every link is blocked both leave the buffer at zero, and the old line printed four
+   zeros for both. That is the exact failure this reporting was added to prevent: a filter-link
+   kernel once failed to compile, the buffer stayed zero, and the silence read as a working feature. */
 async function readLinkStats(renderer: THREE.WebGPURenderer, attr: THREE.StorageBufferAttribute, texelCount: number) {
   const data = new Uint32Array(await renderer.getArrayBufferAsync(attr));
   let texels = 0;
   let links = 0;
   let hidden = 0;
+  let isolated = 0;
   for (let i = 0; i < texelCount; i++) {
     const mask = data[i];
     if (mask & HIDDEN_BIT) { hidden++; continue; }
-    if (mask === 0) continue;
+    if (mask === 0) { isolated++; continue; }
     texels++;
     for (let bit = 0; bit < 8; bit++) if (mask & (1 << bit)) links++;
   }
-  return { texels, links, hidden, blocked: texels * 8 - links };
+  return { texels, links, hidden, isolated, blocked: texels * 8 - links };
 }
 
 export function createFilterLinks(size: number, attr: THREE.StorageBufferAttribute) {
@@ -144,7 +169,7 @@ export function createFilterLinks(size: number, attr: THREE.StorageBufferAttribu
   ): void {
     uSupport.value = options.supportMetres ?? 1;
     uNormalCos.value = options.normalCos ?? 0.9;
-    uHiddenTest.value = options.hiddenTest === false ? 0 : 1;
+    uHiddenTest.value = options.hiddenTest === true ? 1 : 0;
     if (!kernel) kernel = buildKernel(attr, texelCount, gbuffer, bvh, { size: uSize, support: uSupport, normalCos: uNormalCos, hiddenTest: uHiddenTest });
     renderer.compute(kernel);
   }

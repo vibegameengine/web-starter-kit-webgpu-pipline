@@ -75,6 +75,9 @@ export const giKnobs = {
      shadows, and nothing measured pays for that yet. `?bakePlacement=0.35` turns it on. Section 02. */
   bakePlacement: () => num('bakePlacement', 0),
 
+  /** @important `?bakeHidden=1` marks texels whose centre a parity ray calls inside a closed body; see filterLinks. */
+  bakeHiddenTexels: () => flag('bakeHidden', false),
+
   /** Base surfel pool capacity, before any growth. */
   surfelBase: () => num('surfels', 0),
 

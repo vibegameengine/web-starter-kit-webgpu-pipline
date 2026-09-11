@@ -167,8 +167,11 @@ export const bvhCountHits = wgslFn(
 
 		loop {
 
-			if ( pointer < 0 || pointer >= i32( BVH_STACK_DEPTH ) ) {
+			if ( pointer < 0 ) {
 				break;
+			}
+			if ( pointer >= i32( BVH_STACK_DEPTH ) ) {
+				return 0xffffffffu;
 			}
 
 			let currNodeIndex = stack[ pointer ];
