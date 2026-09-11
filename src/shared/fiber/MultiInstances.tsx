@@ -1,7 +1,6 @@
 import { useLayoutEffect, useMemo, useRef } from 'react';
 import * as THREE from 'three/webgpu';
 import { applyMobility, Mobility } from '../world/index.ts';
-import { installStaticMotion } from '../render/vertexMotion.ts';
 
 export interface PrefabPart {
   id: string;
@@ -15,10 +14,6 @@ export interface PrefabInstance {
   id: string;
   matrix: THREE.Matrix4;
   color?: THREE.ColorRepresentation;
-}
-
-function instanceMotionEnabled(): boolean {
-  return new URLSearchParams(window.location.search).get('instanceMotion') !== '0';
 }
 
 export function instanceTransform(position: number[], scale: number[] = [1, 1, 1], rotation: number[] = [0, 0, 0]): THREE.Matrix4 {
@@ -42,7 +37,6 @@ function PartInstances({ part, instances, name }: { part: PrefabPart; instances:
     mesh.computeBoundingBox();
     mesh.computeBoundingSphere();
     applyMobility(mesh, Mobility.Static);
-    if (instanceMotionEnabled()) installStaticMotion(part.material as THREE.NodeMaterial);
   }, [part, instances]);
   return <instancedMesh ref={ref} name={`${name}/${part.id}`} args={[part.geometry, part.material, instances.length]} userData={data} dispose={null} />;
 }

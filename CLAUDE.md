@@ -45,20 +45,26 @@
   a stripped copy through the same code path - `?scene=village-light`
   (`villageLightScene.tsx`, one house plus the instanced windows, 12 s) - and measure on it.
   Details in [lessons-worktree-instances.md](docs/lessons-worktree-instances.md).
-- InstancedMesh motion vectors are ours, not three's. `installStaticMotion()` in
-  `shared/render/vertexMotion.ts` is installed by `MultiInstances` on every part material:
-  three r182's `velocity` node builds the current clip position from `positionLocal`, which
-  `InstanceNode` has already multiplied by `instanceMatrix`, and the previous one from
-  `positionPrevious` (= `positionGeometry`), which it has not - so a motionless instance
-  reports its whole placement as velocity, TAA fetches history from the wrong pixels, and
-  the village shimmers while the beach (plain meshes + `installVertexMotion` foliage) does
-  not. Measured on `village-light`: 118.7 px static velocity and 2.84/255 shimmer with
-  `?instanceMotion=0`, 0 px and 0.53 with the fix, camera motion still 0.21 px, frame cost
-  unchanged at 0.53 ms. `node scripts/check-instance-velocity.mjs` (`SCENE=`, `PORT=`) is
-  the check; it asserts the TAA jitter actually changed, because a stalled frame loop makes
-  any temporal metric pass. Any new `InstancedMesh` outside `MultiInstances` needs the same
-  call; moving instances are not covered; r183 fixes this upstream - re-check before keeping
-  the override. Details in [lessons-instance-velocity.md](docs/lessons-instance-velocity.md).
+- **three is our fork, vendored like the fiber one.** `vendor/three` is
+  `github.com/vibegameengine/three.js`, branch `r182-instance-velocity` = tag r182 plus the
+  two upstream commits that give `InstanceNode` a previous instance matrix (#32586, #32615,
+  landed in r183); `vite.config.ts` aliases `three`, `three/webgpu`, `three/tsl`,
+  `three/addons/*` and `three/examples/jsm/*` into its **source**, and `package.json` keeps
+  `three@^0.182.0` for the types and for anything outside Vite. Stock r182 builds the
+  current clip position from `positionLocal`, which `InstanceNode` has already multiplied by
+  `instanceMatrix`, and the previous one from `positionPrevious` (= `positionGeometry`),
+  which it has not - so a motionless instance reports its whole placement as velocity, TAA
+  fetches history from the wrong pixels, and the village shimmers while the beach (plain
+  meshes + `installVertexMotion` foliage) does not. `VITE_THREE_STOCK=1 npm run dev` is the
+  ablation and it reproduces the defect: 118.6 px of velocity on a still scene and 2.84/255
+  of shimmer, against 0 px and 0.42 on the fork, camera motion 0.21 px either way. There is
+  no local override any more - upstream's version also covers moving instances, which ours
+  did not. `node scripts/check-instance-velocity.mjs` (`SCENE=`, `PORT=`, `BOUND=`) is the
+  check, and it asserts the TAA jitter actually changed, because a stalled frame loop makes
+  any temporal metric pass. `optimizeDeps.entries: ['index.html']` is required: cone-mode
+  sparse checkout drags in `vendor/three/examples/*.html` and Vite's scanner then refuses to
+  start. Details in [lessons-three-fork.md](docs/lessons-three-fork.md) and
+  [lessons-instance-velocity.md](docs/lessons-instance-velocity.md).
 - **Never run anything headless.** User rule (2026-09-08): every capture, check and measurement uses a headed Chrome window; `capture-chrome.mjs` and all `check-*.mjs` launch headed unconditionally. Headless is not an option to mention or offer.
 - **Never leave the renderer broken, and never wait out a failure.** User rule (2026-09-11): this repository is shared by several sessions at once, so a pipeline error you introduce is everybody's error — check the plain URL boots before starting any long measurement, and fix a break before walking away from it. Harness scripts must fail on the first error instead of sitting on a timeout: watch `#error-overlay` and the page's `pageerror`, and exit the moment either fires. A 240-second `waitForFunction` that ends in a timeout when the answer was known in two seconds is the defect, not the scene.
 - **A new view is not delivered as a URL for the user to type.** User rule (2026-09-11): when something new can be looked at — a lab, a split view, a debug pane — wire it into the UI in the same change: a chip on its card in `src/app/home/catalog.ts`, a GUI control, or whatever the user already clicks. Handing over `?lab=1` and waiting to be asked "why don't I see it" is the failure: the user opened the app, found nothing, and had to send a screenshot with an arrow. A URL parameter is the ablation for checks, never the way a person reaches the feature.

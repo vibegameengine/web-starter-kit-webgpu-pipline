@@ -32,32 +32,6 @@ export function vertexMotionVelocity(displaceAt: (time: N) => N, timeNow: N, tim
 }
 
 /**
- * @important Motion vectors for a mesh whose vertices do not move.
- *
- * three r182's `velocity` node reprojects `positionPrevious`, which is
- * `positionGeometry`: for an InstancedMesh the *current* clip position comes from
- * `positionLocal`, which InstanceNode has already multiplied by `instanceMatrix`,
- * while the previous one has not — so a motionless instance reports its whole
- * placement as velocity (measured 2026-09-11 on the village with
- * `scripts/_village_velocity.mjs`: mean 50.4 px and 25 % of instanced pixels above
- * 0.05 px, against exactly 0 for the plain meshes of the same frame), TAA fetches
- * history from the wrong place, and the village shimmers while the beach does not.
- *
- * Both projections here use `positionLocal`, so the instance transform is in both and
- * the only motion left is the camera's. Static meshes only: the object's own matrix is
- * taken as unchanged between the two frames.
- */
-export function installStaticMotion(material: THREE.NodeMaterial): void {
-  const world = modelWorldMatrix.mul(vec4(positionLocal, 1));
-  const clipNow = U_VIEW_PROJECTION.mul(world);
-  const clipPrev = U_PREVIOUS_VIEW_PROJECTION.mul(world);
-  material.mrtNode = mrt({
-    velocity: vec4(clipNow.xy.div(clipNow.w).sub(clipPrev.xy.div(clipPrev.w)), metalness, roughness),
-  });
-  material.userData.staticMotionNode = material.mrtNode;
-}
-
-/**
  * Sets the material's vertex displacement and the matching motion vector in one
  * place, so the two can never disagree. `timeNow`/`timePrev` are the entity's wind
  * clock uniforms; the entity advances `timePrev` before `timeNow` each frame.

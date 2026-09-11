@@ -15,3 +15,14 @@ references/*.zip
 
 # vendored donor repo keeps its own history
 vendor/webgiya/
+.code-graph/
+public/bakes/
+vendor/react-three-fiber/
+vendor/three/
+tmp/dashboard/
+
+# ctx-kit (machine-specific paths + local index)
+.claude/settings.local.json
+.codex/hooks.json
+.codex/hooks/ctx-kit-codex.ps1
+.codex/hooks/ctx-kit-codex.sh

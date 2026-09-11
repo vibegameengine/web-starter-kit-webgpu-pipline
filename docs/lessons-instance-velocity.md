@@ -44,21 +44,23 @@ handles the instanced case upstream; r182 does not.
 
 ## The fix
 
-`installStaticMotion(material)` in `src/shared/render/vertexMotion.ts` writes the
-velocity channel itself, projecting `positionLocal` — instance transform included —
-with the current and previous unjittered view-projections the TAA tracks
-(`U_VIEW_PROJECTION` / `U_PREVIOUS_VIEW_PROJECTION`). `MultiInstances` installs it on
-every part material next to `applyMobility(mesh, Mobility.Static)`. The object matrix is
-taken as unchanged between frames, which is what Static means.
+First ours: `installStaticMotion(material)`, projecting `positionLocal` — instance
+transform included — with both unjittered view-projections, installed by
+`MultiInstances`. It worked (0 px, shimmer 2.84 -> 0.53 /255, frame cost unchanged at
+0.53 ms) but covered only static instances.
 
-`?instanceMotion=0` restores three's node as the ablation.
+It was then replaced by the upstream fix, taken through a fork of three: `vendor/three`,
+branch `r182-instance-velocity` = r182 plus #32586 and #32615, which give `InstanceNode`
+a per-mesh previous instance matrix and therefore handle moving instances too. The local
+override is gone; `VITE_THREE_STOCK=1 npm run dev` is the ablation. See
+[lessons-three-fork.md](lessons-three-fork.md).
 
 Measured on `?scene=village-light` (`node scripts/check-instance-velocity.mjs`):
 
 | | static mean velocity | moving pixels | shimmer (max frame-to-frame, /255) | camera moving |
 |---|---|---|---|---|
-| `?instanceMotion=0` | 118.7 px | 15.4 % | 2.84 | 114.6 px |
-| default | 0 px | 0 % | 0.53 | 0.21 px |
+| stock three r182 (`VITE_THREE_STOCK=1`) | 118.6 px | 15.4 % | 2.84 | 114.5 px |
+| fork | 0 px | 0 % | 0.42–0.57 | 0.21 px |
 
 Camera motion still produces velocity — that column is the guard against "fixing" the
 shimmer by writing zero everywhere, which would make TAA smear on every pan.
@@ -85,10 +87,6 @@ three's velocity arithmetic rather than adding to it.
 
 ## Open
 
-- Only `MultiInstances` installs this. Any other `InstancedMesh` added later needs it, or
-  it will shimmer the same way; the water spray writes its own velocity and lives in the
-  overlay layer.
-- Moving instanced meshes are not covered: the fix assumes the object matrix is constant
-  between frames.
-- Upgrading to three r183 should make this redundant — check `VelocityNode` there before
-  keeping the override.
+- The fork is pinned to r182; moving to r186 removes the branch and the alias together.
+- `package.json` still carries `three@^0.182.0` for types, so a type-level change in the
+  fork would not be visible to TypeScript.
