@@ -32,6 +32,7 @@ export interface LeakInventedLight {
 }
 
 const DIFF_PREFIX = 'diff:';
+const REGION_PERCENTILE = 0.99;
 const DEFAULT_TOLERANCE = 1e-4;
 const DEFAULT_BLACK_LEVEL = 0.002;
 const MEASURED_ALPHA = 0.75;
@@ -213,6 +214,32 @@ export class BakeLeakStages {
     return report && { ...report, metres: +Math.sqrt(nearest).toFixed(4) } as LeakTexelReport;
   }
 
+  /* @important Design section 07 bounds the p99 of the positive error over a dark region, not the
+     value at a point. Two probes cannot see a leak that is spread thin: a seven-fold error at one
+     texel hid under a tolerance derived from the lit reference, and a critic found it by arithmetic
+     rather than by the check. This returns every charted texel whose sample stands inside a box. */
+  region(min: [number, number, number], max: [number, number, number], stageName = 'resident') {
+    const stage = this.stages.find((entry) => entry.name === stageName);
+    if (!stage) return null;
+    const values: number[] = [];
+    for (let slot = 0; slot < this.slots; slot++) {
+      const texel = this.texelOfSlot[slot];
+      if (!this.hasGeometry(texel)) continue;
+      const i = texel * 4;
+      const inside = [0, 1, 2].every((axis) => this.world[i + axis] >= min[axis] && this.world[i + axis] <= max[axis]);
+      if (!inside || stage.values[slot * 4 + 3] < MEASURED_ALPHA) continue;
+      values.push(luma(stage.values, slot * 4));
+    }
+    if (values.length === 0) return { texels: 0, mean: 0, p99: 0, max: 0 };
+    values.sort((a, b) => a - b);
+    return {
+      texels: values.length,
+      mean: values.reduce((sum, v) => sum + v, 0) / values.length,
+      p99: values[Math.min(values.length - 1, Math.floor(values.length * 0.99))],
+      max: values[values.length - 1],
+    };
+  }
+
   firstChange(tolerance = DEFAULT_TOLERANCE): LeakStageChange[] {
     const out: LeakStageChange[] = [];
     for (let order = 1; order < this.stages.length; order++) {
@@ -271,5 +298,6 @@ export function leakHookApi(leak: BakeLeakStages, onShown?: () => void) {
     atWorld: (x: number, y: number, z: number, withinMetres?: number) => leak.atWorld(x, y, z, withinMetres),
     firstChange: (tolerance?: number) => leak.firstChange(tolerance),
     inventedLight: (blackLevel?: number) => leak.inventedLight(blackLevel),
+    region: (min: [number, number, number], max: [number, number, number], stage?: string) => leak.region(min, max, stage),
   };
 }
