@@ -21,7 +21,7 @@ import assert from 'node:assert/strict';
 
 const port = process.env.PORT ?? '5188';
 const scene = process.env.SCENE ?? 'village-light';
-const browser = await chromium.launch({ channel: 'chrome', headless: false, args: ['--enable-unsafe-webgpu', '--ignore-gpu-blocklist', '--use-angle=d3d11'] });
+const browser = await chromium.launch({ channel: 'chrome', headless: false, args: ['--enable-unsafe-webgpu', '--ignore-gpu-blocklist', '--use-angle=d3d11', '--disable-background-timer-throttling', '--disable-backgrounding-occluded-windows', '--disable-renderer-backgrounding'] });
 const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
 let fatal = null;
 page.on('pageerror', (e) => { fatal ??= String(e); });
@@ -45,6 +45,7 @@ const instancedVelocity = () => page.evaluate(async () => {
   return { mean: sum / n, movingFraction: moving / n };
 });
 
+await page.bringToFront();
 await page.goto(`http://127.0.0.1:${port}/?scene=${scene}&hud=0&still=1&grain=0&aa=taa`);
 const booted = await page.waitForFunction(() => window.__fog && document.querySelector('#loading-overlay')?.hidden, null, { timeout: Number(process.env.BOUND ?? 60000) }).then(() => true).catch(() => false);
 assert.ok(booted && !fatal, `boot failed: ${fatal ?? 'timeout'}`);
@@ -53,21 +54,21 @@ await frames(60);
 const shimmer = await page.evaluate(async () => {
   const read = async () => (await window.__fog.taaFrame()).data;
   const wait = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-  const jitters = new Set();
+  const parities = new Set();
   let worst = 0;
   let previous = await read();
   for (let k = 0; k < 6; k++) {
     await wait();
-    jitters.add(window.__fog.taaState().jitter.join(','));
+    parities.add(window.__fog.taaState().parity);
     const current = await read();
     let sum = 0;
     for (let i = 0; i < current.length; i += 4) sum += Math.abs(current[i] - previous[i]) + Math.abs(current[i + 1] - previous[i + 1]) + Math.abs(current[i + 2] - previous[i + 2]);
     worst = Math.max(worst, sum / (current.length / 4) * 255);
     previous = current;
   }
-  return { worst, jitters: jitters.size };
+  return { worst, parities: parities.size };
 });
-assert.ok(shimmer.jitters > 1, `the frame loop stalled: ${shimmer.jitters} distinct TAA jitters over the measurement`);
+assert.ok(shimmer.parities > 1, `the frame loop stalled: the TAA history buffer never flipped over the measurement`);
 
 const instancedMeshes = await page.evaluate(() => {
   let instanced = 0;

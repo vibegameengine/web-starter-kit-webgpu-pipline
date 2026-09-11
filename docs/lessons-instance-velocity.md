@@ -73,8 +73,11 @@ three's velocity arithmetic rather than adding to it.
 
 - **A stalled frame loop makes any temporal metric pass.** The first shimmer run
   reported 0.005 against 0.010 — both essentially zero — because the frames were not
-  advancing in the unfocused window. The check now collects the TAA jitter each sample
-  and asserts more than one distinct value before trusting the number.
+  advancing. The check now watches the TAA history parity across the samples and refuses
+  to report a number if it never flipped. The first version of that guard read
+  `taaState().jitter`, which `endFrame()` clears after the render, so between frames it
+  is always the same value: the guard fired on a perfectly live page. Pick a liveness
+  signal that is *not* reset at the end of the frame you are between.
 - **A 90-second scene is not a test rig.** The full village boots in ~90 s (2.3 M
   triangles of contact BVH, 2109 m² of lightmap, the water simulation settling), so a
   four-boot measurement was a ten-minute loop and the user stopped it. `?scene=village-light`
