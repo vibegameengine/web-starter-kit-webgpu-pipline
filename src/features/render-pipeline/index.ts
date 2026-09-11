@@ -10,6 +10,7 @@ import { giLightSummary } from '../../shared/gi/surfel/sceneLights.ts';
 import { addDynamicDemoObject, type DynamicObject } from '../../shared/gi/surfel/content.ts';
 import { hook, readUrlParams, type PipelineUi, type RenderPipeline, type SceneHost, type UrlParams } from './host.ts';
 import { setupSun, type SunControls } from './sun.ts';
+import { savedLightingFromUrl } from './lightingSettings.ts';
 import { CINE_CAMERAS, DEFAULT_CINE_CAMERA, applyCineCamera, horizontalFovDeg, relativeStops } from './cineCamera.ts';
 import { StaticLight } from './staticLight.ts';
 import { leakHookApi } from '../../shared/gi/bake/leakStages.ts';
@@ -350,7 +351,7 @@ function installAuditHooks(p: Pipeline, state: { paused: boolean; stepOnce: bool
   hook('__audit', {
     pipeline: 'render-pipeline',
     bakeCache: () => ({ ...staticLight.bakeCache }),
-    bakeStatus: () => ({ ...staticLight.bakeStatus(), provenance: staticLight.currentProvenance() }),
+    bakeStatus: () => ({ ...staticLight.bakeStatus(), provenance: staticLight.currentProvenance(), bakedWith: staticLight.bakedWith }),
     lighting: () => ({ baked: staticLight.ready, staticFrozen: gi.staticPinned, runtimeFrozen: gi.frozen, live: p.live.on }),
     probes: () => staticLight.probes ? {
       layout: { ...staticLight.probes.layout, min: staticLight.probes.layout.min.toArray() }, count: staticLight.probes.count,
@@ -485,7 +486,12 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   const hud = ui.showChrome ? new Hud(world, stats, () => staticLight.ready ? `atlas ${staticLight.atlasSize}px + probes` : 'baking', () => staticLight.ready ? staticLight.bakeStatusText() : 'baking') : null;
   ui.applySavedSettings?.(gui);
   const contactTree = await bootStage('Building the contact BVH', () => trace.buildTree(scene));
+  const lighting = await savedLightingFromUrl(window.location.search);
+  if (lighting.bakePasses !== undefined) staticLight.bakeParams.passes = lighting.bakePasses;
+  if (lighting.atlasIntensity !== undefined) staticLight.atlasParams.intensity = lighting.atlasIntensity;
+  if (lighting.environmentIntensity !== undefined) gi.setEnvControls(lighting.environmentIntensity, 4);
   await staticLight.prepare(frameGraph, { contactTree, interiorVolumes: host.interiorVolumes });
+  if (lighting.probeIntensity !== undefined && staticLight.probes) staticLight.probes.intensity.value = lighting.probeIntensity;
   const live = { on: url.flag('surfelGi', false) };
   const cachedReflections = trace.mode === 'cached'
     ? installReflectionCache(renderer, gi, host, { contactTree, probes: staticLight.probes, trace, frameGraph, url })

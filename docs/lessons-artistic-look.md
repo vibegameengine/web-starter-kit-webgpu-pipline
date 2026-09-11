@@ -184,14 +184,43 @@ for the VENICE at 24 mm, 76.76° for the anamorphic, 70.30° for IMAX against 44
 vista vision at the same 50 mm. One assertion in the first run was wrong and the code was
 right - the anamorphic is wider than IMAX because its lens is 40 mm, not 50.
 
+## Bake provenance, and the settings the bake never saw (§08, §04)
+
+**The bake now carries the light it was baked under.** `lightingProvenance.ts` records the
+sun's direction, intensity and colour, a digest of the environment panorama's texels, a
+digest of the transport settings and a lighting revision; it rides in the manifest the dev
+server already writes beside the bake, so no lightmap byte and no bake format changed. The
+comparison only reports, with reasons in words - "the sun moved 6.00°", "sun intensity
+4.657 → 6.985" - on the HUD as `baked light`, in the GI bake folder beside "re-bake now",
+and through `__audit.bakeStatus()`. Nothing in code rebakes, deletes or rewrites because of
+it, and a bake saved before provenance existed says `provenance unknown` instead of
+claiming to be valid.
+
+The environment's identity is a digest of every 64th texel rather than its URL, because two
+scenes can name the same path while the file on disk has been replaced.
+
+`node scripts/check-bake-stale.mjs`: a fresh corridor bake reports valid and is saved with
+its provenance; moving the sun 10° turns it stale with that reason; raising the intensity
+adds a second reason; the bake file's mtime does not change through any of it; putting the
+sun back reports valid again; the HUD row reads it; and the village's older bake reports
+unknown.
+
+**The saved lighting profile now reaches the atlas.** §04's guiSettings trap was real: the
+lighting controls are created after `staticLight.prepare()`, and a saved profile is applied
+to controls that exist - so the first fresh bake ran with the code defaults while the panel
+afterwards showed the saved numbers. `lightingSettings.ts` reads lightmap passes, atlas mul,
+probe mul and env out of the profile before the bake; `staticLight.bakedWith` records what
+the bake actually ran with, inside `bakeAtlas`.
+
+`node scripts/check-lighting-settings-order.mjs` writes a scene profile with 160 passes and
+atlas mul 0.7, drops that scene's bake, and reads `bakedWith` back:
+`{"passes":160,"rays":32,"atlasIntensity":0.7,"atlasSize":512}`, with the panel showing the
+same two numbers. A first attempt used 23 passes and the bake refused to persist as
+unconverged - which is its own proof that the number reached the baker.
+
 ## Not done
 
-- **Bake provenance and the stale flag** (§08): changing the sun or the environment does
-  not yet mark the baked indirect as stale, and nothing shows `provenance unknown` for a
-  bake loaded without metadata.
-- **Lighting settings read before `staticLight.prepare()`** (§04, the `guiSettings` trap):
-  still unfixed, so a first fresh bake can use different env/quality values than the ones
-  the panel shows afterwards.
+- **Water and foliage controls** (§05's last rows, the document's own P4) are untouched.
 - **The beach does not boot** at the moment: `padLightmapCharts` throws
   `chart 13713 has no measured texels`, from another session's in-flight work on
   `beachScene.ts`. Nothing here touches the chart padding. The village and the corridor
