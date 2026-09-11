@@ -67,36 +67,49 @@ re-typed a combinatorial number of times. Only 12 s of the window is the GPU.
   shader stage - the cost tracks the number of distinct materials, not the
   triangle count.
 
-## The fix that was measured, and why it is not in this tree
+## The fix
 
-A per-build type cache in the fork - `NodeBuilder.typeOf(node)`, a `WeakMap`
-keyed by `buildStage|shaderStage`, skipped during `setup`, with
-`globalThis.__nodeTypeCacheOff` as the ablation - and the three hot recursion
-sites (`MathNode.getInputType`, `MathNode.getNodeType` EQUALS branch,
-`OperatorNode.getNodeType`, `VarNode.getNodeType`) routed through it.
+A per-build type cache in the fork - `NodeBuilder.typeOf(node)`, a `WeakMap` keyed by
+`buildStage|shaderStage`, skipped during `setup` because a node's type is not settled
+until its children are built, with `globalThis.__nodeTypeCacheOff` as the ablation - and
+the four hot recursion sites routed through it: `MathNode.getInputType`, the EQUALS
+branch of `MathNode.getNodeType`, `OperatorNode.getNodeType` and `VarNode.getNodeType`.
+The patch is `docs/patches/three-node-type-cache.diff`, four files, 82 lines.
 
-`scripts/check-node-type-cache.mjs` boots the village twice in the same
-configuration, once with the cache disabled from `addInitScript`:
+`scripts/check-node-type-cache.mjs` boots the village twice in the same configuration,
+disabling the cache in one arm from `addInitScript`, and compares the settled frames:
 
 ```
-cache off: shaders 21.7s  first frame 41.9s  exposure 0.538129985332489
-cache on : shaders  5.5s  first frame 10.8s  exposure 0.5381324291229248
-saved 47.2s
+cache off: shaders 17.0s  first frame 37.8s  exposure 7.999996662139893
+cache on : shaders  6.2s  first frame  9.8s  exposure 7.999999046325684
+saved 38.8s
+pixels differing by more than 1/255: 75 of 921600 (0.008%), worst channel 7/255
 ```
 
-The image comparison is not yet closed. Two independent launches of the same
-build differ in 36.6 % of pixels, worst channel 62/255, and the difference does
-not come from the cache: metered exposure settled to the same 0.53813 in both,
-a global gain removal makes the count worse, and the amplified diff image is
-faint uniform noise everywhere plus bright geometry silhouettes - film grain and
-TAA jitter phase, not shading. The control - two boots with the cache on in both
-- gives 0.015 % and worst 10/255, but only because those two runs reached the
-first frame within 0.6 s of each other. The comparison has to be re-run with
-`&grain=0&aa=none` before the cache can be called visually equivalent.
+`vendor/three` is junctioned into every worktree, so the patch cannot be isolated by
+branching. It was reverted in the root tree; `worktrees/boot` carries its own copy of the
+fork's `src` and `examples` and the patch is applied there. Landing it means a commit in
+the fork repository, which every session shares.
 
-`vendor/three` is junctioned into every worktree, so this patch cannot be
-isolated by branching: it was reverted in the root tree and the work moves to a
-worktree with its own copy of the fork.
+## The image comparison that nearly rejected a correct fix
+
+The first A/B reported **98.8 % of pixels differing, worst channel 126/255**, and the
+second 36.6 % - against a control of two identical boots at 0.015 %. Three things had to
+be ruled out before the difference could be attributed:
+
+- Metered exposure. It adapts over seconds, and the two arms reached their first frame
+  20 s apart, so they were sampled at different points of the ramp. Reading
+  `__fog.exposure()` at capture time settled it: 0.538129985332489 against
+  0.5381324291229248, and later 7.999996662139893 against 7.999999046325684. Not exposure.
+- A global gain. Dividing out the mean ratio made the count worse, not better, so the
+  difference is not a brightness scale.
+- Where the pixels are. `scripts/_diff_png.mjs` bands the difference by row and column:
+  it was uniform across the frame, including the empty grey backdrop, plus bright
+  silhouettes along every geometry edge. That is film grain - per-frame noise - and TAA
+  jitter phase, which depends on how many frames have been accumulated.
+
+With `&grain=0&aa=none` the same comparison gives 75 pixels of 921600, worst 7/255. The
+cache is visually equivalent; the harness was measuring its own scheduling.
 
 ## Traps
 

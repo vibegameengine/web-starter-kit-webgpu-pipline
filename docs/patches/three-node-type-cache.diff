@@ -1,0 +1,82 @@
+--- a/src/nodes/core/NodeBuilder.js
++++ b/src/nodes/core/NodeBuilder.js
+@@ -1460,6 +1460,31 @@
+ 
+ 	}
+ 
++	typeOf( node ) {
++
++		if ( this.buildStage === 'setup' || globalThis.__nodeTypeCacheOff === true ) return node.getNodeType( this );
++
++		const key = this.buildStage + '|' + this.shaderStage;
++
++		if ( this._nodeTypeCache === undefined || this._nodeTypeCacheKey !== key ) {
++
++			this._nodeTypeCache = new WeakMap();
++			this._nodeTypeCacheKey = key;
++
++		}
++
++		const cached = this._nodeTypeCache.get( node );
++
++		if ( cached !== undefined ) return cached;
++
++		const type = node.getNodeType( this );
++
++		this._nodeTypeCache.set( node, type );
++
++		return type;
++
++	}
++
+ 	/**
+ 	 * Returns the vector type for a given type.
+ 	 *
+--- a/src/nodes/core/VarNode.js
++++ b/src/nodes/core/VarNode.js
+@@ -153,7 +153,7 @@
+ 
+ 	getNodeType( builder ) {
+ 
+-		return this.node.getNodeType( builder );
++		return builder.typeOf( this.node );
+ 
+ 	}
+ 
+--- a/src/nodes/math/MathNode.js
++++ b/src/nodes/math/MathNode.js
+@@ -101,9 +101,9 @@
+ 	 */
+ 	getInputType( builder ) {
+ 
+-		const aType = this.aNode.getNodeType( builder );
+-		const bType = this.bNode ? this.bNode.getNodeType( builder ) : null;
+-		const cType = this.cNode ? this.cNode.getNodeType( builder ) : null;
++		const aType = builder.typeOf( this.aNode );
++		const bType = this.bNode ? builder.typeOf( this.bNode ) : null;
++		const cType = this.cNode ? builder.typeOf( this.cNode ) : null;
+ 
+ 		const aLen = builder.isMatrix( aType ) ? 0 : builder.getTypeLength( aType );
+ 		const bLen = builder.isMatrix( bType ) ? 0 : builder.getTypeLength( bType );
+@@ -151,7 +151,7 @@
+ 
+ 		} else if ( method === MathNode.EQUALS ) {
+ 
+-			return builder.changeComponentType( this.aNode.getNodeType( builder ), 'bool' );
++			return builder.changeComponentType( builder.typeOf( this.aNode ), 'bool' );
+ 
+ 		} else {
+ 
+--- a/src/nodes/math/OperatorNode.js
++++ b/src/nodes/math/OperatorNode.js
+@@ -114,8 +114,8 @@
+ 		const aNode = this.aNode;
+ 		const bNode = this.bNode;
+ 
+-		const typeA = aNode.getNodeType( builder );
+-		const typeB = bNode ? bNode.getNodeType( builder ) : null;
++		const typeA = builder.typeOf( aNode );
++		const typeB = bNode ? builder.typeOf( bNode ) : null;
+ 
+ 		if ( typeA === 'void' || typeB === 'void' ) {
+ 
