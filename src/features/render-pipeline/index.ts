@@ -110,6 +110,9 @@ function bindLightingGui(gui: GUI, p: Pipeline, ui: PipelineUi): void {
   }
   const bake = gui.addFolder('GI bake');
   bake.add(staticLight.bakeParams, 'passes', 8, 256, 1).name('lightmap passes');
+  const bakeState = { status: 'baking' };
+  bake.add(bakeState, 'status').name('baked light').listen().disable();
+  setInterval(() => { bakeState.status = staticLight.ready ? staticLight.bakeStatusText() : 'baking'; }, 500);
   bake.add({ rebake: () => {
     void staticLight.prepare(frameGraph, { forceBake: true, contactTree: p.trace.buildTree(p.host.scene), interiorVolumes: p.host.interiorVolumes })
       .then(() => ui.clearLoading())
@@ -243,6 +246,7 @@ function installAuditHooks(p: Pipeline, state: { paused: boolean; stepOnce: bool
   hook('__audit', {
     pipeline: 'render-pipeline',
     bakeCache: () => ({ ...staticLight.bakeCache }),
+    bakeStatus: () => ({ ...staticLight.bakeStatus(), provenance: staticLight.currentProvenance() }),
     lighting: () => ({ baked: staticLight.ready, staticFrozen: gi.staticPinned, runtimeFrozen: gi.frozen, live: p.live.on }),
     probes: () => staticLight.probes ? {
       layout: { ...staticLight.probes.layout, min: staticLight.probes.layout.min.toArray() }, count: staticLight.probes.count,
@@ -254,6 +258,33 @@ function installAuditHooks(p: Pipeline, state: { paused: boolean; stepOnce: bool
       materials: staticLight.probeReceivers, intensity: staticLight.probes.intensity.value, visibility: staticLight.probes.visibilityTest.value,
       live: staticLight.probeLive ? { frames: staticLight.probeLive.frames, invalidations: staticLight.probeLive.invalidations, ...staticLight.probeLive.settings } : null,
     } : null,
+    atlasIntensity(value: number) { staticLight.atlasIntensity.value = value; return value; },
+    probeIntensity(value: number) { if (staticLight.probes) staticLight.probes.intensity.value = value; return value; },
+    pick(ndcX: number, ndcY: number) {
+      const raycaster = new THREE.Raycaster();
+      raycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), p.host.camera);
+      const hit = raycaster.intersectObjects(p.host.scene.children, true)[0];
+      if (!hit) return null;
+      const normal = hit.normal ? hit.normal.clone().transformDirection(hit.object.matrixWorld) : null;
+      return {
+        name: hit.object.name, distance: +hit.distance.toFixed(4),
+        point: hit.point.toArray().map((v) => +v.toFixed(4)),
+        normal: normal ? normal.toArray().map((v) => +v.toFixed(3)) : null,
+        sunDot: normal ? +normal.dot(p.host.sun.position.clone().normalize()).toFixed(3) : null,
+      };
+    },
+    meshBounds() {
+      const box = new THREE.Box3();
+      const out: { name: string; min: number[]; max: number[]; side: number; shadow: boolean }[] = [];
+      p.host.scene.traverse((object) => {
+        const mesh = object as THREE.Mesh;
+        if (!mesh.isMesh) return;
+        box.setFromObject(mesh);
+        const material = (Array.isArray(mesh.material) ? mesh.material[0] : mesh.material) as THREE.Material;
+        out.push({ name: mesh.name, min: box.min.toArray().map((v) => +v.toFixed(4)), max: box.max.toArray().map((v) => +v.toFixed(4)), side: material.side, shadow: mesh.castShadow });
+      });
+      return out;
+    },
     probeFill(radiance: number) { staticLight.probes?.fillConstant(radiance); },
     probeVisibility(value: boolean) { if (staticLight.probes) staticLight.probes.visibilityTest.value = value ? 1 : 0; },
     sun(azimuthDeg: number, elevationDeg: number, intensity?: number) {
@@ -346,7 +377,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   const trace = new TraceStages(renderer, gi, host, url);
   const world = new WorldState();
   const stats = new CacheStats();
-  const hud = ui.showChrome ? new Hud(world, stats, () => staticLight.ready ? `atlas ${staticLight.atlasSize}px + probes` : 'baking') : null;
+  const hud = ui.showChrome ? new Hud(world, stats, () => staticLight.ready ? `atlas ${staticLight.atlasSize}px + probes` : 'baking', () => staticLight.ready ? staticLight.bakeStatusText() : 'baking') : null;
   ui.applySavedSettings?.(gui);
   const contactTree = await bootStage('Building the contact BVH', () => trace.buildTree(scene));
   await staticLight.prepare(frameGraph, { contactTree, interiorVolumes: host.interiorVolumes });
