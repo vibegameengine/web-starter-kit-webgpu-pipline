@@ -96,6 +96,7 @@ export function createLightmapSurfels(pool: SurfelPool, size: number, height = s
   const U_PLANE_EPS = uniform(0.02);
   const U_SURFACE_TEST = uniform(1);
   const U_USE_LINKS = uniform(0);
+  const U_PLACEMENT = uniform(0);
   const linkAttr = new THREE.StorageBufferAttribute(new Uint32Array(texelCount), 1);
 
   let seedNode: THREE.ComputeNode | null = null;
@@ -113,6 +114,11 @@ export function createLightmapSurfels(pool: SurfelPool, size: number, height = s
    * screen coverage and has no meaning for an atlas), so they live for the whole bake
    * and the pool never recycles them out from under it.
    */
+  /* @important A texel whose footprint is cut by a wall cannot be one value, and its centre is on
+     whichever side the rasteriser happened to land. The sample is moved toward the neighbours it can
+     actually see, so it speaks for the larger part of its own footprint instead of the arbitrary
+     one. This is not the domain split design section 02 asks for - two sides still share one texel -
+     it is the placement half of it. `?bakePlacement=0` is the ablation. */
   function seed(
     renderer: THREE.WebGPURenderer,
     gbuffer: LightmapGBuffer,
@@ -148,6 +154,7 @@ export function createLightmapSurfels(pool: SurfelPool, size: number, height = s
 
       const positionTex = texture(gbuffer.position);
       const normalTex = texture(gbuffer.normal);
+      const links = storage(linkAttr, 'uint', texelCount).setAccess('readOnly');
 
       seedNode = Fn(() => {
         const tid = int(instanceIndex);
@@ -163,6 +170,41 @@ export function createLightmapSurfels(pool: SurfelPool, size: number, height = s
         const posSample = positionTex.sample(uv);
 
         If(posSample.w.greaterThan(0.5), () => {
+          const p0 = posSample.xyz.toVar();
+          const n0 = normalTex.sample(uv).xyz.normalize().toVar();
+          const mask = links.element(tid);
+          const drift = vec3(0, 0, 0).toVar();
+          const visible = float(0).toVar();
+          const blocked = float(0).toVar();
+          Loop(int(9), ({ i }) => {
+            const dx = i.mod(int(3)).sub(int(1));
+            const dy = i.div(int(3)).sub(int(1));
+            If(dx.equal(int(0)).and(dy.equal(int(0))), () => { return; });
+            const nx = x.add(dx);
+            const ny = y.add(dy);
+            If(
+              nx.greaterThanEqual(int(0)).and(nx.lessThan(int(size)))
+                .and(ny.greaterThanEqual(int(0))).and(ny.lessThan(int(height))),
+              () => {
+                const nUv = vec2(
+                  nx.toFloat().add(0.5).div(float(size)),
+                  ny.toFloat().add(0.5).div(float(height)),
+                );
+                const pj = positionTex.sample(nUv);
+                If(pj.w.greaterThan(0.5), () => {
+                  const bit = i.lessThan(int(4)).select(i, i.sub(int(1)));
+                  If(bitAnd(mask, shiftLeft(uint(1), uint(bit))).notEqual(uint(0)), () => {
+                    drift.addAssign(pj.xyz.sub(p0));
+                    visible.addAssign(1);
+                  }).Else(() => { blocked.addAssign(1); });
+                });
+              },
+            );
+          });
+          If(blocked.greaterThan(0).and(visible.greaterThan(0)).and(U_PLACEMENT.greaterThan(0)), () => {
+            const mean = drift.div(visible);
+            p0.addAssign(mean.sub(n0.mul(mean.dot(n0))).mul(U_PLACEMENT));
+          });
           // Same free-list pop the allocate pass performs, so these surfels occupy
           // real pool slots and the runtime allocator cannot hand them out twice.
           const slot = atomicAdd(poolAlloc.element(0), int(1));
@@ -172,8 +214,8 @@ export function createLightmapSurfels(pool: SurfelPool, size: number, height = s
             atomicMax(poolMax.element(0), sid.add(int(1)));
 
             const surfel = surfels.element(sid);
-            surfel.get('posb').assign(vec4(posSample.xyz, float(U_FRAME)));
-            surfel.get('normal').assign(normalTex.sample(uv).xyz.normalize());
+            surfel.get('posb').assign(vec4(p0, float(U_FRAME)));
+            surfel.get('normal').assign(n0);
             surfel.get('age').assign(int(0));
 
             // [RADIAL DEPTH] clear this surfel's tile — allocate does the same.
@@ -498,5 +540,5 @@ export function createLightmapSurfels(pool: SurfelPool, size: number, height = s
     return seeded;
   }
 
-  return { lightmap, seed, writeAtlas, readStats, countSeeded, readHalf, links: linkAttr, texelSurfel: texelSurfelAttr };
+  return { lightmap, seed, setPlacement: (value: number) => { U_PLACEMENT.value = value; }, writeAtlas, readStats, countSeeded, readHalf, links: linkAttr, texelSurfel: texelSurfelAttr };
 }

@@ -68,6 +68,13 @@ export const giKnobs = {
   /** @important `?spawnEps=radius` restores the ray offset that was a length in metres; see spawnEpsilon. */
   spawnEpsilonFromRadius: () => (params()?.get('spawnEps') ?? '') === 'radius',
 
+  /* @important How far a bake sample may move toward the neighbours it can see, as a fraction of
+     their spacing. Off by default and not because it is wrong: the case it was built for - the
+     sealed room at 0.23 m/texel, where a texel spans the wall base - now reads 0.00001 with it at 0,
+     the ray distance epsilon having been the whole leak. Moving every edge sample shifts contact
+     shadows, and nothing measured pays for that yet. `?bakePlacement=0.35` turns it on. Section 02. */
+  bakePlacement: () => num('bakePlacement', 0),
+
   /** Base surfel pool capacity, before any growth. */
   surfelBase: () => num('surfels', 0),
 

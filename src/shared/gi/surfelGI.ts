@@ -1374,6 +1374,14 @@ export class SurfelGI {
 
     const start = performance.now();
 
+    if (filterLinks) {
+      if (!this.lightmapFilterLinks) this.lightmapFilterLinks = createFilterLinks(size, lm.links);
+      const reach = this.staticBounds(scene).getSize(new THREE.Vector3()).length() * 0.05;
+      this.lightmapFilterLinks.run(renderer, gbuffer, filterLinks, { supportMetres: reach });
+      const linkStats = await this.lightmapFilterLinks.readStats(renderer);
+      console.log(`[lightmap] filter links: ${linkStats.links} allowed, ${linkStats.blocked} blocked across ${linkStats.texels} texels, ${linkStats.hidden} hidden inside solids, support ${reach.toFixed(2)} m`);
+    }
+    lm.setPlacement(filterLinks ? giKnobs.bakePlacement() : 0);
     if (!lm.seed(renderer, gbuffer)) return null;
     const seeded = await lm.countSeeded(renderer);
     console.log(`[lightmap] seeded ${seeded} surfels from the atlas`);
@@ -1425,15 +1433,7 @@ export class SurfelGI {
     // small scene or reject valid neighbours in a large one.
     const planeEpsilon =
       bounds.getSize(new THREE.Vector3()).length() * 0.0025;
-    let useLinks = false;
-    if (filterLinks) {
-      if (!this.lightmapFilterLinks) this.lightmapFilterLinks = createFilterLinks(size, lm.links);
-      const support = bounds.getSize(new THREE.Vector3()).length() * 0.05;
-      this.lightmapFilterLinks.run(renderer, gbuffer, filterLinks, { supportMetres: support });
-      const stats = await this.lightmapFilterLinks.readStats(renderer);
-      console.log(`[lightmap] filter links: ${stats.links} allowed, ${stats.blocked} blocked across ${stats.texels} texels, ${stats.hidden} hidden inside solids, support ${support.toFixed(2)} m`);
-      useLinks = true;
-    }
+    const useLinks = filterLinks !== null && filterLinks !== undefined;
     await lm.writeAtlas(renderer, gbuffer, { denoise, dilate, planeEpsilon, denoiseIgnoresSurface, useLinks, onStage });
     const stats = await lm.readStats(renderer);
     this.integrate.setExactReuse(false);
