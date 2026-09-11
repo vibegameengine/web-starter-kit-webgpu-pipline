@@ -1322,6 +1322,10 @@ export class SurfelGI {
       dilate?: number;
       /** Keep webgiya's lifecycle running beside the baked atlas for moving receivers. */
       dynamicReceivers?: boolean;
+      denoiseIgnoresSurface?: boolean;
+      height?: number;
+      freshSurfels?: boolean;
+      onStage?: (name: string, pixels: Float32Array) => void;
       onProgress?: (fraction: number, iteration: number) => void;
     } = {},
   ): Promise<{
@@ -1340,6 +1344,10 @@ export class SurfelGI {
       viewpoint,
       denoise,
       dilate,
+      denoiseIgnoresSurface,
+      height = size,
+      freshSurfels,
+      onStage,
       onProgress,
     } = options;
 
@@ -1348,10 +1356,11 @@ export class SurfelGI {
     // ~143 k of them. Growing here rather than discovering the shortfall during seeding
     // is what stops the tail of the atlas baking black — and this is the safe moment to
     // do it, because `resetCache` has already thrown the runtime cache away.
-    this.ensurePoolCapacity(renderer, Math.min(MAX_SURFELS, size * size));
+    this.ensurePoolCapacity(renderer, Math.min(MAX_SURFELS, size * height));
 
+    if (freshSurfels) this.lightmapSurfels = null;
     if (!this.lightmapSurfels) {
-      this.lightmapSurfels = createLightmapSurfels(this.pool, size);
+      this.lightmapSurfels = createLightmapSurfels(this.pool, size, height);
     }
     const lm = this.lightmapSurfels;
 
@@ -1407,7 +1416,7 @@ export class SurfelGI {
     // small scene or reject valid neighbours in a large one.
     const planeEpsilon =
       bounds.getSize(new THREE.Vector3()).length() * 0.0025;
-    lm.writeAtlas(renderer, gbuffer, { denoise, dilate, planeEpsilon });
+    await lm.writeAtlas(renderer, gbuffer, { denoise, dilate, planeEpsilon, denoiseIgnoresSurface, onStage });
     const stats = await lm.readStats(renderer);
     this.setBaseSampleCount(this.runtimeSampleCount);
 

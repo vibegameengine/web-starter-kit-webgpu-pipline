@@ -57,8 +57,8 @@ import type { LightmapGBuffer } from './lightmapGBuffer.ts';
  * no leak gate — the resolve exists to *reconstruct* a value at a point that has no
  * surfel of its own, and here every point has one by construction.
  */
-export function createLightmapSurfels(pool: SurfelPool, size: number) {
-  const texelCount = size * size;
+export function createLightmapSurfels(pool: SurfelPool, size: number, height = size) {
+  const texelCount = size * height;
   const DEPTH_TILE = SURFEL_DEPTH_TEXELS * SURFEL_DEPTH_TEXELS;
 
   /** texel -> surfel index, or -1 where no chart covers the texel. */
@@ -79,7 +79,7 @@ export function createLightmapSurfels(pool: SurfelPool, size: number) {
     4,
   );
 
-  const lightmap = new THREE.StorageTexture(size, size);
+  const lightmap = new THREE.StorageTexture(size, height);
   lightmap.type = THREE.HalfFloatType;
   lightmap.format = THREE.RGBAFormat;
   lightmap.minFilter = THREE.LinearFilter;
@@ -91,6 +91,7 @@ export function createLightmapSurfels(pool: SurfelPool, size: number) {
   const U_DST = uniform(0);
   /** How far off a texel's own plane a neighbour may sit and still be averaged in. */
   const U_PLANE_EPS = uniform(0.02);
+  const U_SURFACE_TEST = uniform(1);
 
   let seedNode: THREE.ComputeNode | null = null;
   let writeNode: THREE.ComputeNode | null = null;
@@ -149,7 +150,7 @@ export function createLightmapSurfels(pool: SurfelPool, size: number) {
         const y = tid.div(int(size));
         const uv = vec2(
           x.toFloat().add(0.5).div(float(size)),
-          y.toFloat().add(0.5).div(float(size)),
+          y.toFloat().add(0.5).div(float(height)),
         );
 
         texelSurfel.element(tid).assign(int(-1));
@@ -213,16 +214,16 @@ export function createLightmapSurfels(pool: SurfelPool, size: number) {
    * of every iteration exactly as `update()` does, so after the final swap the
    * converged half is the one the *next* integration would read.
    */
-  function writeAtlas(
+  async function writeAtlas(
     renderer: THREE.WebGPURenderer,
     gbuffer: LightmapGBuffer,
-    options: { denoise?: number; dilate?: number; planeEpsilon?: number } = {},
-  ): boolean {
+    options: { denoise?: number; dilate?: number; planeEpsilon?: number; denoiseIgnoresSurface?: boolean; onStage?: (name: string, pixels: Float32Array) => void } = {},
+  ): Promise<boolean> {
     const momentsAttr = pool.getMomentsAttr();
     const surfelAttr = pool.getSurfelAttr();
     if (!momentsAttr || !surfelAttr) return false;
 
-    const { denoise = 2, dilate = 4, planeEpsilon = 0.02 } = options;
+    const { denoise = 2, dilate = 4, planeEpsilon = 0.02, denoiseIgnoresSurface = false, onStage } = options;
     const capacity = surfelAttr.count;
 
     if (!writeNode) {
@@ -239,7 +240,7 @@ export function createLightmapSurfels(pool: SurfelPool, size: number) {
       const texelUv = (x: ReturnType<typeof int>, y: ReturnType<typeof int>) =>
         vec2(
           x.toFloat().add(0.5).div(float(size)),
-          y.toFloat().add(0.5).div(float(size)),
+          y.toFloat().add(0.5).div(float(height)),
         );
 
       writeNode = Fn(() => {
@@ -300,7 +301,7 @@ export function createLightmapSurfels(pool: SurfelPool, size: number) {
                 .and(nx.greaterThanEqual(int(0)))
                 .and(nx.lessThan(int(size)))
                 .and(ny.greaterThanEqual(int(0)))
-                .and(ny.lessThan(int(size))),
+                .and(ny.lessThan(int(height))),
               () => {
                 const j = ny.mul(int(size)).add(nx);
                 const s = atlas.element(j.add(int(U_SRC)));
@@ -313,7 +314,8 @@ export function createLightmapSurfels(pool: SurfelPool, size: number) {
                     n0
                       .dot(nj)
                       .greaterThan(0.9)
-                      .and(pj.sub(p0).dot(n0).abs().lessThan(U_PLANE_EPS)),
+                      .and(pj.sub(p0).dot(n0).abs().lessThan(U_PLANE_EPS))
+                      .or(U_SURFACE_TEST.lessThan(0.5)),
                     () => {
                       sum.addAssign(s.xyz);
                       count.addAssign(1);
@@ -358,7 +360,7 @@ export function createLightmapSurfels(pool: SurfelPool, size: number) {
                 .greaterThanEqual(int(0))
                 .and(nx.lessThan(int(size)))
                 .and(ny.greaterThanEqual(int(0)))
-                .and(ny.lessThan(int(size))),
+                .and(ny.lessThan(int(height))),
               () => {
                 const s = atlas.element(ny.mul(int(size)).add(nx).add(int(U_SRC)));
                 If(s.w.greaterThan(0.25), () => {
@@ -396,6 +398,7 @@ export function createLightmapSurfels(pool: SurfelPool, size: number) {
 
     U_READ_OFFSET.value = pool.getOffsets().readOffset;
     U_PLANE_EPS.value = planeEpsilon;
+    U_SURFACE_TEST.value = denoiseIgnoresSurface ? 0 : 1;
 
     // Ping-pong through the two halves; `half` always names the one holding the
     // current result, which is what readStats and the blit must both read.
@@ -410,12 +413,21 @@ export function createLightmapSurfels(pool: SurfelPool, size: number) {
       renderer.compute(node);
     };
 
-    for (let i = 0; i < denoise; i++) step(denoiseNode!);
-    for (let i = 0; i < dilate; i++) step(dilateNode!);
+    const capture = async (name: string) => { if (onStage) onStage(name, await readHalf(renderer)); };
+    await capture('raw');
+    for (let i = 0; i < denoise; i++) { step(denoiseNode!); await capture(`denoise ${i + 1}`); }
+    for (let i = 0; i < dilate; i++) { step(dilateNode!); await capture(`dilate ${i + 1}`); }
 
     U_SRC.value = half * texelCount;
     renderer.compute(blitNode!);
     return true;
+  }
+
+  async function readHalf(renderer: THREE.WebGPURenderer): Promise<Float32Array> {
+    const buffer = await renderer.getArrayBufferAsync(atlasAttr);
+    const floats = new Float32Array(buffer);
+    const base = half * texelCount * 4;
+    return floats.slice(base, base + texelCount * 4);
   }
 
   /**
@@ -475,5 +487,5 @@ export function createLightmapSurfels(pool: SurfelPool, size: number) {
     return seeded;
   }
 
-  return { lightmap, seed, writeAtlas, readStats, countSeeded, texelSurfel: texelSurfelAttr };
+  return { lightmap, seed, writeAtlas, readStats, countSeeded, readHalf, texelSurfel: texelSurfelAttr };
 }

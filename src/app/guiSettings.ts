@@ -1,7 +1,7 @@
 import type GUI from 'lil-gui';
 
 const ROUTE = '/__gui_settings';
-const NAVIGATION_KEYS = new Set(['scene', 'cam', 'hud', 'settings']);
+const NAVIGATION_KEYS = new Set(['scene', 'cam', 'hud', 'settings', 'lodLab', 'lod']);
 const PROFILE_STORAGE_KEY = 'elderwood.guiSettingsProfile';
 const SETTINGS_FOLDER = 'Settings file';
 
@@ -31,6 +31,19 @@ export function settingsProfile(params: URLSearchParams): SettingsProfile {
   if (SETTINGS_PROFILES.includes(forced as SettingsProfile)) return forced as SettingsProfile;
   for (const key of params.keys()) if (!NAVIGATION_KEYS.has(key)) return 'off';
   return storedProfile();
+}
+
+export type ProfileSource =
+  | { kind: 'url'; parameter: string }
+  | { kind: 'ablation'; parameters: string[] }
+  | { kind: 'panel' };
+
+export function settingsProfileSource(params: URLSearchParams): ProfileSource {
+  const forced = params.get('settings');
+  if (forced !== null) return { kind: 'url', parameter: `?settings=${forced}` };
+  const ablations = [...params.keys()].filter((key) => !NAVIGATION_KEYS.has(key));
+  if (ablations.length) return { kind: 'ablation', parameters: ablations };
+  return { kind: 'panel' };
 }
 
 function storedProfile(): SettingsProfile {

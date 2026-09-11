@@ -17,7 +17,7 @@ export interface PersistedProbes {
   probeData: Float32Array;
   bakedSunIntensity: number;
 }
-export interface PersistedBake { size: number; pixels: Float32Array; surfels: FrozenSurfelData; probes?: PersistedProbes }
+export interface PersistedBake { size: number; pages?: number; pixels: Float32Array; surfels: FrozenSurfelData; probes?: PersistedProbes }
 const PROBE_BLOCK_MAGIC = 0x32425250;
 const PROBE_HEADER_WORDS = 16;
 const BAKE_VERSION = 3;
@@ -67,7 +67,7 @@ export async function encodeBake(bake: PersistedBake): Promise<ArrayBuffer> {
   const chunks = [bake.pixels, s.spatial, s.moments, s.depth, s.guiding, probeBlock];
   const size = 32 + chunks.reduce((n, a) => n + a.byteLength, 0);
   const buffer = new ArrayBuffer(size + 32);
-  new Uint32Array(buffer, 0, 8).set([0x42474957, BAKE_VERSION, bake.size, s.capacity, s.count, s.spatial.length, s.moments.length, s.depth.length]);
+  new Uint32Array(buffer, 0, 8).set([0x42474957, BAKE_VERSION, bake.size | ((bake.pages ?? 1) << 16), s.capacity, s.count, s.spatial.length, s.moments.length, s.depth.length]);
   let offset = 32;
   for (const chunk of chunks) { new Uint8Array(buffer, offset, chunk.byteLength).set(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength)); offset += chunk.byteLength; }
   new Uint8Array(buffer, size).set(await digest(new Uint8Array(buffer, 0, size)));
@@ -76,17 +76,19 @@ export async function encodeBake(bake: PersistedBake): Promise<ArrayBuffer> {
 
 export async function decodeBake(buffer: ArrayBuffer): Promise<PersistedBake> {
   if (buffer.byteLength < 64 || buffer.byteLength % 4) throw new Error('Truncated bake');
-  const [magic, version, size, capacity, count, spatial, moments, depth] = new Uint32Array(buffer, 0, 8);
+  const [magic, version, packedSize, capacity, count, spatial, moments, depth] = new Uint32Array(buffer, 0, 8);
+  const size = packedSize & 0xffff;
+  const pages = (packedSize >>> 16) || 1;
   // `size` 0 is a surfel-only cache: the warmed radiance cache with no lightmap.
   if (magic !== 0x42474957 || (version !== 2 && version !== BAKE_VERSION) || (size !== 0 && (size < 2 || size > 4096 || !Number.isInteger(Math.log2(size)))) || count < 1 || count > capacity || capacity > 1048576 || spatial !== count * 8 || moments !== count * 20 || depth !== count * 64) throw new Error('Incompatible bake header');
-  const lengths = [size * size * 4, spatial, moments, depth, count * 72];
+  const lengths = [size * size * pages * 4, spatial, moments, depth, count * 72];
   const surfelEnd = 32 + lengths.reduce((a, b) => a + b * 4, 0);
   const end = buffer.byteLength - 32;
   if (end < surfelEnd || hex(await digest(new Uint8Array(buffer, 0, end))) !== hex(new Uint8Array(buffer, end))) throw new Error('Bake checksum mismatch');
   let offset = 32;
   const chunks = lengths.map(length => { const array = new Float32Array(buffer, offset, length); offset += length * 4; return array; });
   const probes = end > surfelEnd ? decodeProbeBlock(buffer, surfelEnd, end) : undefined;
-  return { size, pixels: chunks[0], surfels: { capacity, count, spatial: chunks[1], moments: chunks[2], depth: chunks[3], guiding: chunks[4] }, probes };
+  return { size, pages, pixels: chunks[0], surfels: { capacity, count, spatial: chunks[1], moments: chunks[2], depth: chunks[3], guiding: chunks[4] }, probes };
 }
 
 /**

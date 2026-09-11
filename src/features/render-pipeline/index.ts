@@ -11,18 +11,20 @@ import { addDynamicDemoObject, type DynamicObject } from '../../shared/gi/surfel
 import { hook, readUrlParams, type PipelineUi, type RenderPipeline, type SceneHost, type UrlParams } from './host.ts';
 import { setupSun, type SunControls } from './sun.ts';
 import { StaticLight } from './staticLight.ts';
+import { leakHookApi } from '../../shared/gi/bake/leakStages.ts';
 import { TraceStages } from './traceStages.ts';
 import { PostStages } from './postStages.ts';
 import { gpuPasses } from './audit.ts';
+import { LodLab } from '../../widgets/lod-lab/index.ts';
+import { bootStage } from '../../shared/ui/bootProgress.ts';
 
 export type { SceneHost, PipelineUi, RenderPipeline } from './host.ts';
 
 const MAX_MOVERS = 64;
 const HALF_GBUFFER = 0.5;
 
-export async function createRenderPipeline(renderer: THREE.WebGPURenderer, ui: PipelineUi): Promise<RenderPipeline> {
-  ui.setLoading('Loading GI assets');
-  const gi = await SurfelGI.create(renderer);
+export async function createRenderPipeline(renderer: THREE.WebGPURenderer): Promise<RenderPipeline> {
+  const gi = await bootStage('Loading GI assets', () => SurfelGI.create(renderer));
   return { gi, envTexture: gi.envTexture, run: (host, gui, runUi) => runPipeline(renderer, gi, host, gui, runUi) };
 }
 
@@ -72,6 +74,23 @@ interface Pipeline {
   renderer: THREE.WebGPURenderer; gi: SurfelGI; host: SceneHost; url: UrlParams; frameGraph: FrameGraph;
   staticLight: StaticLight; trace: TraceStages; post: PostStages; sun: SunControls; live: { on: boolean }; giScale: () => number;
   dynamic: ReturnType<typeof addMovers>; world: WorldState; stats: CacheStats; hud: Hud | null;
+  lab: LodLab | null;
+}
+
+function openLodLab(renderer: THREE.WebGPURenderer, staticLight: StaticLight, camera: THREE.PerspectiveCamera, frameGraph: FrameGraph): LodLab | null {
+  if (!staticLight.lod) {
+    console.warn('[lod-lab] needs ?lod=1');
+    return null;
+  }
+  const lab = new LodLab(renderer, staticLight.lod);
+  const guiElement = document.querySelector<HTMLElement>('.lil-gui.root');
+  const gutter = guiElement ? guiElement.getBoundingClientRect().width : 0;
+  document.documentElement.style.setProperty('--lod-lab-gutter', `${Math.ceil(gutter)}px`);
+  document.body.classList.add('lod-lab');
+  camera.aspect = (window.innerWidth / 2) / window.innerHeight;
+  camera.updateProjectionMatrix();
+  frameGraph.setSize(window.innerWidth / 2, window.innerHeight);
+  return lab;
 }
 
 function bindLightingGui(gui: GUI, p: Pipeline, ui: PipelineUi): void {
@@ -91,9 +110,41 @@ function bindLightingGui(gui: GUI, p: Pipeline, ui: PipelineUi): void {
   }
   const bake = gui.addFolder('GI bake');
   bake.add(staticLight.bakeParams, 'passes', 8, 256, 1).name('lightmap passes');
-  bake.add({ rebake: () => { void staticLight.prepare(frameGraph, { forceBake: true, contactTree: p.trace.buildTree(p.host.scene), interiorVolumes: p.host.interiorVolumes }).catch(ui.showError); } }, 'rebake').name('re-bake now');
+  bake.add({ rebake: () => {
+    void staticLight.prepare(frameGraph, { forceBake: true, contactTree: p.trace.buildTree(p.host.scene), interiorVolumes: p.host.interiorVolumes })
+      .then(() => ui.clearLoading())
+      .catch(ui.showError);
+  } }, 'rebake').name('re-bake now');
   const envParams = { env: p.url.num('env') ?? 1, lod: 4 };
   giFolder.add(envParams, 'env', 0, 5, 0.05).name('env').onChange(() => gi.setEnvControls(envParams.env, envParams.lod));
+}
+
+function atlasTexelUnderPointer(p: Pipeline, event: MouseEvent): [number, number] | null {
+  const leak = p.staticLight.leak;
+  if (!leak || p.frameGraph.split !== SplitView.Leak) return null;
+  const rect = p.renderer.domElement.getBoundingClientRect();
+  const u = (event.clientX - rect.left) / rect.width;
+  if (u < p.frameGraph.splitPosition) return null;
+  const local = (u - p.frameGraph.splitPosition) / (1 - p.frameGraph.splitPosition);
+  const v = (event.clientY - rect.top) / rect.height;
+  if (local > 1) return null;
+  return [Math.floor(local * leak.size), Math.floor(v * leak.size)];
+}
+
+function bindLeakGui(gui: GUI, p: Pipeline): void {
+  const leak = p.staticLight.leak;
+  if (!leak) return;
+  const folder = gui.addFolder('Bake leak');
+  const params = { stage: leak.shown, gain: leak.diffGain };
+  const stage = folder.add(params, 'stage', leak.options()).name('atlas stage');
+  stage.onChange((v: string) => { leak.show(v); p.frameGraph.setSplitView(SplitView.Leak); });
+  folder.add(params, 'gain', 1, 64, 1).name('diff gain').onChange((v: number) => { leak.diffGain = v; leak.show(leak.shown); });
+  folder.add({ show: () => { stage.options(leak.options()).setValue(leak.shown); p.frameGraph.setSplitView(SplitView.Leak); } }, 'show').name('show in right pane');
+  folder.add({ report: () => { console.table(leak.firstChange()); console.table(leak.inventedLight()); } }, 'report').name('first changed stage');
+  p.renderer.domElement.addEventListener('click', (event) => {
+    const texel = atlasTexelUnderPointer(p, event);
+    if (texel) console.log('[leak]', JSON.stringify(leak.inspect(texel[0], texel[1])));
+  });
 }
 
 function countProbes(volume: ProbeVolume, test: (volume: ProbeVolume, probe: number) => boolean): number {
@@ -103,7 +154,7 @@ function countProbes(volume: ProbeVolume, test: (volume: ProbeVolume, probe: num
 }
 
 function installHooks(p: Pipeline, state: { paused: boolean; stepOnce: boolean; frozen: boolean; intervals: number[]; recording: boolean }): void {
-  const { renderer, host, gi, frameGraph, staticLight, sun } = p;
+  const { renderer, host, frameGraph, sun } = p;
   const { camera, controls } = host;
   hook('__probe', () => ({
     sunPos: host.sun.position.toArray(), sunIntensity: host.sun.intensity, camera: camera.position.toArray(), target: controls.target.toArray(),
@@ -112,9 +163,83 @@ function installHooks(p: Pipeline, state: { paused: boolean; stepOnce: boolean; 
   hook('__camera', (px: number, py: number, pz: number, tx: number, ty: number, tz: number) => {
     camera.position.set(px, py, pz); controls.target.set(tx, ty, tz); controls.update(); camera.updateMatrixWorld(); return true;
   });
+  installLodHooks(p);
   hook('__gpuPasses', (frames = 60) => gpuPasses(renderer, frames));
+  if (p.staticLight.leak) hook('__leak', leakHookApi(p.staticLight.leak, () => frameGraph.setSplitView(SplitView.Leak)));
   hook('__fog', { ...p.post.hooks(), ...p.trace.hooks(frameGraph) });
   hook('__freeze', (t: number) => { p.dynamic?.update(t); state.frozen = true; return true; });
+  installAuditHooks(p, state);
+}
+
+function installLodHooks(p: Pipeline): void {
+  const { renderer, staticLight } = p;
+  hook('__lod', () => {
+    const lod = staticLight.lod;
+    if (!lod) return null;
+    return {
+      charts: staticLight.layout?.regions.length ?? 0,
+      pages: lod.pool.pages.length,
+      poolMiB: +(lod.pool.bytes / 1048576).toFixed(2),
+      atlasSize: lod.atlas.size,
+      resident: lod.atlas.residentCount(),
+      usedCells: lod.atlas.usedCells(),
+      totalCells: lod.atlas.totalCells(),
+      copies: lod.atlas.copiesLastFrame,
+      ...lod.plan,
+      demands: undefined,
+      mips: lod.plan.demands.reduce((counts: Record<number, number>, demand) => {
+        counts[demand.mip] = (counts[demand.mip] ?? 0) + 1;
+        return counts;
+      }, {}),
+    };
+  });
+  hook('__chartLight', (name = 'bench') => {
+    const layout = staticLight.layout;
+    const pixels = staticLight.atlasPixels;
+    if (!layout || !pixels) return null;
+    const size = staticLight.atlasSize;
+    return layout.placements.flatMap((placement, chart) => {
+      if (placement.mesh.name !== name) return [];
+      const { x, y, width, height } = placement.region;
+      let sum = 0;
+      let lit = 0;
+      for (let row = 0; row < height; row++) {
+        for (let column = 0; column < width; column++) {
+          const index = ((y + row) * size + x + column) * 4;
+          const value = (pixels[index] + pixels[index + 1] + pixels[index + 2]) / 3;
+          sum += value;
+          if (value > 0.002) lit++;
+        }
+      }
+      return [{ chart, region: placement.region, centre: placement.centre.toArray().map((v) => +v.toFixed(2)),
+        mean: +(sum / (width * height)).toFixed(5), litFraction: +(lit / (width * height)).toFixed(2) }];
+    });
+  });
+  hook('__lodChart', (name = 'bench') => {
+    const lod = staticLight.lod;
+    const layout = staticLight.layout;
+    if (!lod || !layout) return null;
+    return layout.placements.flatMap((placement, chart) => {
+      if (placement.mesh.name !== name) return [];
+      return [{
+        chart, region: placement.region, lastMip: lod.pool.lastMip(chart),
+        centre: placement.centre.toArray().map((v) => +v.toFixed(2)),
+        extent: [+placement.extentU.toFixed(2), +placement.extentV.toFixed(2)],
+        root: [lod.pool.rootColours[chart * 3], lod.pool.rootColours[chart * 3 + 1], lod.pool.rootColours[chart * 3 + 2]].map((v) => +v.toFixed(5)),
+        residentMip: lod.atlas.residentMip(chart),
+      }];
+    }).slice(0, 8);
+  });
+  hook('__lodPixels', async (x = 0, y = 0, width = 32, height = 4) => {
+    const lod = staticLight.lod;
+    if (!lod) return null;
+    const pixels = await renderer.readRenderTargetPixelsAsync(lod.atlas.target, x, y, width, height);
+    return Array.from(pixels.slice(0, Math.min(pixels.length, 256)));
+  });
+}
+
+function installAuditHooks(p: Pipeline, state: { paused: boolean; stepOnce: boolean; frozen: boolean; intervals: number[]; recording: boolean }): void {
+  const { renderer, gi, frameGraph, staticLight, sun } = p;
   hook('__audit', {
     pipeline: 'render-pipeline',
     bakeCache: () => ({ ...staticLight.bakeCache }),
@@ -158,7 +283,7 @@ function startLoop(p: Pipeline, ui: PipelineUi, state: { paused: boolean; stepOn
   const { renderer, gi, host, frameGraph, trace, post, world, stats, hud } = p;
   const { scene, camera, controls } = host;
   let previous = performance.now();
-  let firstFrame = true;
+  let framesShown = 0;
   let fatal = false;
   window.addEventListener('error', () => { fatal = true; });
   window.addEventListener('unhandledrejection', () => { fatal = true; });
@@ -190,14 +315,16 @@ function startLoop(p: Pipeline, ui: PipelineUi, state: { paused: boolean; stepOn
     } else {
       frameGraph.setGiTextures(null, null);
     }
+    p.staticLight.lod?.update(camera, window.innerHeight);
     trace.update(scene, frameGraph);
     scene.background = host.skyIsBackground ? gi.envTexture : null;
     post.beforeRender(now, dt);
     frameGraph.render();
     frameGraph.endFrame();
     stats.endFrame(world.dt);
+    p.lab?.update();
     hud?.update(world.dt);
-    if (firstFrame) { firstFrame = false; ui.clearLoading(); }
+    if (framesShown < 2 && ++framesShown === 2) ui.clearLoading();
   });
 }
 
@@ -207,23 +334,22 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   gi.rigidSurfels = url.flag('rigidSurfels', true);
   gi.setLeafTransmit(url.flag('giLeafTransmit', true));
   const sun = setupSun(gui, host, { envTexture: gi.envTexture, blueNoise: gi.blueNoiseTexture }, url);
-  const staticLight = new StaticLight(renderer, gi, scene, host.sun, url, ui);
-  staticLight.unwrap();
+  const staticLight = new StaticLight(renderer, gi, scene, host.sun, url);
+  await staticLight.unwrap();
   const dynamic = addMovers(host, url);
   dynamic?.update(0);
-  ui.setLoading('Building static BVH');
-  gi.buildScene(renderer, scene);
+  await bootStage('Building the static BVH', () => gi.buildScene(renderer, scene));
   gi.setDynamicTracing(url.flag('dyntrace', true));
   gi.setEnvControls(url.num('env') ?? 1, 4);
-  ui.setLoading('Compiling frame graph');
-  const frameGraph = createFrameGraph(renderer, host, url);
+  const frameGraph = await bootStage('Compiling the frame graph', () => createFrameGraph(renderer, host, url));
   const post = new PostStages(renderer, host, gi.envTexture as THREE.DataTexture, frameGraph, url);
   const trace = new TraceStages(renderer, gi, host, url);
   const world = new WorldState();
   const stats = new CacheStats();
   const hud = ui.showChrome ? new Hud(world, stats, () => staticLight.ready ? `atlas ${staticLight.atlasSize}px + probes` : 'baking') : null;
   ui.applySavedSettings?.(gui);
-  await staticLight.prepare(frameGraph, { contactTree: trace.buildTree(scene), interiorVolumes: host.interiorVolumes });
+  const contactTree = await bootStage('Building the contact BVH', () => trace.buildTree(scene));
+  await staticLight.prepare(frameGraph, { contactTree, interiorVolumes: host.interiorVolumes });
   const live = { on: url.flag('surfelGi', false) };
   if (staticLight.probes && url.flag('probeSpecular', true)) {
     const volume = staticLight.probes;
@@ -231,24 +357,29 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   }
   const giScale = () => (live.on ? 1 : (url.num('giScale') ?? HALF_GBUFFER));
   staticLight.setLiveChainServesReceivers(live.on);
-  const p: Pipeline = { renderer, gi, host, url, frameGraph, staticLight, trace, post, sun, live, dynamic, world, stats, hud, giScale };
+  const lab = url.flag('lodLab', false) ? openLodLab(renderer, staticLight, camera, frameGraph) : null;
+  const p: Pipeline = { renderer, gi, host, url, frameGraph, staticLight, trace, post, sun, live, dynamic, world, stats, hud, giScale, lab };
   gi.resize(renderer, giScale());
   bindLightingGui(gui, p, ui);
+  bindLeakGui(gui, p);
   host.bindGui?.(gui);
   post.bindGui(gui);
   trace.bindGui(gui, frameGraph);
   window.addEventListener('resize', () => {
-    camera.aspect = window.innerWidth / window.innerHeight;
+    const width = lab ? window.innerWidth / 2 : window.innerWidth;
+    camera.aspect = width / window.innerHeight;
     camera.updateProjectionMatrix();
-    frameGraph.setSize(window.innerWidth, window.innerHeight);
+    frameGraph.setSize(width, window.innerHeight);
     gi.resize(renderer, p.giScale());
   });
   const state = { paused: false, stepOnce: false, frozen: false, intervals: [] as number[], recording: false, sunSeen: '' };
   const freezeAt = url.num('freezeAt');
   if (freezeAt !== null) { dynamic?.update(freezeAt); state.frozen = true; }
   installHooks(p, state);
-  const programs = url.flag('warmup', true) ? renderer.compileAsync(scene, camera) : Promise.resolve();
-  trace.tree(scene);
-  await programs;
-  startLoop(p, ui, state);
+  await bootStage('Compiling shaders', async () => {
+    const programs = url.flag('warmup', true) ? renderer.compileAsync(scene, camera) : Promise.resolve();
+    trace.tree(scene);
+    await programs;
+  });
+  await bootStage('Waiting for the first frame', () => startLoop(p, ui, state));
 }

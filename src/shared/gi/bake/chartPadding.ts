@@ -5,19 +5,19 @@ export interface LightmapRegion { x: number; y: number; width: number; height: n
  * baked sample, including physically black samples. No brightness threshold.
  * A bounded breadth-first expansion fills arbitrary holes and border padding in
  * O(atlas texels), without allocating per chart or touching another rectangle. */
-export function padLightmapCharts(pixels: Float32Array, size: number, regions: LightmapRegion[]): number {
-  if (pixels.length !== size * size * 4) throw new Error('Invalid lightmap padding dimensions');
-  const owners = new Int32Array(size * size).fill(-1);
+export function padLightmapCharts(pixels: Float32Array, size: number, regions: LightmapRegion[], height = size): number {
+  if (pixels.length !== size * height * 4) throw new Error('Invalid lightmap padding dimensions');
+  const owners = new Int32Array(size * height).fill(-1);
   for (const [id, region] of regions.entries()) {
     const { x, y, width, height } = region;
-    if (![x, y, width, height].every(Number.isInteger) || x < 0 || y < 0 || width < 1 || height < 1 || x + width > size || y + height > size) throw new Error('Invalid lightmap chart rectangle');
+    if (![x, y, width, height].every(Number.isInteger) || x < 0 || y < 0 || width < 1 || height < 1 || x + width > size) throw new Error('Invalid lightmap chart rectangle');
     for (let py = y; py < y + height; py++) for (let px = x; px < x + width; px++) {
       const index = py * size + px;
       if (owners[index] !== -1) throw new Error('Overlapping lightmap chart rectangles');
       owners[index] = id;
     }
   }
-  const queue = new Int32Array(size * size);
+  const queue = new Int32Array(size * height);
   let tail = 0, filled = 0;
   const seeds = new Uint32Array(regions.length);
   for (let i = 0; i < owners.length; i++) {

@@ -1,6 +1,7 @@
 import * as THREE from 'three/webgpu';
 import {
   attribute,
+  float,
   modelNormalMatrix,
   modelWorldMatrix,
   mrt,
@@ -20,20 +21,21 @@ export async function measureCoverage(
   renderer: THREE.WebGPURenderer,
   gbuffer: LightmapGBuffer,
   size: number,
+  height = size,
 ): Promise<{ covered: number; total: number; fraction: number }> {
   const pixels = await renderer.readRenderTargetPixelsAsync(
     gbuffer.target,
     0,
     0,
     size,
-    size,
+    height,
     0,
   );
   let covered = 0;
   for (let i = 3; i < pixels.length; i += 4) {
     if (pixels[i] > 0.5) covered++;
   }
-  const total = size * size;
+  const total = size * height;
   return { covered, total, fraction: covered / total };
 }
 
@@ -60,6 +62,8 @@ export function rasteriseLightmapGBuffer(
   renderer: THREE.WebGPURenderer,
   scene: THREE.Scene,
   size: number,
+  pages = 1,
+  page = 0,
 ): LightmapGBuffer {
   const target = new THREE.RenderTarget(size, size, {
     count: 2,
@@ -99,11 +103,17 @@ export function rasteriseLightmapGBuffer(
   // this build shipped until it was measured: the sun-shadowed half of the left wall
   // was pure black at any lightmap intensity, because it was sampling a gutter.
   const atlasUv = attribute('uv1', 'vec2');
+  /* @important uv1 addresses the whole stack of pages, so one page is rasterised by
+     scaling v back into its own square and pushing every other page out of clip space.
+     The pool holds one surfel per texel and tops out at MAX_SURFELS, so a scene with
+     more atlas texels than that must be baked a page at a time or the probe bake is
+     left with no pool at all. */
+  const pageV = atlasUv.y.mul(float(pages)).sub(float(page));
   const bakeMaterial = new THREE.MeshBasicNodeMaterial();
   bakeMaterial.vertexNode = vec4(
     atlasUv.x.mul(2).sub(1),
-    atlasUv.y.mul(2).sub(1).negate(),
-    0,
+    pageV.mul(2).sub(1).negate(),
+    pageV.greaterThanEqual(float(0)).and(pageV.lessThanEqual(float(1))).select(float(0), float(2)),
     1,
   );
   bakeMaterial.side = THREE.DoubleSide;

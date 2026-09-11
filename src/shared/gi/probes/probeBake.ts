@@ -100,7 +100,7 @@ async function bakeIrradianceBatch(renderer: THREE.WebGPURenderer, gi: SurfelGI,
   if (seeded < texels) throw new Error(`probes: ${seeded}/${texels} probe surfels seeded`);
   gi.setBaseSampleCount(options.raysPerSurfel);
   await integrateSeeded(renderer, gi, scene, options, batch.stage);
-  surfels.writeAtlas(renderer, gbuffer, { denoise: 0, dilate: 0 });
+  if (!await surfels.writeAtlas(renderer, gbuffer, { denoise: 0, dilate: 0 })) throw new Error('probes: the atlas write was refused');
   const pixels = (await readFloatTexture(renderer, surfels.lightmap)).data;
   for (let i = 0; i < count; i++) {
     for (let k = 0; k < directions.length; k++) {
