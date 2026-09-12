@@ -63,8 +63,9 @@ export function rasteriseLightmapGBuffer(
   scene: THREE.Scene,
   size: number,
   pages = 1,
+  page = 0,
 ): LightmapGBuffer {
-  const target = new THREE.RenderTarget(size, size * pages, {
+  const target = new THREE.RenderTarget(size, size, {
     count: 2,
     type: THREE.FloatType,
     format: THREE.RGBAFormat,
@@ -102,18 +103,17 @@ export function rasteriseLightmapGBuffer(
   // this build shipped until it was measured: the sun-shadowed half of the left wall
   // was pure black at any lightmap intensity, because it was sampling a gutter.
   const atlasUv = attribute('uv1', 'vec2');
-  /* @important uv1 addresses the whole stack of pages and the target is that whole stack,
-     `size x size*pages`, drawn in one render. It used to draw one page per call, scaling v
-     back into a single square and pushing the other pages out of clip space, and the bake
-     then ran a full 200-pass integration per page: six pages of the village were six bakes,
-     six minutes against the forty seconds the scene took before pages existed. Nothing
-     required that - the seeder, the denoiser and the blit have always taken a height. What
-     the surfel pool limits is the number of COVERED texels, not the number of pages. */
+  /* @important uv1 addresses the whole stack of pages, so one page is rasterised by
+     scaling v back into its own square and pushing every other page out of clip space.
+     The pool holds one surfel per texel and tops out at MAX_SURFELS, so a scene with
+     more atlas texels than that must be baked a page at a time or the probe bake is
+     left with no pool at all. */
+  const pageV = atlasUv.y.mul(float(pages)).sub(float(page));
   const bakeMaterial = new THREE.MeshBasicNodeMaterial();
   bakeMaterial.vertexNode = vec4(
     atlasUv.x.mul(2).sub(1),
-    atlasUv.y.mul(2).sub(1).negate(),
-    float(0),
+    pageV.mul(2).sub(1).negate(),
+    pageV.greaterThanEqual(float(0)).and(pageV.lessThanEqual(float(1))).select(float(0), float(2)),
     1,
   );
   bakeMaterial.side = THREE.DoubleSide;

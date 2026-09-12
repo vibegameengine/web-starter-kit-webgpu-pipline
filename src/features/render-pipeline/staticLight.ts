@@ -203,40 +203,41 @@ export class StaticLight {
     console.log(`[bake] ${this.bakedWith.passes} passes, ${this.bakedWith.rays} rays, atlas mul ${this.bakedWith.atlasIntensity}`);
     const size = this.atlasSize;
     const pages = Math.max(1, this.layout.pages);
-    const height = size * pages;
-    /* @important One rasterisation of the whole stack and one bake over it. Pages used to
-       be baked one at a time, each with a cleared radiance cache and its own 200-pass
-       integration, so the village's six pages were six bakes - six minutes against the
-       forty seconds the scene took before pages existed - and every page lost the bounce
-       off the others. The pool limits COVERED texels, not pages, and the seeder, the
-       denoiser and the blit have always taken a height. */
-    this.gbuffer?.dispose();
-    this.gbuffer = rasteriseLightmapGBuffer(this.renderer, this.scene, size, pages);
-    const coverage = await measureCoverage(this.renderer, this.gbuffer, size, height);
-    console.log(`[lightmap] ${pages} page(s) cover ${coverage.covered}/${coverage.total} texels (${(coverage.fraction * 100).toFixed(1)}%)`);
-    if (coverage.covered === 0) throw new Error('lightmap: the atlas rasterised zero texels');
-    if (this.leak) this.leak.recordGeometryPage(0,
-      await readFloatAttachment(this.renderer, this.gbuffer.target, 0),
-      await readFloatAttachment(this.renderer, this.gbuffer.target, 1));
-    this.coverage = coverage.covered;
-    const result = await this.gi.bakeLightmap(this.renderer, this.scene, this.gbuffer, size, {
-      height,
-      iterations: this.bakeParams.passes,
-      raysPerSurfel: this.bakeParams.rays,
-      freshSurfels: true,
-      dilate: 0,
-      dynamicReceivers: true,
-      denoiseIgnoresSurface: this.url.get('leakMutation') === 'denoiseAll',
-      atlasGain: this.url.get('leakMutation') === 'atlasHalf' ? 0.5 : 1,
-      filterLinks: this.url.flag('filterLinks', true) ? contactTree : null,
-      onStage: this.leak ? (name, pixels) => this.leak!.recordPage(name, 0, pixels) : undefined,
-      onProgress: (fraction, iteration) => bootNote(`Baking lightmap ${(fraction * 100).toFixed(0)}% · pass ${iteration}`),
-    });
-    if (result && result.seeded < this.coverage) throw new Error(`[lightmap] surfel pool exhausted: ${result.seeded}/${this.coverage} covered texels got a surfel. Lower ?lm=`);
-    if (!result?.texture) throw new Error('lightmap: the bake produced no texture');
-    const stacked = (await readFloatTexture(this.renderer, result.texture)).data;
-    const surfels = await this.gi.captureStaticBake(this.renderer, result.seeded);
-    if (!surfels) throw new Error('lightmap: nothing was baked');
+    const stacked = new Float32Array(size * size * pages * 4);
+    let surfels: FrozenSurfelData | null = null;
+    /* @important The pool holds one surfel per texel and stops at MAX_SURFELS, so the
+       pages cannot be resident together: each page starts from a cleared cache. Rays
+       still trace the whole scene, so direct light and the first bounce are unchanged;
+       what a page loses is the cached bounce off the texels of the other pages. */
+    for (let page = 0; page < pages; page++) {
+      this.gi.resetCache(this.renderer);
+      this.gbuffer?.dispose();
+      this.gbuffer = rasteriseLightmapGBuffer(this.renderer, this.scene, size, pages, page);
+      const coverage = await measureCoverage(this.renderer, this.gbuffer, size);
+      console.log(`[lightmap] page ${page + 1}/${pages} covers ${coverage.covered}/${coverage.total} texels (${(coverage.fraction * 100).toFixed(1)}%)`);
+      if (coverage.covered === 0) throw new Error(`lightmap: page ${page} rasterised zero texels`);
+      if (this.leak) this.leak.recordGeometryPage(page,
+        await readFloatAttachment(this.renderer, this.gbuffer.target, 0),
+        await readFloatAttachment(this.renderer, this.gbuffer.target, 1));
+      this.coverage = coverage.covered;
+      const result = await this.gi.bakeLightmap(this.renderer, this.scene, this.gbuffer, size, {
+        iterations: this.bakeParams.passes,
+        raysPerSurfel: this.bakeParams.rays,
+        freshSurfels: true,
+        dilate: 0,
+        dynamicReceivers: true,
+        denoiseIgnoresSurface: this.url.get('leakMutation') === 'denoiseAll',
+        atlasGain: this.url.get('leakMutation') === 'atlasHalf' ? 0.5 : 1,
+        filterLinks: this.url.flag('filterLinks', true) ? contactTree : null,
+        onStage: this.leak ? (name, pixels) => this.leak!.recordPage(name, page, pixels) : undefined,
+        onProgress: (fraction, iteration) => bootNote(`Baking lightmap page ${page + 1}/${pages} ${(fraction * 100).toFixed(0)}% · pass ${iteration}`),
+      });
+      if (result && result.seeded < this.coverage) throw new Error(`[lightmap] surfel pool exhausted: ${result.seeded}/${this.coverage} covered texels got a surfel on page ${page}. Lower ?lm=`);
+      if (!result?.texture) throw new Error('lightmap: the bake produced no texture');
+      stacked.set((await readFloatTexture(this.renderer, result.texture)).data, page * size * size * 4);
+      surfels = await this.gi.captureStaticBake(this.renderer, result.seeded);
+    }
+    if (!surfels) throw new Error('lightmap: no page was baked');
     this.leak?.record('blit', stacked);
     const filled = padLightmapCharts(stacked, size, this.layout.regions, size * pages);
     this.leak?.record('padded', stacked);
