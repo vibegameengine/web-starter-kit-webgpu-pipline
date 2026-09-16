@@ -1,11 +1,11 @@
 import * as THREE from 'three/webgpu';
 import type { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { createScene } from '../../shared/gi/surfel/scene.ts';
-import { Layer, Mobility, applyMobility } from '../../shared/world/index.ts';
+import { Layer } from '../../shared/world/index.ts';
 import { createFiberSceneRoot } from '../../shared/fiber/index.ts';
-import { HousePrefab, VILLAGE_HOUSES } from '../../entities/village/index.ts';
-
-import { VillageWindows } from '../../entities/village/WindowPrefabs.tsx';
+import { IslandPrefab } from '../../entities/island/IslandPrefab.tsx';
+import { VillagePrefab } from '../../entities/village/index.ts';
+import { createVillageCoast } from './villageCoast.ts';
 import { loadVillageMaterials, VillageMaterialsContext } from '../../entities/village/materials.tsx';
 import { bootStage } from '../../shared/ui/bootProgress.ts';
 
@@ -18,41 +18,43 @@ export interface VillageLightScene {
 }
 
 /**
- * @important One house of the village and nothing else: same InstancedMesh prefabs
- * (roof tiles, windows) and same materials, no island, rocks, water, foliage or
- * backdrop. The full village needs ~90 s per boot — 2.3 M triangles of contact BVH and
- * a 2109 m² lightmap — so a four-boot measurement was a ten-minute loop. A check that
- * only asks about instanced motion vectors boots this instead.
+ * @important The village's charted surfaces and nothing else. Same island, same houses,
+ * terraces, quay and roofs through the same prefabs, so the atlas under test holds the
+ * same charts and the black patches on the walls reproduce here. What is dropped is what
+ * never reaches a chart and only costs a shader and a contact tree: the water simulation
+ * and its bathymetry bake, the shore rocks, the backdrop, and the prefab's dressing -
+ * pines, cypresses, garden trees, planting, the boat and the harbour clutter. The full
+ * village takes about five minutes a boot, which turned any four-boot measurement into a
+ * ten-minute loop.
  */
 export async function createVillageLightScene(renderer: THREE.WebGPURenderer, environment: THREE.Texture): Promise<VillageLightScene> {
   const { scene, camera, controls, dirLight: sun } = createScene(renderer);
   scene.name = 'village-light';
   scene.background = null;
   camera.fov = 35;
-  camera.near = 0.2;
+  camera.near = .2;
   camera.far = 200;
-  const house = VILLAGE_HOUSES[0];
-  camera.position.set(house.x + 9, 7, house.z + 12);
-  controls.target.set(house.x, 3, house.z);
+  const presets: Record<string, [number[], number[]]> = {
+    quay: [[12, 6, 13], [2, 3, -2]],
+    front: [[0, 17, 46], [0, 2, -1]],
+    walls: [[.5, 5.5, 7.5], [7, 3.6, -3]],
+  };
+  const params = new URLSearchParams(location.search);
+  const [position, target] = presets[params.get('cam') ?? ''] ?? presets.quay;
+  camera.position.fromArray(position);
+  controls.target.fromArray(target);
   camera.updateProjectionMatrix();
   camera.layers.enable(Layer.Debug);
   controls.update();
 
-  const ground = new THREE.Mesh(new THREE.BoxGeometry(40, 1, 40), new THREE.MeshStandardNodeMaterial({ color: 0xb9ab92, roughness: 0.9 }));
-  ground.position.set(house.x, -0.5, house.z);
-  ground.name = 'village-light-ground';
-  applyMobility(ground, Mobility.Static);
-  scene.add(ground);
-
-  const materials = await bootStage('Village light: materials', () => loadVillageMaterials(environment));
+  const { island } = await createVillageCoast();
+  const materials = await bootStage('Village stand: materials', () => loadVillageMaterials(environment));
   const fiber = await createFiberSceneRoot(renderer, scene, camera);
-  await bootStage('Village light: one house', () => fiber.render(
-    <VillageMaterialsContext value={materials}>
-      <group name="village-light-prefab">
-        <HousePrefab house={house}/>
-        <VillageWindows/>
-      </group>
-    </VillageMaterialsContext>,
+  await bootStage('Village stand: island, houses and quay', () => fiber.render(
+    <group name="coast-prefab">
+      <IslandPrefab island={island} sun={sun}/>
+      <VillageMaterialsContext value={materials}><VillagePrefab dressing={false}/></VillageMaterialsContext>
+    </group>,
   ));
   window.addEventListener('resize', () => fiber.resize(renderer.domElement.clientWidth, renderer.domElement.clientHeight));
 

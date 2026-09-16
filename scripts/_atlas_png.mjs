@@ -17,10 +17,14 @@ await page.goto(`http://127.0.0.1:${port}/?${query}`);
 await page.waitForFunction(() => document.querySelector('#loading-overlay')?.hidden || !document.querySelector('#error-overlay')?.hidden, null, { timeout: gate - 30000 }).catch(() => {});
 await page.waitForTimeout(2000);
 
-const dump = await page.evaluate(() => (window.__atlasDump ? window.__atlasDump() : null));
-if (!dump) { console.error('no atlas'); process.exit(3); }
-
-const { width, height, data } = dump;
+const info = await page.evaluate(() => (window.__atlasDump ? window.__atlasDump() : null));
+if (!info) { console.error('no atlas'); process.exit(3); }
+const { width, height, pages } = info;
+const data = new Float32Array(width * height * 4);
+for (let p = 0; p < pages; p++) {
+  const slice = await page.evaluate((index) => window.__atlasDump(index), p);
+  data.set(slice.data, p * width * width * 4);
+}
 const png = new PNG({ width, height });
 let lit = 0;
 let covered = 0;
@@ -35,6 +39,10 @@ for (let i = 0; i < width * height; i++) {
 }
 mkdirSync(dirname(out), { recursive: true });
 writeFileSync(out, PNG.sync.write(png));
-console.log(`${width}x${height}, covered ${covered}, lit ${lit} (${((lit / Math.max(covered, 1)) * 100).toFixed(1)}% of covered), gain ${gain} -> ${out}`);
+let sum = 0;
+for (let i = 0; i < width * height; i++) {
+  if (data[i * 4 + 3] > 0.25) sum += (data[i * 4] + data[i * 4 + 1] + data[i * 4 + 2]) / 3;
+}
+console.log(`${width}x${height}, covered ${covered}, lit ${lit} (${((lit / Math.max(covered, 1)) * 100).toFixed(1)}%), mean over covered ${(sum / Math.max(covered, 1)).toFixed(5)} -> ${out}`);
 clearTimeout(timer);
 await browser.close();

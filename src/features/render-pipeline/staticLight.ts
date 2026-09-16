@@ -8,6 +8,7 @@ import { bakeKey, loadBake, loadBakeManifest, saveBake } from '../../shared/gi/b
 import { captureLightingProvenance, compareLightingProvenance, describeProvenance, environmentDigest, transportDigest, type LightingProvenance, type ProvenanceStatus } from '../../shared/gi/bake/lightingProvenance.ts';
 import { readFloatAttachment, readFloatTexture } from '../../shared/render/gpuReadback.ts';
 import { MAX_SURFELS, MAX_TEMPORAL_M } from '../../shared/gi/surfel/constants.ts';
+import { giLightSummary } from '../../shared/gi/surfel/sceneLights.ts';
 import { Layer } from '../../shared/world/index.ts';
 import { ProbeLiveUpdate, ProbeVolume, applyProbeVolume, bakeProbeVolume, fitProbeLayout, seedResidentProbes, setProbeReceiversBaked, storageMatchesLayout, type ProbeReceivers, type ProbeVolumeStorage, type ResidentProbeSurfels } from '../../shared/gi/probes/index.ts';
 import type { FrozenSurfelData } from '../../shared/gi/bake/persistedBake.ts';
@@ -195,7 +196,8 @@ export class StaticLight {
   private async bakeAtlas(frameGraph: FrameGraph, contactTree: ContactBVHBundle | null): Promise<{ pixels: Float32Array; surfels: FrozenSurfelData }> {
     if (!this.layout) throw new Error('lightmap: unwrap before baking');
     this.bakedWith = { passes: this.bakeParams.passes, rays: this.bakeParams.rays, atlasIntensity: this.atlasParams.intensity, atlasSize: this.atlasSize };
-    console.log(`[bake] ${this.bakedWith.passes} passes, ${this.bakedWith.rays} rays, atlas mul ${this.bakedWith.atlasIntensity}`);
+    const direction = this.sun.position.clone().normalize();
+    console.log(`[bake] ${this.bakedWith.passes} passes, ${this.bakedWith.rays} rays, atlas mul ${this.bakedWith.atlasIntensity}, sun ${this.sun.intensity.toFixed(3)} from ${direction.x.toFixed(2)},${direction.y.toFixed(2)},${direction.z.toFixed(2)} (elevation ${(Math.asin(direction.y) * 180 / Math.PI).toFixed(1)}°), ${giLightSummary().length} analytic light(s) in the tracer`);
     const size = this.atlasSize;
     const pages = Math.max(1, this.layout.pages);
     const height = size * pages;

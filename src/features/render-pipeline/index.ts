@@ -273,11 +273,18 @@ function installAtlasHooks(p: Pipeline): void {
   /* @important The baked atlas itself, texel for texel, so a dark frame can be answered by
      looking at what the bake produced instead of arguing about it. Alpha is the coverage
      mark: 1 measured by its own surfel, 0.5 carried or padded, 0 nothing. */
-  hook('__atlasDump', () => {
+  hook('__atlasDump', (page = -1) => {
     const layout = staticLight.layout;
     const pixels = staticLight.atlasPixels;
     if (!layout || !pixels) return null;
-    return { width: staticLight.atlasSize, height: staticLight.atlasHeight(), data: [...pixels] };
+    const size = staticLight.atlasSize;
+    const height = staticLight.atlasHeight();
+    /* @important One page per call by default. The whole stack of a five-page atlas is
+       5.2 M floats, and handing that to a harness as one JSON array throws
+       ERR_STRING_TOO_LONG before anything can be looked at. */
+    if (page < 0) return { width: size, height, pages: layout.pages };
+    const start = page * size * size * 4;
+    return { width: size, height: size, page, data: [...pixels.slice(start, start + size * size * 4)] };
   });
   hook('__chartLight', (name = 'bench') => {
     const layout = staticLight.layout;

@@ -16,5 +16,5 @@ export async function bootOrFail(page, timeout = 300000) {
     const overlay = document.querySelector('#loading-overlay');
     return Boolean(window.__audit) && (!overlay || overlay.hidden || !overlay.offsetParent);
   }, null, { timeout })]);
-  return failed;
+  return { failed };
 }

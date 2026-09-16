@@ -18,7 +18,14 @@ import { TerraceGrotto } from './TerraceGrotto.tsx';
 import { RoofAccessories } from './RoofAccessories.tsx';
 import { GardenTreesPrefab } from './GardenTreesPrefab.tsx';
 
-export function VillagePrefab() {
+/**
+ * @important `dressing` is what the lightmap never sees: pines, cypresses, garden trees,
+ * potted planting, the boat and the harbour clutter carry no chart, so they cost a
+ * contact BVH and a shader each and contribute nothing to the atlas under test. The
+ * stripped stand drops them and keeps every charted surface, so the black patches on the
+ * walls still reproduce.
+ */
+export function VillagePrefab({ dressing = true }: { dressing?: boolean }) {
   const materials = useVillageMaterials();
   const foundationParts = useMemo(() => [{ id:'masonry',geometry:new THREE.BoxGeometry(1,1,1),material:materials.limestone }], [materials]);
   const foundations = useMemo(() => VILLAGE_TERRACES.filter(t=>t.id!=='pine-terrace').map(t=>({id:t.id,matrix:instanceTransform([(t.x0+t.x1)/2,(t.top+VILLAGE_PLOT.bottom)/2,(t.z0+t.z1)/2],[t.x1-t.x0,t.top-VILLAGE_PLOT.bottom,t.z1-t.z0])})), []);
@@ -36,12 +43,12 @@ export function VillagePrefab() {
     <RoofTiles/>
     <RoofAccessories/>
     <BellTowerPrefab/>
-    <MultiInstances name="umbrella-pines" parts={pineParts} instances={pines}/>
-    <CypressPrefab/>
-    <GardenTreesPrefab/>
-    <BoatPrefab/>
-    <PlantingPrefab/>
+    {dressing && <MultiInstances name="umbrella-pines" parts={pineParts} instances={pines}/>}
+    {dressing && <CypressPrefab/>}
+    {dressing && <GardenTreesPrefab/>}
+    {dressing && <BoatPrefab/>}
+    {dressing && <PlantingPrefab/>}
     <CafePrefab/>
-    <HarborDetails/>
+    {dressing && <HarborDetails/>}
   </group>;
 }
