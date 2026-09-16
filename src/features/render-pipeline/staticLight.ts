@@ -7,6 +7,7 @@ import { BakeLeakStages, leakHookApi } from '../../shared/gi/bake/leakStages.ts'
 import { bakeKey, loadBake, loadBakeManifest, saveBake } from '../../shared/gi/bake/persistedBake.ts';
 import { captureLightingProvenance, compareLightingProvenance, describeProvenance, environmentDigest, transportDigest, type LightingProvenance, type ProvenanceStatus } from '../../shared/gi/bake/lightingProvenance.ts';
 import { readFloatAttachment, readFloatTexture } from '../../shared/render/gpuReadback.ts';
+import { LightmapLod } from '../../shared/gi/lod/index.ts';
 import { MAX_SURFELS, MAX_TEMPORAL_M } from '../../shared/gi/surfel/constants.ts';
 import { giLightSummary } from '../../shared/gi/surfel/sceneLights.ts';
 import { Layer } from '../../shared/world/index.ts';
@@ -24,6 +25,10 @@ const DEFAULT_BAKE_SECONDS = 15;
 const DEFAULT_METRES_PER_TEXEL = 0.05;
 const DEFAULT_PROBE_ITERATIONS = 100;
 const MAX_PROBES = 65536;
+const DEFAULT_LOD_PAGE = 2048;
+const DEFAULT_LOD_ATLAS = 512;
+const DEFAULT_LOD_COPIES = 32;
+const DEFAULT_LOD_FEEDBACK_SPACING = 4;
 
 export interface BakeCacheState { source: string; storage: string; key: string; saved: boolean; error: string; probes: string }
 
@@ -55,6 +60,7 @@ export class StaticLight {
   layout: LightmapLayout | null = null;
   atlas: THREE.Texture | null = null;
   atlasPixels: Float32Array | null = null;
+  lod: LightmapLod | null = null;
   leak: BakeLeakStages | null = null;
   probes: ProbeVolume | null = null;
   probeLive: ProbeLiveUpdate | null = null;
@@ -106,6 +112,7 @@ export class StaticLight {
       const bakeTree = options.bakeTree ?? (() => null);
       const atlas = await this.prepareAtlas(frameGraph, options.forceBake === true, bakeTree);
       this.atlasPixels = atlas.pixels;
+      this.enableLod(atlas.pixels);
       this.atlasIntensity.value = this.atlasParams.intensity;
       const probesBaked = await this.prepareProbes(bakeTree, atlas.probes, options.interiorVolumes ?? []);
       if ((atlas.fresh || probesBaked) && atlas.surfels) await this.save(atlas.pixels, atlas.surfels);
@@ -326,9 +333,28 @@ export class StaticLight {
     return dark + uncovered;
   }
 
+  /* @important The pages are what the bake wrote, cut per chart into a mip chain; the frame
+     reads one working atlas the camera's own fragments ask for. The full stacked atlas stays
+     published for the tracer and the split view, which address it by the baked uv1. */
+  private lodWanted(): boolean {
+    return this.url.flag('lod', true) && (this.layout?.regions.length ?? 0) > 0;
+  }
+
+  private enableLod(pixels: Float32Array): void {
+    this.lod?.dispose();
+    this.lod = null;
+    if (!this.lodWanted() || !this.layout) return;
+    this.lod = new LightmapLod(this.renderer, this.scene, this.layout, pixels, this.atlasIntensity, {
+      pageSize: this.url.num('lodPage') ?? DEFAULT_LOD_PAGE,
+      atlasSize: this.url.num('lodAtlas') ?? DEFAULT_LOD_ATLAS,
+      copyBudget: this.url.num('lodCopies') ?? DEFAULT_LOD_COPIES,
+      feedbackSpacing: this.url.num('lodFeedback') ?? DEFAULT_LOD_FEEDBACK_SPACING,
+    });
+  }
+
   private publishAtlas(frameGraph: FrameGraph, texture: THREE.Texture): void {
     this.atlas = texture;
-    applyLightmap(this.scene, texture, this.atlasIntensity);
+    if (!this.lodWanted()) applyLightmap(this.scene, texture, this.atlasIntensity);
     frameGraph.setLightmapTexture(texture);
     frameGraph.hybridReceivers.value = 1;
     if (this.url.flag('atlasHits', true)) this.gi.useBakedAtlas(texture, this.atlasIntensity);
