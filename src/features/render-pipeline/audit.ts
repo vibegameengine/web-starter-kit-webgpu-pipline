@@ -53,3 +53,53 @@ export async function gpuPasses(renderer: THREE.WebGPURenderer, frames = 60) {
     .sort((x, y) => y.gpu - x.gpu);
   return { framesUsed: used, frameMs: median(intervals), gpuMs: median(totals), passes };
 }
+
+type DrawnObject = { object: { name?: string; type: string; isInstancedMesh?: boolean; count?: number }; material: { type: string; name?: string }; context: { renderTarget: { width: number; height: number; texture?: { name: string } } | null } };
+
+export async function drawCounts(renderer: THREE.WebGPURenderer, frames = 30) {
+  const backend = renderer.backend as unknown as { draw: (renderObject: DrawnObject, info: unknown) => void };
+  const original = backend.draw;
+  const byTarget = new Map<string, { draws: number; instances: number; objects: Map<string, number> }>();
+  backend.draw = function drawCounted(renderObject, info) {
+    const target = renderObject.context.renderTarget;
+    const key = target ? `${target.texture?.name || 'rt'} ${target.width}x${target.height}` : 'screen';
+    const entry = byTarget.get(key) ?? { draws: 0, instances: 0, objects: new Map() };
+    entry.draws++;
+    entry.instances += renderObject.object.isInstancedMesh ? renderObject.object.count ?? 1 : 1;
+    const name = `${renderObject.object.name || renderObject.object.type} (${renderObject.material.type})`;
+    entry.objects.set(name, (entry.objects.get(name) ?? 0) + 1);
+    byTarget.set(key, entry);
+    return original.call(this, renderObject, info);
+  };
+  try {
+    for (let i = 0; i < frames; i++) await new Promise((resolve) => requestAnimationFrame(resolve));
+  } finally {
+    backend.draw = original;
+  }
+  return [...byTarget].map(([target, entry]) => ({
+    target, drawsPerFrame: +(entry.draws / frames).toFixed(1), instancesPerFrame: +(entry.instances / frames).toFixed(0),
+    top: [...entry.objects].sort((a, b) => b[1] - a[1]).slice(0, 6).map(([name, count]) => `${name}:${(count / frames).toFixed(0)}`),
+  })).sort((a, b) => b.drawsPerFrame - a.drawsPerFrame);
+}
+
+export async function frameCpu(renderer: THREE.WebGPURenderer, frames = 240) {
+  const animation = (renderer as unknown as { _animation: { _animationLoop: ((time: number, frame?: unknown) => void) | null } })._animation;
+  const loop = animation._animationLoop;
+  if (!loop) return null;
+  const cpu: number[] = [];
+  const intervals: number[] = [];
+  let last = performance.now();
+  animation._animationLoop = (time, frame) => {
+    const start = performance.now();
+    intervals.push(start - last);
+    last = start;
+    loop(time, frame);
+    cpu.push(performance.now() - start);
+  };
+  try {
+    while (cpu.length < frames) await new Promise((resolve) => requestAnimationFrame(resolve));
+  } finally {
+    animation._animationLoop = loop;
+  }
+  return { loopCpuMs: median(cpu), intervalMs: median(intervals.slice(1)) };
+}

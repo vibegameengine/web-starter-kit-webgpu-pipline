@@ -16,7 +16,7 @@ import { StaticLight } from './staticLight.ts';
 import { leakHookApi } from '../../shared/gi/bake/leakStages.ts';
 import { TraceStages } from './traceStages.ts';
 import { PostStages } from './postStages.ts';
-import { gpuPasses } from './audit.ts';
+import { drawCounts, frameCpu, gpuPasses } from './audit.ts';
 import { bootStage } from '../../shared/ui/bootProgress.ts';
 import { ReflectionCache, deriveReflectionVolume, type ReflectionVolume } from '../../shared/gi/reflect/cache/index.ts';
 import type { ContactBVHBundle } from '../../shared/gi/contact/contactBvh.ts';
@@ -293,6 +293,9 @@ function installHooks(p: Pipeline, state: { paused: boolean; stepOnce: boolean; 
   });
   installAtlasHooks(p);
   hook('__gpuPasses', (frames = 60) => gpuPasses(renderer, frames));
+  hook('__drawCounts', (frames = 30) => drawCounts(renderer, frames));
+  hook('__frameCpu', (frames = 240) => frameCpu(renderer, frames));
+  hook('__shadowAutoUpdate', (value: boolean) => { host.sun.shadow.autoUpdate = value; host.sun.shadow.needsUpdate = true; return value; });
   if (p.staticLight.leak) hook('__leak', leakHookApi(p.staticLight.leak, () => frameGraph.setSplitView(SplitView.Leak)));
   hook('__fog', { ...p.post.hooks(), ...p.trace.hooks(frameGraph) });
   hook('__cine', (name?: string, focalMm?: number) => {
