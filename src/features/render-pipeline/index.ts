@@ -162,9 +162,16 @@ function bindLightingGui(gui: GUI, p: Pipeline, ui: PipelineUi): void {
   }
   const bake = gui.addFolder('GI bake');
   bake.add(staticLight.bakeParams, 'passes', 8, 256, 1).name('lightmap passes');
-  const bakeState = { status: 'baking' };
+  const bakeState = { status: 'baking', layout: 'unwrapping' };
   bake.add(bakeState, 'status').name('baked light').listen().disable();
-  setInterval(() => { bakeState.status = staticLight.ready ? staticLight.bakeStatusText() : 'baking'; }, 500);
+  bake.add(bakeState, 'layout').name('atlas layout').listen().disable();
+  setInterval(() => {
+    bakeState.status = staticLight.ready ? staticLight.bakeStatusText() : 'baking';
+    const layout = staticLight.layout;
+    bakeState.layout = layout
+      ? `${layout.metresPerTexel.toFixed(3)} m/texel, ${layout.pages} page(s), sample ${(p.url.num('sample') ?? 0.1).toFixed(2)} m`
+      : 'unwrapping';
+  }, 500);
   bake.add({ rebake: () => {
     void staticLight.prepare(frameGraph, { forceBake: true, bakeTree: () => p.trace.detailedTree(p.host.scene), interiorVolumes: p.host.interiorVolumes })
       .then(() => ui.clearLoading())

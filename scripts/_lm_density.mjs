@@ -10,12 +10,12 @@ const page = await browser.newPage({ viewport: { width: 800, height: 450 } });
 const lines = [];
 page.on('console', (message) => {
   const text = message.text();
-  if (text.includes('[lightmap]')) lines.push(text);
+  if (text.includes('[lightmap]') || text.includes('[bake') || text.includes('[BVH')) lines.push(text);
 });
 page.on('pageerror', (error) => { console.error('pageerror:', String(error).slice(0, 200)); });
 await page.goto(`http://127.0.0.1:${port}/?scene=${scene}&hud=0`);
-await page.waitForFunction(() => window.__lightmapSeen === true || document.querySelector('#loading-message')?.textContent?.includes('Building the static BVH') || !document.querySelector('#error-overlay')?.hidden, null, { timeout: gate - 20000 }).catch(() => {});
-await page.waitForTimeout(2000);
+await page.waitForFunction(() => document.querySelector('#loading-overlay')?.hidden || !document.querySelector('#error-overlay')?.hidden, null, { timeout: gate - 20000 }).catch(() => {});
+await page.waitForTimeout(3000);
 for (const line of lines) console.log(line);
 clearTimeout(timer);
 await browser.close();

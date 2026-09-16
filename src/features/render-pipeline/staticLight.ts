@@ -121,9 +121,15 @@ export class StaticLight {
     if (this.url.flag('bakeCache', true) && !this.leak) {
       bootNote('Checking the saved static lighting');
       try {
-        cache.key = await bakeKey(this.url.get('scene') ?? 'default');
+        cache.key = await bakeKey(this.url.get('scene') ?? 'default', {
+          metresPerTexel: this.layout?.metresPerTexel ?? 0,
+          sampleMetres: this.url.num('sample') ?? DEFAULT_SAMPLE_METRES,
+          atlasSize: this.atlasSize,
+        });
         const saved = forceBake ? null : await loadBake(cache.key);
-        if (saved) {
+        if (saved && (saved.pages ?? 1) !== (this.layout?.pages ?? 1)) {
+          console.warn(`[bake-cache] ${cache.key} holds ${saved.pages ?? 1} page(s) against this layout's ${this.layout?.pages ?? 1}; baking instead`);
+        } else if (saved) {
           bootNote('Restoring the saved static lighting');
           this.gi.restoreStaticBake(this.renderer, saved.surfels, this.url.get('atlasSurfels') === '1');
           this.publishAtlas(frameGraph, halfFloatTexture(this.renderer, saved.pixels, saved.size, saved.size * (saved.pages ?? 1)));

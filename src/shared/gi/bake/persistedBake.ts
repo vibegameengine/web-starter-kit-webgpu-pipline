@@ -33,8 +33,13 @@ const hex = (data: Uint8Array) => Array.from(data, v => v.toString(16).padStart(
  * of them by the day this was written. The name is still spelled as 64 hex digits
  * because the manifest, the dev-server routes and the packer check that shape.
  */
-export async function bakeKey(sceneName: string): Promise<string> {
-  return hex(await digest(new TextEncoder().encode(`bake:${sceneName}`)));
+/* @important The layout is part of the key. The key used to be the scene name alone, so
+   changing the density loaded an atlas laid out for a different one: the unwrap addressed
+   a two-page atlas through uv1 while the restored texture held six pages, every sample
+   landed on the wrong page, and the frame looked plausible and was wrong throughout. */
+export async function bakeKey(sceneName: string, layout: { metresPerTexel: number; sampleMetres: number; atlasSize: number } = { metresPerTexel: 0, sampleMetres: 0, atlasSize: 0 }): Promise<string> {
+  const shape = `${layout.metresPerTexel.toFixed(5)}|${layout.sampleMetres.toFixed(5)}|${layout.atlasSize}`;
+  return hex(await digest(new TextEncoder().encode(`bake:${sceneName}|${shape}`)));
 }
 
 function encodeProbeBlock(probes: PersistedProbes): ArrayBuffer {

@@ -202,7 +202,11 @@ export function assignLightmapUvs(
     chart.w = Math.max(2 * alignment, Math.ceil((chart.extentU / metresPerTexel + 2 * inset) / alignment) * alignment);
     chart.h = Math.max(2 * alignment, Math.ceil((chart.extentV / metresPerTexel + 2 * inset) / alignment) * alignment);
   }
-  const maxPages = options.maxPages ?? 64;
+  /* @important WebGPU guarantees 8192 texels of texture, and the stack is one texture of
+     `size x size*pages`, so the ceiling is what fits that - not a round number. 64 pages of
+     512 would be a 32768-tall render target and the failure lands inside WebGPU with
+     nothing that names the atlas. */
+  const maxPages = options.maxPages ?? Math.floor(8192 / atlasSize);
   const pages = packPages(requests, atlasSize, alignment, maxPages);
   if (pages === 0) {
     throw new Error(
@@ -449,7 +453,14 @@ function packOnePage(charts: ChartRequest[], side: number, alignment: number, fi
   const skyline: { x: number; y: number; width: number }[] = [{ x: 0, y: 0, width: side }];
   const rejected: ChartRequest[] = [];
   for (const chart of order) {
-    if (chart.w > side || chart.h > side) return [];
+    /* @important Throws where it used to return an empty list of leftovers. That read to
+       the caller as "everything fitted", so the oversized chart and every chart after it in
+       the order kept x = y = page = 0, took a uv1 anyway, and two charts shared one
+       rectangle - a silently corrupt atlas, or a confusing throw from the padding pass. A
+       fixed density cannot coarsen its way out of this, so it has to say so here. */
+    if (chart.w > side || chart.h > side) {
+      throw new Error(`[lightmap] a chart of ${chart.w}x${chart.h} texels does not fit a ${side}² page: ${(side * (chart.extentU / Math.max(chart.w, 1))).toFixed(1)} m is the widest surface this density and page size can hold`);
+    }
     const spot = lowestFit(skyline, chart.w, chart.h, side, alignment);
     if (!spot) { rejected.push(chart); continue; }
     chart.x = spot.x;
