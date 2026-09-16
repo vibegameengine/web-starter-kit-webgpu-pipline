@@ -16,6 +16,7 @@ import { StaticLight } from './staticLight.ts';
 import { leakHookApi } from '../../shared/gi/bake/leakStages.ts';
 import { TraceStages } from './traceStages.ts';
 import { PostStages } from './postStages.ts';
+import { SkyStage } from './skyStage.ts';
 import { drawCounts, frameCpu, gpuPasses } from './audit.ts';
 import { bootStage } from '../../shared/ui/bootProgress.ts';
 import { ReflectionCache, deriveReflectionVolume, type ReflectionVolume } from '../../shared/gi/reflect/cache/index.ts';
@@ -121,6 +122,7 @@ interface Pipeline {
   dynamic: ReturnType<typeof addMovers>; world: WorldState; stats: CacheStats; hud: Hud | null;
   lab: LodLab | null;
   cine: { name: string };
+  sky: SkyStage | null;
 }
 
 function openLodLab(renderer: THREE.WebGPURenderer, staticLight: StaticLight, camera: THREE.PerspectiveCamera, frameGraph: FrameGraph): LodLab | null {
@@ -620,6 +622,7 @@ function startLoop(p: Pipeline, ui: PipelineUi, state: { paused: boolean; stepOn
     world.beginFrame(dt);
     controls.update();
     p.sun.updateAnimation();
+    p.sky?.update();
     camera.updateMatrixWorld();
     p.sun.shadowFit.update(camera);
     frameGraph.beginFrame();
@@ -658,6 +661,8 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   gi.rigidSurfels = url.flag('rigidSurfels', true);
   gi.setLeafTransmit(url.flag('giLeafTransmit', true));
   const sun = setupSun(gui, host, { envTexture: gi.envTexture, blueNoise: gi.blueNoiseTexture }, url);
+  const sky = SkyStage.fromHost(renderer, host, url);
+  await sky?.lightEnvironment(renderer, gi.envTexture, url);
   if (url.flag('reflectionLab', false)) addReflectionFixture(host);
   const staticLight = new StaticLight(renderer, gi, scene, host.sun, url);
   await staticLight.unwrap();
@@ -705,12 +710,13 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
     post.motionBlur.settings.shutter = CINE_CAMERAS[cine.name].shutterAngleDeg / 360;
     console.log(`[cine] ${CINE_CAMERAS[cine.name].label}, ${horizontalFovDeg(CINE_CAMERAS[cine.name]).toFixed(1)}° horizontal`);
   }
-  const p: Pipeline = { renderer, gi, host, url, frameGraph, staticLight, trace, post, sun, live, dynamic, world, stats, hud, giScale, lab, cine };
+  const p: Pipeline = { renderer, gi, host, url, frameGraph, staticLight, trace, post, sun, live, dynamic, world, stats, hud, giScale, lab, cine, sky };
   gi.resize(renderer, giScale());
   bindLightingGui(gui, p, ui);
   bindCineGui(gui, p);
   bindLeakGui(gui, p);
   host.bindGui?.(gui);
+  sky?.bindGui(gui, sun);
   post.bindGui(gui);
   trace.bindGui(gui, frameGraph);
   window.addEventListener('resize', () => {

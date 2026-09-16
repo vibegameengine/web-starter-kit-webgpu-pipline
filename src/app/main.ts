@@ -1,10 +1,10 @@
 import GUI from 'lil-gui';
 
 import { initRenderer } from '../shared/render/index.ts';
-import { createLightingPipeline, type SceneHost } from '../features/lighting-pipeline/index.ts';
-import { createRenderPipeline } from '../features/render-pipeline/index.ts';
+import { createLightingPipeline } from '../features/lighting-pipeline/index.ts';
+import { createRenderPipeline, type SceneHost } from '../features/render-pipeline/index.ts';
 import { staticInteriorVolume } from '../shared/gi/probes/index.ts';
-import { createBeachScene, createMidseeVillageScene, createVillageLightScene, createCorridorScene, createCorridorLightsScene, createCornellScene, createForestScene, createLeakRoomScene, populateCornell } from '../widgets/world/index.ts';
+import { createBeachScene, createMidseeVillageScene, createVillageLightScene, createCorridorScene, createCorridorLightsScene, createCornellScene, createForestScene, createLeakRoomScene, createSkyLabScene, populateCornell } from '../widgets/world/index.ts';
 import { applyGuiSettings, loadGuiSettings, settingsProfile, settingsProfileSource, settingsSceneName } from './guiSettings.ts';
 import { addGuiSettingsControls } from './guiSettingsPanel.ts';
 import { bootStage, onBootProgress } from '../shared/ui/bootProgress.ts';
@@ -89,6 +89,9 @@ async function boot(): Promise<void> {
   } else if (params.get('scene') === 'corridor') {
     const corridor = await createCorridorScene(renderer);
     host = { ...corridor, skyIsBackground: true, moverByDefault: false, sunIntensity: 'environment', interiorVolumes: [staticInteriorVolume(corridor.scene)] };
+  } else if (params.get('scene') === 'sky') {
+    const lab = await createSkyLabScene(renderer);
+    host = { ...lab, skyIsBackground: false, moverByDefault: false, sunIntensity: 8, sky: {} };
   } else if (params.get('scene') === 'leak-room') {
     const room = createLeakRoomScene(renderer);
     host = { ...room, skyIsBackground: true, moverByDefault: false };

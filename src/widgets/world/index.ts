@@ -11,3 +11,4 @@ export { createForestScene, type ForestScene } from './forestScene.ts';
 export { createCorridorScene, type CorridorScene } from './corridorScene.ts';
 export { createCorridorLightsScene } from './corridorLightsScene.ts';
 export { createLeakRoomScene, LEAK_ROOM_PROBES, type LeakRoomScene } from './leakRoomScene.ts';
+export { createSkyLabScene, type SkyLabScene } from './skyLabScene.tsx';

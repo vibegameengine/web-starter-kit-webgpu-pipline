@@ -75,6 +75,23 @@ export const SCENES: Entry[] = [
     ],
   },
   {
+    title: 'Небо',
+    art: 'home-art-beach',
+    description:
+      'Физическая атмосфера: LUT пропускания, многократного рассеяния и вида неба, диск солнца с потемнением к краю. То же небо освещает сцену: запекание, пробы, отражения и цвет солнца.',
+    href: '/?scene=sky&cam=objects',
+    open: 'Открыть лабу',
+    chips: [
+      { label: 'полдень', href: '/?scene=sky&cam=objects&sunAz=-60&sunEl=45&bakeCache=0' },
+      { label: 'золотой час', href: '/?scene=sky&cam=objects&sunAz=-60&sunEl=10&bakeCache=0' },
+      { label: 'закат', href: '/?scene=sky&cam=sunward&sunAz=-40&sunEl=2&bakeCache=0' },
+      { label: 'сумерки', href: '/?scene=sky&cam=sunward&sunAz=-40&sunEl=-4&bakeCache=0' },
+      { label: 'зенит', href: '/?scene=sky&cam=zenith&sunAz=-60&sunEl=30&bakeCache=0' },
+      { label: 'с высоты 12 км', href: '/?scene=sky&cam=horizon&sunAz=-90&sunEl=8&skyAltitude=12&bakeCache=0' },
+      { label: 'без неба (панорама)', href: '/?scene=sky&cam=objects&sky=0' },
+    ],
+  },
+  {
     title: 'Комната протечек',
     art: 'home-art-cornell',
     description:

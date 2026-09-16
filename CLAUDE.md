@@ -58,6 +58,14 @@
   Open: the runtime half (streaming pages into one resident atlas) is not built, and no oracle
   has compared the lattice's atlas against a surfel-per-texel one.
 
+- Iteration 31 (2026-09-17): physical sky. `src/shared/render/sky/` implements Hillaire 2020 from the
+  paper (UE 5.8 source read for inspiration only, nothing copied): transmittance, 64-direction
+  multi-scattering and sky-view LUTs as TSL compute, a limb-darkened sun disc, sun light colour from
+  transmittance, and `SkyEnvironment` rewriting the loaded panorama in place so bake, probes,
+  reflections and fog see the same sky. Host opt-in `sky: {}`, `?sky=0 skyAltitude= sunDiscScale=
+  skyEnvironment=0`, GUI folder Sky, hook `__sky`, lab `?scene=sky` (R3F) with catalog chips,
+  `scripts/check-sky.mjs`. Details in [lessons-sky-atmosphere.md](docs/lessons-sky-atmosphere.md).
+
 - **No long timeouts, and never walk away from a broken renderer.** User rule (2026-09-11): a check
   waits seconds, not minutes. Gate every headed script at a few minutes, give each `waitForFunction`
   a bound that matches what it waits for, and handle the error path explicitly - a script that hangs
