@@ -234,6 +234,7 @@ export class StaticLight {
     const result = await this.gi.bakeLightmap(this.renderer, this.scene, this.gbuffer, size, {
       height,
       sampleStride: stride,
+      sampleFallback: this.url.flag('sampleFallback', true),
       regions: this.layout.regions,
       iterations: this.bakeParams.passes,
       raysPerSurfel: this.bakeParams.rays,

@@ -5,6 +5,7 @@ import {
   If,
   Loop,
   atomicAdd,
+  bool,
   atomicMax,
   bitAnd,
   shiftLeft,
@@ -111,7 +112,10 @@ export function createLightmapSurfels(pool: SurfelPool, size: number, height = s
      Chart-local, because a lattice in atlas coordinates walks across chart borders and a
      small chart can fall entirely between two of its points. */
   const U_STRIDE = uniform(1);
+  const U_FALLBACK = uniform(0);
   const chartOriginAttr = new THREE.StorageBufferAttribute(new Int32Array(texelCount * 2), 2);
+  const chartIndexAttr = new THREE.StorageBufferAttribute(new Int32Array(texelCount), 1);
+  let chartSeedsAttr = new THREE.StorageBufferAttribute(new Int32Array(1), 1);
 
   let seedNode: THREE.ComputeNode | null = null;
   let writeNode: THREE.ComputeNode | null = null;
@@ -122,11 +126,22 @@ export function createLightmapSurfels(pool: SurfelPool, size: number, height = s
   let half = 0;
   let seeded = 0;
 
-  function setCharts(regions: { x: number; y: number; width: number; height: number }[], stride: number): void {
+  let chartFallback = true;
+
+  function setCharts(regions: { x: number; y: number; width: number; height: number }[], stride: number, fallback = true): void {
+    chartFallback = fallback;
     U_STRIDE.value = Math.max(1, Math.round(stride));
     const origins = chartOriginAttr.array as Int32Array;
+    const indices = chartIndexAttr.array as Int32Array;
     origins.fill(-1);
-    for (const region of regions) {
+    indices.fill(-1);
+    if (chartSeedsAttr.count !== Math.max(1, regions.length)) {
+      chartSeedsAttr = new THREE.StorageBufferAttribute(new Int32Array(Math.max(1, regions.length)), 1);
+      seedNode = null;
+    }
+    (chartSeedsAttr.array as Int32Array).fill(0);
+    chartSeedsAttr.needsUpdate = true;
+    for (const [chart, region] of regions.entries()) {
       const right = Math.min(size, region.x + region.width);
       const bottom = Math.min(height, region.y + region.height);
       for (let y = region.y; y < bottom; y++) {
@@ -134,10 +149,12 @@ export function createLightmapSurfels(pool: SurfelPool, size: number, height = s
           const index = (y * size + x) * 2;
           origins[index] = region.x;
           origins[index + 1] = region.y;
+          indices[y * size + x] = chart;
         }
       }
     }
     chartOriginAttr.needsUpdate = true;
+    chartIndexAttr.needsUpdate = true;
   }
 
   /**
@@ -189,6 +206,8 @@ export function createLightmapSurfels(pool: SurfelPool, size: number, height = s
       const normalTex = texture(gbuffer.normal);
       const links = storage(linkAttr, 'uint', texelCount).setAccess('readOnly');
       const chartOrigin = storage(chartOriginAttr, 'ivec2', texelCount).setAccess('readOnly');
+      const chartIndex = storage(chartIndexAttr, 'int', texelCount).setAccess('readOnly');
+      const chartSeeds = storage(chartSeedsAttr, 'int', chartSeedsAttr.count).setPBO(true).toAtomic();
 
       seedNode = Fn(() => {
         const tid = int(instanceIndex);
@@ -199,16 +218,29 @@ export function createLightmapSurfels(pool: SurfelPool, size: number, height = s
           y.toFloat().add(0.5).div(float(height)),
         );
 
-        texelSurfel.element(tid).assign(int(-1));
+        If(U_FALLBACK.lessThan(0.5), () => { texelSurfel.element(tid).assign(int(-1)); });
 
         const posSample = positionTex.sample(uv);
         const origin = chartOrigin.element(tid);
+        const chart = chartIndex.element(tid);
         const stride = int(U_STRIDE);
         const onLattice = x.sub(origin.x).mod(stride).equal(int(0))
           .and(y.sub(origin.y).mod(stride).equal(int(0)))
           .and(origin.x.greaterThanEqual(int(0)));
+        /* @important A chart smaller than the spacing, or one whose lattice points all miss
+           its measured area, would get no sample at all and bake black. The second pass over
+           the same kernel gives every chart that still has none its first covered texel,
+           claimed with an atomic so exactly one thread wins. */
+        const seedHere = bool(false).toVar();
+        If(U_FALLBACK.lessThan(0.5), () => {
+          seedHere.assign(onLattice);
+        }).Else(() => {
+          If(chart.greaterThanEqual(int(0)).and(texelSurfel.element(tid).lessThan(int(0))), () => {
+            seedHere.assign(atomicAdd(chartSeeds.element(chart), int(1)).equal(int(0)));
+          });
+        });
 
-        If(posSample.w.greaterThan(0.5).and(onLattice), () => {
+        If(posSample.w.greaterThan(0.5).and(seedHere), () => {
           const p0 = posSample.xyz.toVar();
           const n0 = normalTex.sample(uv).xyz.normalize().toVar();
           const mask = links.element(tid);
@@ -281,6 +313,7 @@ export function createLightmapSurfels(pool: SurfelPool, size: number, height = s
             });
 
             texelSurfel.element(tid).assign(sid);
+            If(chart.greaterThanEqual(int(0)).and(U_FALLBACK.lessThan(0.5)), () => { atomicAdd(chartSeeds.element(chart), int(1)); });
           });
         });
       })()
@@ -289,7 +322,13 @@ export function createLightmapSurfels(pool: SurfelPool, size: number, height = s
     }
 
     U_FRAME.value = renderer.info.frame;
+    U_FALLBACK.value = 0;
     renderer.compute(seedNode);
+    if (chartFallback) {
+      U_FALLBACK.value = 1;
+      renderer.compute(seedNode);
+      U_FALLBACK.value = 0;
+    }
     return true;
   }
 
