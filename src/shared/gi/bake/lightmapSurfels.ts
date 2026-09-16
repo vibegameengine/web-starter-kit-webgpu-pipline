@@ -103,14 +103,42 @@ export function createLightmapSurfels(pool: SurfelPool, size: number, height = s
      nothing it measured could move. Design section 07. */
   const U_ATLAS_GAIN = uniform(1);
   const linkAttr = new THREE.StorageBufferAttribute(new Uint32Array(texelCount), 1);
+  /* @important The sample spacing, in texels, and the corner each chart counts it from.
+     A surfel per texel ties the pool ceiling to the atlas resolution: a finer atlas asks
+     for more surfels for the same light. The lattice breaks that tie - light is measured
+     every `U_STRIDE` texels and carried to the rest along the traced links - so the atlas
+     may be as fine as the geometry deserves while the pool pays only for the spacing.
+     Chart-local, because a lattice in atlas coordinates walks across chart borders and a
+     small chart can fall entirely between two of its points. */
+  const U_STRIDE = uniform(1);
+  const chartOriginAttr = new THREE.StorageBufferAttribute(new Int32Array(texelCount * 2), 2);
 
   let seedNode: THREE.ComputeNode | null = null;
   let writeNode: THREE.ComputeNode | null = null;
   let denoiseNode: THREE.ComputeNode | null = null;
+  let spreadNode: THREE.ComputeNode | null = null;
   let dilateNode: THREE.ComputeNode | null = null;
   let blitNode: THREE.ComputeNode | null = null;
   let half = 0;
   let seeded = 0;
+
+  function setCharts(regions: { x: number; y: number; width: number; height: number }[], stride: number): void {
+    U_STRIDE.value = Math.max(1, Math.round(stride));
+    const origins = chartOriginAttr.array as Int32Array;
+    origins.fill(-1);
+    for (const region of regions) {
+      const right = Math.min(size, region.x + region.width);
+      const bottom = Math.min(height, region.y + region.height);
+      for (let y = region.y; y < bottom; y++) {
+        for (let x = region.x; x < right; x++) {
+          const index = (y * size + x) * 2;
+          origins[index] = region.x;
+          origins[index + 1] = region.y;
+        }
+      }
+    }
+    chartOriginAttr.needsUpdate = true;
+  }
 
   /**
    * One surfel per covered atlas texel.
@@ -160,6 +188,7 @@ export function createLightmapSurfels(pool: SurfelPool, size: number, height = s
       const positionTex = texture(gbuffer.position);
       const normalTex = texture(gbuffer.normal);
       const links = storage(linkAttr, 'uint', texelCount).setAccess('readOnly');
+      const chartOrigin = storage(chartOriginAttr, 'ivec2', texelCount).setAccess('readOnly');
 
       seedNode = Fn(() => {
         const tid = int(instanceIndex);
@@ -173,8 +202,13 @@ export function createLightmapSurfels(pool: SurfelPool, size: number, height = s
         texelSurfel.element(tid).assign(int(-1));
 
         const posSample = positionTex.sample(uv);
+        const origin = chartOrigin.element(tid);
+        const stride = int(U_STRIDE);
+        const onLattice = x.sub(origin.x).mod(stride).equal(int(0))
+          .and(y.sub(origin.y).mod(stride).equal(int(0)))
+          .and(origin.x.greaterThanEqual(int(0)));
 
-        If(posSample.w.greaterThan(0.5), () => {
+        If(posSample.w.greaterThan(0.5).and(onLattice), () => {
           const p0 = posSample.xyz.toVar();
           const n0 = normalTex.sample(uv).xyz.normalize().toVar();
           const mask = links.element(tid);
@@ -399,6 +433,78 @@ export function createLightmapSurfels(pool: SurfelPool, size: number, height = s
         .compute(texelCount)
         .setName('Lightmap denoise');
 
+      /* @important Carries the lattice's measured texels to the texels between them, and
+         only through the links the filter pass traced. A texel that cannot see its
+         neighbour does not take light from it, so the spacing never reaches through a
+         wall - which is the one thing an interpolation over an atlas must not do. Runs
+         until the front has travelled the spacing; texels no front reaches keep w = 0 and
+         are reported, not invented. */
+      spreadNode = Fn(() => {
+        const tid = int(instanceIndex);
+        const x = tid.mod(int(size));
+        const y = tid.div(int(size));
+        const self = atlas.element(tid.add(int(U_SRC)));
+
+        If(self.w.greaterThan(0.25), () => {
+          atlas.element(tid.add(int(U_DST))).assign(self);
+        }).Else(() => {
+          const linkMask = links.element(tid);
+          const uv = texelUv(x, y);
+          const centre = positionTex.sample(uv);
+          const p0 = centre.xyz;
+          const n0 = normalTex.sample(uv).xyz.normalize();
+          const sum = vec3(0, 0, 0).toVar();
+          const weight = float(0).toVar();
+
+          If(centre.w.greaterThan(0.5), () => {
+            Loop(int(9), ({ i }) => {
+              const dx = i.mod(int(3)).sub(int(1));
+              const dy = i.div(int(3)).sub(int(1));
+              const nx = x.add(dx);
+              const ny = y.add(dy);
+              const bit = i.lessThan(int(4)).select(i, i.sub(int(1)));
+              const linked = bitAnd(linkMask, shiftLeft(uint(1), uint(bit))).notEqual(uint(0));
+
+              If(
+                dx.equal(int(0)).and(dy.equal(int(0))).not()
+                  .and(linked.or(U_USE_LINKS.lessThan(0.5)))
+                  .and(nx.greaterThanEqual(int(0)))
+                  .and(nx.lessThan(int(size)))
+                  .and(ny.greaterThanEqual(int(0)))
+                  .and(ny.lessThan(int(height))),
+                () => {
+                  const j = ny.mul(int(size)).add(nx);
+                  const s = atlas.element(j.add(int(U_SRC)));
+                  If(s.w.greaterThan(0.25), () => {
+                    const uvj = texelUv(nx, ny);
+                    const pj = positionTex.sample(uvj).xyz;
+                    const nj = normalTex.sample(uvj).xyz.normalize();
+                    If(
+                      n0.dot(nj).greaterThan(0.9)
+                        .and(pj.sub(p0).dot(n0).abs().lessThan(U_PLANE_EPS))
+                        .or(U_USE_LINKS.greaterThan(0.5)),
+                      () => {
+                        const w = dx.equal(int(0)).or(dy.equal(int(0))).select(float(1), float(0.7071));
+                        sum.addAssign(s.xyz.mul(w));
+                        weight.addAssign(w);
+                      },
+                    );
+                  });
+                },
+              );
+            });
+          });
+
+          If(weight.greaterThan(0), () => {
+            atlas.element(tid.add(int(U_DST))).assign(vec4(sum.div(weight), float(1)));
+          }).Else(() => {
+            atlas.element(tid.add(int(U_DST))).assign(self);
+          });
+        });
+      })()
+        .compute(texelCount)
+        .setName('Lightmap spread');
+
       // Gutter fill. Bilinear sampling at a chart border reaches outside the chart;
       // without this it reaches into zeros and every chart edge renders as a dark
       // seam. Filled texels are marked 0.5 so a later pass can spread them further
@@ -482,6 +588,9 @@ export function createLightmapSurfels(pool: SurfelPool, size: number, height = s
 
     const capture = async (name: string) => { if (onStage) onStage(name, await readHalf(renderer)); };
     await capture('raw');
+    const spread = Math.max(0, Math.round(U_STRIDE.value) - 1) * 2;
+    for (let i = 0; i < spread; i++) step(spreadNode!);
+    if (spread > 0) await capture('spread');
     for (let i = 0; i < denoise; i++) { step(denoiseNode!); await capture(`denoise ${i + 1}`); }
     for (let i = 0; i < dilate; i++) { step(dilateNode!); await capture(`dilate ${i + 1}`); }
 
@@ -554,5 +663,5 @@ export function createLightmapSurfels(pool: SurfelPool, size: number, height = s
     return seeded;
   }
 
-  return { lightmap, seed, setPlacement: (value: number) => { U_PLACEMENT.value = value; }, writeAtlas, readStats, countSeeded, readHalf, links: linkAttr, texelSurfel: texelSurfelAttr };
+  return { lightmap, seed, setCharts, setPlacement: (value: number) => { U_PLACEMENT.value = value; }, writeAtlas, readStats, countSeeded, readHalf, links: linkAttr, texelSurfel: texelSurfelAttr };
 }

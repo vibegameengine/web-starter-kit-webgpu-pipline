@@ -1330,6 +1330,9 @@ export class SurfelGI {
       filterLinks?: ContactBVHBundle | null;
       height?: number;
       freshSurfels?: boolean;
+      /** Atlas texels between measured samples, and the chart rectangles they sit in. */
+      sampleStride?: number;
+      regions?: { x: number; y: number; width: number; height: number }[];
       onStage?: (name: string, pixels: Float32Array) => void;
       onProgress?: (fraction: number, iteration: number) => void;
     } = {},
@@ -1354,6 +1357,8 @@ export class SurfelGI {
       filterLinks,
       height = size,
       freshSurfels,
+      sampleStride = 1,
+      regions = [],
       onStage,
       onProgress,
     } = options;
@@ -1385,9 +1390,10 @@ export class SurfelGI {
       if (linkStats.texels === 0) throw new Error('[lightmap] the filter-link pass wrote nothing: every texel is isolated, which is what a kernel that failed to compile also leaves behind');
     }
     lm.setPlacement(filterLinks ? giKnobs.bakePlacement() : 0);
+    lm.setCharts(regions, sampleStride);
     if (!lm.seed(renderer, gbuffer)) return null;
     const seeded = await lm.countSeeded(renderer);
-    console.log(`[lightmap] seeded ${seeded} surfels from the atlas`);
+    console.log(`[lightmap] seeded ${seeded} surfels from the atlas, every ${sampleStride} texel(s)`);
     if (seeded === 0) return null;
 
     this.setBaseSampleCount(raysPerSurfel);

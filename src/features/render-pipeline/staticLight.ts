@@ -18,6 +18,8 @@ import { bootNote, bootStage } from '../../shared/ui/bootProgress.ts';
 
 const DEFAULT_ATLAS_SIZE = 512;
 const DEFAULT_PROBE_SPACING = 2;
+const DEFAULT_SAMPLE_METRES = 0.1;
+const DEFAULT_METRES_PER_TEXEL = 0.05;
 const DEFAULT_PROBE_ITERATIONS = 100;
 const MAX_PROBES = 65536;
 
@@ -78,7 +80,12 @@ export class StaticLight {
   }
 
   async unwrap(): Promise<void> {
-    this.layout = await bootStage('Unwrapping lightmap UVs', () => assignLightmapUvs(this.scene, { padding: this.url.num('pad') ?? 0.12, atlasSize: this.atlasSize }));
+    const density = this.url.num('lmDensity') ?? DEFAULT_METRES_PER_TEXEL;
+    this.layout = await bootStage('Unwrapping lightmap UVs', () => assignLightmapUvs(this.scene, {
+      padding: this.url.num('pad') ?? 0.12,
+      atlasSize: this.atlasSize,
+      metresPerTexel: density,
+    }));
     this.atlasSize = this.layout.atlasSize;
     if (this.url.flag('leak', false)) {
       this.leak = new BakeLeakStages(this.atlasSize, this.layout.atlasHeight, this.layout.regions, this.layout.pageOfRegion);
@@ -200,8 +207,20 @@ export class StaticLight {
       await readFloatAttachment(this.renderer, this.gbuffer.target, 0),
       await readFloatAttachment(this.renderer, this.gbuffer.target, 1));
     this.coverage = coverage.covered;
+    /* @important The light is measured every `sampleMetres` of world surface and carried
+       between those samples along the traced links, so the atlas resolution and the surfel
+       pool stop being the same number. A surfel per texel made a finer atlas cost more
+       surfels for the same light, and the pool ceiling (262144, 179 MiB on the GPU and the
+       same again on the host) then capped the atlas. `?sample=` is the spacing in metres;
+       `?sample=0` puts a surfel back on every texel. */
+    const sampleMetres = this.url.num('sample') ?? DEFAULT_SAMPLE_METRES;
+    const stride = sampleMetres > 0 && this.layout.metresPerTexel > 0
+      ? Math.max(1, Math.round(sampleMetres / this.layout.metresPerTexel))
+      : 1;
     const result = await this.gi.bakeLightmap(this.renderer, this.scene, this.gbuffer, size, {
       height,
+      sampleStride: stride,
+      regions: this.layout.regions,
       iterations: this.bakeParams.passes,
       raysPerSurfel: this.bakeParams.rays,
       freshSurfels: true,
@@ -213,7 +232,8 @@ export class StaticLight {
       onStage: this.leak ? (name, pixels) => this.leak!.recordPage(name, 0, pixels) : undefined,
       onProgress: (fraction, iteration) => bootNote(`Baking lightmap ${(fraction * 100).toFixed(0)}% · pass ${iteration}`),
     });
-    if (result && result.seeded < this.coverage) throw new Error(`[lightmap] surfel pool exhausted: ${result.seeded}/${this.coverage} covered texels got a surfel. Lower ?lm=`);
+    const wanted = Math.ceil(this.coverage / (stride * stride));
+    if (result && result.seeded < wanted * 0.9) throw new Error(`[lightmap] surfel pool exhausted: ${result.seeded} surfels for ${wanted} lattice points over ${this.coverage} covered texels. Raise ?sample= or lower ?lmDensity=`);
     if (!result?.texture) throw new Error('lightmap: the bake produced no texture');
     const stacked = (await readFloatTexture(this.renderer, result.texture)).data;
     const surfels = await this.gi.captureStaticBake(this.renderer, result.seeded);

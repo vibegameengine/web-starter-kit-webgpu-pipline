@@ -75,6 +75,7 @@ interface ChartRequest {
   h: number;
   x: number;
   y: number;
+  page: number;
   /** Maps a vertex index to its position inside the chart, in metres from the corner. */
   local: (vertex: number, out: THREE.Vector2) => void;
   vertices: number[];
@@ -111,7 +112,7 @@ interface ChartRequest {
  */
 export function assignLightmapUvs(
   scene: THREE.Scene,
-  options: { padding?: number; atlasSize?: number; filterMip?: number } = {},
+  options: { padding?: number; atlasSize?: number; filterMip?: number; metresPerTexel?: number; maxPages?: number } = {},
 ): LightmapLayout {
   const { atlasSize = 512 } = options;
   const safeMip = options.filterMip ?? Math.log2(atlasSize / Math.min(128, atlasSize / 2));
@@ -188,22 +189,27 @@ export function assignLightmapUvs(
     };
   }
 
-  // --- density search ---------------------------------------------------------
-  let metresPerTexel = Math.sqrt(mappedArea / (TARGET_FILL * atlasSize * atlasSize));
-  let packed = false;
-  for (let attempt = 0; attempt < 40 && !packed; attempt++) {
-    for (const chart of requests) {
-      chart.w = Math.max(2 * alignment, Math.ceil((chart.extentU / metresPerTexel + 2 * inset) / alignment) * alignment);
-      chart.h = Math.max(2 * alignment, Math.ceil((chart.extentV / metresPerTexel + 2 * inset) / alignment) * alignment);
-    }
-    packed = shelfPack(requests, atlasSize);
-    if (!packed) metresPerTexel *= 1.07;
+  /* @important The density is ours to choose, and the atlas grows in pages to hold it.
+     It used to be solved for: start where the charts would fill TARGET_FILL of one atlas
+     and coarsen 7% at a time until they fitted, so the same bench was baked at 0.1156 m
+     per texel in the corridor and 0.0691 on the beach - quality as a by-product of how
+     much surface a scene happens to have. Pages cost nothing extra to bake now that the
+     stack is rasterised and integrated once, and the sample lattice keeps the surfel pool
+     off the atlas resolution. `?lmDensity=0` restores the search. */
+  const searched = Math.sqrt(mappedArea / (TARGET_FILL * atlasSize * atlasSize));
+  const metresPerTexel = options.metresPerTexel && options.metresPerTexel > 0 ? options.metresPerTexel : searched;
+  for (const chart of requests) {
+    chart.w = Math.max(2 * alignment, Math.ceil((chart.extentU / metresPerTexel + 2 * inset) / alignment) * alignment);
+    chart.h = Math.max(2 * alignment, Math.ceil((chart.extentV / metresPerTexel + 2 * inset) / alignment) * alignment);
   }
-  if (!packed) {
+  const maxPages = options.maxPages ?? 64;
+  const pages = packPages(requests, atlasSize, alignment, maxPages);
+  if (pages === 0) {
     throw new Error(
-      `[lightmap] could not pack ${requests.length} charts into a ${atlasSize}² atlas`,
+      `[lightmap] could not pack ${requests.length} charts at ${metresPerTexel.toFixed(4)} m/texel into ${maxPages} pages of ${atlasSize}²`,
     );
   }
+  const atlasHeight = atlasSize * pages;
 
   // --- write uv1 ----------------------------------------------------------------
   const perMesh = new Map<THREE.Mesh, { uv1: Float32Array; bounds: Float32Array; texels: number }>();
@@ -223,15 +229,16 @@ export function assignLightmapUvs(
     const spanV = Math.max(chart.h - 2 * inset, 1e-3);
     const scaleU = chart.extentU > 1e-6 ? spanU / chart.extentU : 0;
     const scaleV = chart.extentV > 1e-6 ? spanV / chart.extentV : 0;
-    const filterBounds = [(chart.x + alignment * .5) / atlasSize, (chart.y + alignment * .5) / atlasSize,
-      (chart.x + chart.w - alignment * .5) / atlasSize, (chart.y + chart.h - alignment * .5) / atlasSize];
+    const pageTop = chart.page * atlasSize;
+    const filterBounds = [(chart.x + alignment * .5) / atlasSize, (pageTop + chart.y + alignment * .5) / atlasHeight,
+      (chart.x + chart.w - alignment * .5) / atlasSize, (pageTop + chart.y + chart.h - alignment * .5) / atlasHeight];
 
     for (const vertex of chart.vertices) {
       chart.local(vertex, local);
       const u = chart.x + inset + local.x * scaleU;
       const v = chart.y + inset + local.y * scaleV;
       entry.uv1[vertex * 2 + 0] = u / atlasSize;
-      entry.uv1[vertex * 2 + 1] = v / atlasSize;
+      entry.uv1[vertex * 2 + 1] = (v + chart.page * atlasSize) / atlasHeight;
       // Constant within each chart. All line-filter taps stay inside the
       // coarsest mip's texel centres, including when only fallback is resident.
       entry.bounds.set(filterBounds, vertex * 4);
@@ -264,14 +271,14 @@ export function assignLightmapUvs(
 
   return {
     charts,
-    regions: requests.map(c => ({ x: c.x, y: c.y, width: c.w, height: c.h })),
-    pageOfRegion: requests.map(() => 0),
-    pages: 1,
-    atlasHeight: atlasSize,
+    regions: requests.map(c => ({ x: c.x, y: c.y + c.page * atlasSize, width: c.w, height: c.h })),
+    pageOfRegion: requests.map(c => c.page),
+    pages,
+    atlasHeight,
     placements: requests.map((c) => ({
       mesh: c.mesh,
-      page: 0,
-      region: { x: c.x, y: c.y, width: c.w, height: c.h },
+      page: c.page,
+      region: { x: c.x, y: c.y + c.page * atlasSize, width: c.w, height: c.h },
       centre: chartCentre(c),
       extentU: c.extentU,
       extentV: c.extentV,
@@ -330,6 +337,7 @@ function quadCharts(mesh: THREE.Mesh): { charts: ChartRequest[]; area: number } 
       extentV: side,
       w: 1,
       h: 1,
+      page: 0,
       x: 0,
       y: 0,
       vertices: [base, base + 1, base + 2, base + 3],
@@ -410,6 +418,7 @@ function projectedCharts(mesh: THREE.Mesh): { charts: ChartRequest[]; area: numb
       extentV: maxV - minV,
       w: 1,
       h: 1,
+      page: 0,
       x: 0,
       y: 0,
       vertices,
@@ -421,23 +430,68 @@ function projectedCharts(mesh: THREE.Mesh): { charts: ChartRequest[]; area: numb
 }
 
 /** Shelf packer: rows of charts sorted by height, tallest first. Exact enough here. */
-function shelfPack(charts: ChartRequest[], side: number): boolean {
-  const order = charts.slice().sort((p, q) => q.h - p.h || q.w - p.w);
-  let x = 0;
-  let y = 0;
-  let rowHeight = 0;
-  for (const chart of order) {
-    if (chart.w > side || chart.h > side) return false;
-    if (x + chart.w > side) {
-      x = 0;
-      y += rowHeight;
-      rowHeight = 0;
-    }
-    if (y + chart.h > side) return false;
-    chart.x = x;
-    chart.y = y;
-    x += chart.w;
-    rowHeight = Math.max(rowHeight, chart.h);
+
+function packPages(charts: ChartRequest[], side: number, alignment: number, maxPages: number): number {
+  let remaining = charts;
+  let page = 0;
+  while (remaining.length > 0 && page < maxPages) {
+    const fitted: ChartRequest[] = [];
+    remaining = packOnePage(remaining, side, alignment, fitted);
+    if (fitted.length === 0) return 0;
+    for (const chart of fitted) chart.page = page;
+    page++;
   }
-  return true;
+  return remaining.length === 0 ? page : 0;
+}
+
+function packOnePage(charts: ChartRequest[], side: number, alignment: number, fitted: ChartRequest[]): ChartRequest[] {
+  const order = charts.slice().sort((p, q) => q.h - p.h || q.w - p.w);
+  const skyline: { x: number; y: number; width: number }[] = [{ x: 0, y: 0, width: side }];
+  const rejected: ChartRequest[] = [];
+  for (const chart of order) {
+    if (chart.w > side || chart.h > side) return [];
+    const spot = lowestFit(skyline, chart.w, chart.h, side, alignment);
+    if (!spot) { rejected.push(chart); continue; }
+    chart.x = spot.x;
+    chart.y = spot.y;
+    raiseSkyline(skyline, spot.x, spot.y + chart.h, chart.w);
+    fitted.push(chart);
+  }
+  return rejected;
+}
+
+function lowestFit(skyline: { x: number; y: number; width: number }[], width: number, height: number, side: number, alignment: number):
+  { x: number; y: number } | null {
+  let best: { x: number; y: number } | null = null;
+  for (let index = 0; index < skyline.length; index++) {
+    const x = Math.ceil(skyline[index].x / alignment) * alignment;
+    if (x + width > side) continue;
+    let y = 0;
+    let covered = 0;
+    for (let scan = index; scan < skyline.length && covered < width + (x - skyline[index].x); scan++) {
+      y = Math.max(y, skyline[scan].y);
+      covered += skyline[scan].width;
+    }
+    if (covered < width) continue;
+    y = Math.ceil(y / alignment) * alignment;
+    if (y + height > side) continue;
+    if (!best || y < best.y || (y === best.y && x < best.x)) best = { x, y };
+  }
+  return best;
+}
+
+function raiseSkyline(skyline: { x: number; y: number; width: number }[], x: number, top: number, width: number): void {
+  const inserted = { x, y: top, width };
+  const next: typeof skyline = [];
+  for (const segment of skyline) {
+    const endSegment = segment.x + segment.width;
+    const endInserted = x + width;
+    if (endSegment <= x || segment.x >= endInserted) { next.push(segment); continue; }
+    if (segment.x < x) next.push({ x: segment.x, y: segment.y, width: x - segment.x });
+    if (endSegment > endInserted) next.push({ x: endInserted, y: segment.y, width: endSegment - endInserted });
+  }
+  next.push(inserted);
+  next.sort((a, b) => a.x - b.x);
+  skyline.length = 0;
+  skyline.push(...next);
 }
