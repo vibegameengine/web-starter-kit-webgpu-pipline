@@ -1555,8 +1555,10 @@ ${bakedAtlas ? `                var fromAtlas = false;
       U_ALBEDO_BOOST.value = Math.max(0, boost);
     },
     setGiScales: (fromDirect: number, fromIndirect: number) => {
-      U_GI_FROM_DIRECT.value = Math.max(0, fromDirect);
-      U_GI_FROM_INDIRECT.value = Math.max(0, fromIndirect);
+      const direct = giKnobs.giFromDirectOverride();
+      const indirect = giKnobs.giFromIndirectOverride();
+      U_GI_FROM_DIRECT.value = Math.max(0, direct >= 0 ? direct : fromDirect);
+      U_GI_FROM_INDIRECT.value = Math.max(0, indirect >= 0 ? indirect : fromIndirect);
     },
     setEnvControls: (intensity: number, lod: number) => {
       U_ENV_INTENSITY.value = Math.max(0, intensity);

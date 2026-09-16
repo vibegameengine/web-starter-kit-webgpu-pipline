@@ -46,6 +46,17 @@ export const SCENES: Entry[] = [
     ],
   },
   {
+    title: 'Коридор · динамический свет',
+    art: 'home-art-corridor',
+    description: 'Копия коридора с тремя движущимися цветными лампами и тенями. Пауза, скорость, мощность и отдельное отключение каждого источника в панели «Свет · коридор».',
+    href: '/?scene=corridor-lights',
+    open: 'Открыть лабу',
+    chips: [
+      ...cams('corridor-lights', ['hero', 'bench', 'deep']),
+      { label: 'пауза', href: '/?scene=corridor-lights&lightMotion=0' },
+    ],
+  },
+  {
     title: 'Деревня Мидси',
     art: 'home-art-village',
     preview: '/previews/midsee-village.png',

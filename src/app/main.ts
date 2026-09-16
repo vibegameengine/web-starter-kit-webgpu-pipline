@@ -4,7 +4,7 @@ import { initRenderer } from '../shared/render/index.ts';
 import { createLightingPipeline, type SceneHost } from '../features/lighting-pipeline/index.ts';
 import { createRenderPipeline } from '../features/render-pipeline/index.ts';
 import { staticInteriorVolume } from '../shared/gi/probes/index.ts';
-import { createBeachScene, createMidseeVillageScene, createVillageLightScene, createCorridorScene, createCornellScene, createForestScene, createLeakRoomScene, populateCornell } from '../widgets/world/index.ts';
+import { createBeachScene, createMidseeVillageScene, createVillageLightScene, createCorridorScene, createCorridorLightsScene, createCornellScene, createForestScene, createLeakRoomScene, populateCornell } from '../widgets/world/index.ts';
 import { applyGuiSettings, loadGuiSettings, settingsProfile, settingsProfileSource, settingsSceneName } from './guiSettings.ts';
 import { addGuiSettingsControls } from './guiSettingsPanel.ts';
 import { bootStage, onBootProgress } from '../shared/ui/bootProgress.ts';
@@ -83,6 +83,9 @@ async function boot(): Promise<void> {
   if (params.get('scene') === 'forest') {
     const forest = await createForestScene(renderer);
     host = { ...forest, skyIsBackground: false, moverByDefault: false, sunIntensity: 'environment' };
+  } else if (params.get('scene') === 'corridor-lights') {
+    const corridor = await createCorridorLightsScene(renderer);
+    host = { ...corridor, skyIsBackground: true, moverByDefault: false, sunIntensity: 0.35, staticLighting: false, interiorVolumes: [staticInteriorVolume(corridor.scene)] };
   } else if (params.get('scene') === 'corridor') {
     const corridor = await createCorridorScene(renderer);
     host = { ...corridor, skyIsBackground: true, moverByDefault: false, sunIntensity: 'environment', interiorVolumes: [staticInteriorVolume(corridor.scene)] };

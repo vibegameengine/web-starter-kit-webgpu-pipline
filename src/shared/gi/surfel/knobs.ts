@@ -60,10 +60,14 @@ export const giKnobs = {
      Design section 04, source fragment C1. */
   donorVisibilityGate: () => num('donorGate', 0),
 
-  /* @important The bake traces the segment from a hit to each surfel it reuses, instead of trusting
-     the radial-depth moments. Two surfaces sharing a hash cell are what the moments cannot separate,
-     and the weights are normalised afterwards. `?bakeExactReuse=0` is the ablation. Design section 04. */
-  exactBakeReuse: () => flag('bakeExactReuse', false),
+  /* @important ON, and it is what closes the sealed room. The bake traces the segment from a hit to
+     each surfel it reuses instead of trusting the radial-depth moments, which cannot separate two
+     surfaces that share a hash cell - and the inner and outer faces of a 0.2 m wall share one. With
+     ?env=0 the sealed room admits light by exactly two routes, and ?giIndirect=0 shows which: the
+     shadow rays leave the interior at exactly zero, so every leaked texel came through this gather.
+     Tracing it: the interior goes from 224 texels over tau, peaking at 1.7e-4, to zero, while the
+     sunlit ground outside is unmoved at 0.0135. `?bakeExactReuse=0` is the ablation. Section 04. */
+  exactBakeReuse: () => flag('bakeExactReuse', true),
 
   /** @important `?spawnEps=radius` restores the ray offset that was a length in metres; see spawnEpsilon. */
   spawnEpsilonFromRadius: () => (params()?.get('spawnEps') ?? '') === 'radius',
@@ -74,6 +78,15 @@ export const giKnobs = {
      the ray distance epsilon having been the whole leak. Moving every edge sample shifts contact
      shadows, and nothing measured pays for that yet. `?bakePlacement=0.35` turns it on. Section 02. */
   bakePlacement: () => num('bakePlacement', 0),
+
+  /* @important Which half of a bounce carries the light, as an ablation rather than a tuning knob.
+     A sealed room lit only by the sun (?env=0) admits exactly two mechanisms for interior light: a
+     shadow ray at some hit point that escapes to the sun, and a gather that reads a surfel on the
+     outside of a wall. -1 means the scene's own value, so nothing changes unless asked; `?giDirect=0`
+     leaves only the gather and `?giIndirect=0` leaves only the shadow rays, which is how the sealed
+     room's residue is attributed instead of argued about. */
+  giFromDirectOverride: () => num('giDirect', -1),
+  giFromIndirectOverride: () => num('giIndirect', -1),
 
   /** @important `?bakeHidden=1` marks texels whose centre a parity ray calls inside a closed body; see filterLinks. */
   bakeHiddenTexels: () => flag('bakeHidden', false),

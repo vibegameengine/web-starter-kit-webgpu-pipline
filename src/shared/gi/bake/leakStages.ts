@@ -218,7 +218,7 @@ export class BakeLeakStages {
      value at a point. Two probes cannot see a leak that is spread thin: a seven-fold error at one
      texel hid under a tolerance derived from the lit reference, and a critic found it by arithmetic
      rather than by the check. This returns every charted texel whose sample stands inside a box. */
-  region(min: [number, number, number], max: [number, number, number], stageName = 'resident', threshold = 0) {
+  region(min: [number, number, number], max: [number, number, number], stageName = 'resident', threshold = 0, reach = 0.05) {
     const found = this.stages.find((entry) => entry.name === stageName);
     if (!found) return null;
     const values: number[] = [];
@@ -231,7 +231,7 @@ export class BakeLeakStages {
       if (!inside || stage.values[slot * 4 + 3] < MEASURED_ALPHA) continue;
       values.push(luma(stage.values, slot * 4));
     }
-    if (values.length === 0) return { texels: 0, mean: 0, p99: 0, max: 0, above: 0 };
+    if (values.length === 0) return { texels: 0, mean: 0, p99: 0, max: 0, above: 0, widestMetres: 0 };
     values.sort((a, b) => a - b);
     return {
       texels: values.length,
@@ -239,44 +239,75 @@ export class BakeLeakStages {
       p99: values[Math.min(values.length - 1, Math.floor(values.length * REGION_PERCENTILE))],
       max: values[values.length - 1],
       above: values.filter((v) => v > threshold).length,
-      largestRun: this.largestRunAbove(min, max, stage, threshold),
+      widestMetres: this.widestLeak(min, max, stage, threshold, reach),
     };
   }
 
-  /* @important Design section 07 bounds the p99 AND the width of a connected leak. A count of texels
-     over tau is neither: it is max in disguise, it moved 20/20/21/22/22/23/25 across seven bakes of
-     the same scene, and a single outlier blocks while a one-texel line eight metres long does not.
-     This walks the four-neighbourhood in atlas space and returns the largest connected run over tau. */
-  private largestRunAbove(min: [number, number, number], max: [number, number, number], stage: LeakStage, threshold: number): number {
-    const hot = new Set<number>();
+  /* @important A region statistic says how much light is where it should not be; it never says which
+     surface put it there. Localising the sealed room's residue by height alone named the ceiling,
+     and the ceiling turned out to hold none of it. This returns the offending texels themselves -
+     position, normal, chart, and the value at every stage - so the next question is asked of the
+     geometry rather than of a histogram. */
+  hottest(min: [number, number, number], max: [number, number, number], stageName = 'resident', threshold = 0, limit = 24): LeakTexelReport[] {
+    const stage = this.stages.find((entry) => entry.name === stageName);
+    if (!stage) return [];
+    const hot: { slot: number; value: number }[] = [];
     for (let slot = 0; slot < this.slots; slot++) {
       const texel = this.texelOfSlot[slot];
       if (!this.hasGeometry(texel) || stage.values[slot * 4 + 3] < MEASURED_ALPHA) continue;
       const i = texel * 4;
       if (![0, 1, 2].every((axis) => this.world[i + axis] >= min[axis] && this.world[i + axis] <= max[axis])) continue;
-      if (luma(stage.values, slot * 4) > threshold) hot.add(texel);
+      const value = luma(stage.values, slot * 4);
+      if (value > threshold) hot.push({ slot, value });
     }
-    let largest = 0;
+    hot.sort((one, two) => two.value - one.value);
+    return hot.slice(0, limit).map((entry) => this.reportOfSlot(entry.slot)).filter((report): report is LeakTexelReport => report !== null);
+  }
+
+  /* @important The design bounds the width of a connected leak on the SURFACE, and this used to walk
+     the four-neighbourhood of the atlas and return the component's area. Two things were wrong with
+     that. A 3x3 blob and a 1x9 line both answer 9 while being 9.5 cm and 3.2 cm across. And atlas
+     neighbours are not world neighbours: the residue sits on the junction of two walls, which is a
+     chart boundary by construction, so the measure was cut in half by the very seam it measures -
+     16 hot texels in one corner came back as a component of 8. Connectivity is by world distance
+     between texel centres now, and the number returned is the width in metres: the largest distance
+     between any two texels of the worst component. */
+  private widestLeak(min: [number, number, number], max: [number, number, number], stage: LeakStage, threshold: number, reach: number): number {
+    const hot: number[] = [];
+    for (let slot = 0; slot < this.slots; slot++) {
+      const texel = this.texelOfSlot[slot];
+      if (!this.hasGeometry(texel) || stage.values[slot * 4 + 3] < MEASURED_ALPHA) continue;
+      const i = texel * 4;
+      if (![0, 1, 2].every((axis) => this.world[i + axis] >= min[axis] && this.world[i + axis] <= max[axis])) continue;
+      if (luma(stage.values, slot * 4) > threshold) hot.push(texel);
+    }
     const seen = new Set<number>();
+    let widest = 0;
     for (const start of hot) {
       if (seen.has(start)) continue;
-      let size = 0;
-      const queue = [start];
+      const component: number[] = [start];
       seen.add(start);
-      while (queue.length > 0) {
-        const texel = queue.pop() as number;
-        size++;
-        const x = texel % this.size;
-        for (const step of [x > 0 ? -1 : 0, x < this.size - 1 ? 1 : 0, -this.size, this.size]) {
-          const next = texel + step;
-          if (step === 0 || next < 0 || next >= this.slotOfTexel.length || seen.has(next) || !hot.has(next)) continue;
-          seen.add(next);
-          queue.push(next);
+      for (let head = 0; head < component.length; head++) {
+        const a = component[head] * 4;
+        for (const other of hot) {
+          if (seen.has(other)) continue;
+          const b = other * 4;
+          const distance = Math.hypot(this.world[a] - this.world[b], this.world[a + 1] - this.world[b + 1], this.world[a + 2] - this.world[b + 2]);
+          if (distance > reach) continue;
+          seen.add(other);
+          component.push(other);
         }
       }
-      if (size > largest) largest = size;
+      for (const one of component) {
+        for (const two of component) {
+          const a = one * 4;
+          const b = two * 4;
+          const span = Math.hypot(this.world[a] - this.world[b], this.world[a + 1] - this.world[b + 1], this.world[a + 2] - this.world[b + 2]);
+          if (span > widest) widest = span;
+        }
+      }
     }
-    return largest;
+    return widest;
   }
 
   firstChange(tolerance = DEFAULT_TOLERANCE): LeakStageChange[] {
@@ -337,6 +368,7 @@ export function leakHookApi(leak: BakeLeakStages, onShown?: () => void) {
     atWorld: (x: number, y: number, z: number, withinMetres?: number) => leak.atWorld(x, y, z, withinMetres),
     firstChange: (tolerance?: number) => leak.firstChange(tolerance),
     inventedLight: (blackLevel?: number) => leak.inventedLight(blackLevel),
-    region: (min: [number, number, number], max: [number, number, number], stage?: string, threshold?: number) => leak.region(min, max, stage, threshold),
+    region: (min: [number, number, number], max: [number, number, number], stage?: string, threshold?: number, reach?: number) => leak.region(min, max, stage, threshold, reach),
+    hottest: (min: [number, number, number], max: [number, number, number], stage?: string, threshold?: number, limit?: number) => leak.hottest(min, max, stage, threshold, limit),
   };
 }
