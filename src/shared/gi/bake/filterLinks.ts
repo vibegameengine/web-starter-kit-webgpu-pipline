@@ -26,13 +26,15 @@ const KERNEL = /* wgsl */ `
     positionTex: texture_2d<f32>,
     normalTex: texture_2d<f32>,
     size: f32,
+    rows: f32,
     supportScale: f32,
     normalCos: f32,
     hiddenTest: f32
   ) -> void {
     let side = u32( size );
+    let lines = u32( rows );
     let i = instanceIndex;
-    if ( i >= side * side ) { return; }
+    if ( i >= side * lines ) { return; }
     let px = vec2i( i32( i % side ), i32( i / side ) );
     let centre = textureLoad( positionTex, px, 0 );
     if ( centre.w < 0.5 ) { links.value[ i ] = 0u; return; }
@@ -70,7 +72,7 @@ const KERNEL = /* wgsl */ `
       for ( var dx = -1; dx <= 1; dx = dx + 1 ) {
         if ( dx == 0 && dy == 0 ) { continue; }
         let q = px + vec2i( dx, dy );
-        if ( q.x < 0 || q.y < 0 || q.x >= i32( side ) || q.y >= i32( side ) ) { bit = bit + 1u; continue; }
+        if ( q.x < 0 || q.y < 0 || q.x >= i32( side ) || q.y >= i32( lines ) ) { bit = bit + 1u; continue; }
         let other = textureLoad( positionTex, q, 0 );
         if ( other.w < 0.5 ) { bit = bit + 1u; continue; }
         let pj = other.xyz;
@@ -125,6 +127,7 @@ function buildKernel(
     positionTex: texture(gbuffer.position),
     normalTex: texture(gbuffer.normal),
     size: uniforms.size,
+    rows: uniforms.rows,
     supportScale: uniforms.support,
     normalCos: uniforms.normalCos,
     hiddenTest: uniforms.hiddenTest,
@@ -153,9 +156,15 @@ async function readLinkStats(renderer: THREE.WebGPURenderer, attr: THREE.Storage
   return { texels, links, hidden, isolated, blocked: texels * 8 - links };
 }
 
-export function createFilterLinks(size: number, attr: THREE.StorageBufferAttribute) {
-  const texelCount = size * size;
+/* @important The atlas is a stack of pages, so the kernel is parameterised by its height as
+   well as its side. It used to take the side alone and stop at `side * side`: every page
+   above the first kept a zero link mask, the spread and the denoise then refused every
+   neighbour there, and the gutter fill invented what the bake had not measured - 730687
+   invented against 165537 measured on the six-page corridor. */
+export function createFilterLinks(size: number, height: number, attr: THREE.StorageBufferAttribute) {
+  const texelCount = size * height;
   const uSize = uniform(size);
+  const uRows = uniform(height);
   const uSupport = uniform(1);
   const uNormalCos = uniform(0.9);
   const uHiddenTest = uniform(1);
@@ -170,7 +179,7 @@ export function createFilterLinks(size: number, attr: THREE.StorageBufferAttribu
     uSupport.value = options.supportMetres ?? 1;
     uNormalCos.value = options.normalCos ?? 0.9;
     uHiddenTest.value = options.hiddenTest === true ? 1 : 0;
-    if (!kernel) kernel = buildKernel(attr, texelCount, gbuffer, bvh, { size: uSize, support: uSupport, normalCos: uNormalCos, hiddenTest: uHiddenTest });
+    if (!kernel) kernel = buildKernel(attr, texelCount, gbuffer, bvh, { size: uSize, rows: uRows, support: uSupport, normalCos: uNormalCos, hiddenTest: uHiddenTest });
     renderer.compute(kernel);
   }
 

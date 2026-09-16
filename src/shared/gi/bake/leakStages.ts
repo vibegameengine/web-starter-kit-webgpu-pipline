@@ -57,12 +57,15 @@ export class BakeLeakStages {
 
   readonly pageOfSlot: Int32Array;
 
-  constructor(readonly size: number, readonly height: number, regions: LightmapRegion[], pageOfRegion: number[]) {
+  constructor(readonly size: number, readonly height: number, regions: LightmapRegion[]) {
     this.slotOfTexel = new Int32Array(size * height).fill(-1);
     let slots = 0;
+    /* @important `region.y` already carries its page: the unwrap returns the row in the whole
+       stack, not inside a page. Adding the page offset a second time pushed every chart above
+       page 0 out of the atlas, so the stage capture reported "no texel here" for exactly the
+       surfaces a multi-page scene puts on its later pages. */
     for (const [chart, region] of regions.entries()) {
-      const row = (pageOfRegion[chart] ?? 0) * size;
-      for (let y = row + region.y; y < row + region.y + region.height; y++) {
+      for (let y = region.y; y < region.y + region.height; y++) {
         for (let x = region.x; x < region.x + region.width; x++) {
           if (y >= height || this.slotOfTexel[y * size + x] >= 0) continue;
           this.slotOfTexel[y * size + x] = chart;

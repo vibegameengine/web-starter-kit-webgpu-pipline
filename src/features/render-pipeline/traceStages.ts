@@ -1,9 +1,8 @@
 import * as THREE from 'three/webgpu';
 import type GUI from 'lil-gui';
-import { cameraProjectionMatrixInverse, cameraWorldMatrix, float, getViewPosition, mix, normalize, screenUV, uint, uniform, vec3, vec4 } from 'three/tsl';
+import { cameraProjectionMatrixInverse, cameraWorldMatrix, float, getViewPosition, normalize, screenUV, uint, uniform, vec3, vec4 } from 'three/tsl';
 import type { SurfelGI } from '../../shared/gi/index.ts';
 import type { ReflectionCache } from '../../shared/gi/reflect/cache/index.ts';
-import { ContactOcclusionPass, DEFAULT_CONTACT_SETTINGS } from '../../shared/gi/contact/contactOcclusionPass.ts';
 import { createContactBVH, type ContactBVHBundle } from '../../shared/gi/contact/contactBvh.ts';
 import { ReflectionPass } from '../../shared/gi/reflect/reflectionPass.ts';
 import { meanEnvironmentRadiance } from '../../shared/render/atmosphere/volumetricFog.ts';
@@ -17,19 +16,6 @@ function readCell(reader: Reader, x: THREE.Node, y: THREE.Node): TslNode {
   const index = uint(y).mul(uint(reader.width)).add(uint(x));
   const parity = reader.parity as unknown as ReturnType<typeof float>;
   return parity.lessThan(0.5).select(vec4((reader.current as any).element(index)), vec4((reader.previous as any).element(index))) as unknown as TslNode;
-}
-
-function bilinearReader(reader: Reader) {
-  return (uv: TslNode) => {
-    const { width, height } = reader;
-    const fx = float((uv as any).x).mul(width).sub(0.5).clamp(0, width - 1);
-    const fy = float((uv as any).y).mul(height).sub(0.5).clamp(0, height - 1);
-    const x0 = uint(fx.floor()); const y0 = uint(fy.floor());
-    const x1 = x0.add(uint(1)).min(uint(width - 1)); const y1 = y0.add(uint(1)).min(uint(height - 1));
-    const top = mix(readCell(reader, x0, y0) as any, readCell(reader, x1, y0) as any, fx.fract());
-    const bottom = mix(readCell(reader, x0, y1) as any, readCell(reader, x1, y1) as any, fx.fract());
-    return mix(top, bottom, fy.fract()) as unknown as TslNode;
-  };
 }
 
 function boxReader(reader: Reader) {
@@ -46,13 +32,11 @@ function boxReader(reader: Reader) {
 }
 
 export class TraceStages {
-  readonly contact: ContactOcclusionPass;
   readonly reflections: ReflectionPass;
-  readonly contactIntensity: THREE.UniformNode<number>;
   readonly reflectionsIntensity: THREE.UniformNode<number>;
   readonly mode: 'legacy' | 'cached';
-  private contactBvh: ContactBVHBundle | null = null;
-  private contactReaderBound: unknown = null;
+  private staticTree: ContactBVHBundle | null = null;
+  private bakeTree: ContactBVHBundle | null = null;
   private reflectionsReaderBound: unknown = null;
   private cache: ReflectionCache | null = null;
   private cachedReader: { sample: (uv: TslNode) => TslNode; intensity: THREE.UniformNode<number> } | null = null;
@@ -63,15 +47,6 @@ export class TraceStages {
     host: SceneHost,
     url: UrlParams,
   ) {
-    this.contact = new ContactOcclusionPass(renderer, host.camera, gi.blueNoiseTexture, {
-      ...host.contact,
-      enabled: url.flag('contact', host.contact?.enabled ?? DEFAULT_CONTACT_SETTINGS.enabled),
-    });
-    const radius = url.num('contactRadius'); if (radius !== null) this.contact.settings.radius = radius;
-    const scale = url.num('contactScale'); if (scale !== null) this.contact.settings.resolutionScale = scale;
-    const rays = url.num('contactRays'); if (rays !== null) this.contact.settings.rays = rays;
-    const contactEvery = url.num('contactEvery'); if (contactEvery !== null) this.contact.settings.traceInterval = contactEvery;
-    this.contactIntensity = uniform(this.contact.settings.intensity) as THREE.UniformNode<number>;
     const ambient = meanEnvironmentRadiance(gi.envTexture as THREE.DataTexture).multiplyScalar(0.5);
     this.reflections = new ReflectionPass(renderer, host.camera, gi.blueNoiseTexture, gi.envTexture, ambient, {
       ...host.reflections,
@@ -116,17 +91,41 @@ export class TraceStages {
   }
 
   get needsTree(): boolean {
-    return this.contact.enabled || this.reflections.enabled || this.mode === 'cached';
+    return this.reflections.enabled || this.mode === 'cached';
   }
 
-  tree(scene: THREE.Scene): ContactBVHBundle | null {
-    if (!this.needsTree) return this.contactBvh;
-    return this.buildTree(scene);
+  tree(): ContactBVHBundle | null {
+    if (this.staticTree) return this.staticTree;
+    const bvh = this.gi.staticBvh;
+    if (!bvh) return null;
+    /* @important One tree for the whole frame. The second, full-detail contact tree was
+       built on every launch (8 M triangles, 6.5 s of the village boot) for a pass that has
+       been off since 2026-09-09, and the reflections that also read it are the only
+       consumer left. Distant geometry the GI budget demoted to a proxy box reflects as
+       that box; raise `?bvhBudget=` if a scene needs it back. */
+    this.staticTree = {
+      bvhNode: bvh.bvhNode,
+      positionNode: bvh.positionNode,
+      indexNode: bvh.indexNode,
+      attributeNode: bvh.colorNode,
+      triangles: bvh.stats.triangles,
+      buildMs: 0,
+      dispose: () => {},
+    };
+    return this.staticTree;
   }
 
-  buildTree(scene: THREE.Scene): ContactBVHBundle | null {
-    if (!this.contactBvh && this.gi.staticBvh) this.contactBvh = createContactBVH(scene, this.gi.staticBvh.materialIdByUUID);
-    return this.contactBvh;
+  /* @important Full detail, no demotion, built on demand and kept: the bake's visibility
+     queries and the probe distances need the triangles the GI tree replaced with boxes.
+     A launch that reads its bake from disk never calls this. */
+  detailedTree(scene: THREE.Scene): ContactBVHBundle | null {
+    if (!this.bakeTree && this.gi.staticBvh) this.bakeTree = createContactBVH(scene, this.gi.staticBvh.materialIdByUUID);
+    return this.bakeTree;
+  }
+
+  disposeDetailedTree(): void {
+    this.bakeTree?.dispose();
+    this.bakeTree = null;
   }
 
   bindGui(gui: GUI, frameGraph: FrameGraph): void {
@@ -139,13 +138,6 @@ export class TraceStages {
     reflectionsFolder.add(this.reflections.settings, 'denoisePasses', 0, 3, 1).name('denoise passes').onChange(() => this.syncReflections(frameGraph));
     reflectionsFolder.add(this.reflections.settings, 'intensity', 0, 2, 0.01).name('strength').onChange((v: number) => { this.reflectionsIntensity.value = v; });
     reflectionsFolder.close();
-    const contactFolder = gui.addFolder('Contact occlusion');
-    contactFolder.add(this.contact.settings, 'enabled').name('enabled').onChange((v: boolean) => { this.contact.setEnabled(v); this.syncContact(frameGraph); });
-    contactFolder.add(this.contact.settings, 'radius', 0.05, 2, 0.01).name('radius (m)');
-    contactFolder.add(this.contact.settings, 'rays', 1, 8, 1).name('rays / frame');
-    contactFolder.add(this.contact.settings, 'historyWeight', 0, 0.97, 0.01).name('history');
-    contactFolder.add(this.contact.settings, 'intensity', 0, 1, 0.01).name('strength').onChange((v: number) => { this.contactIntensity.value = v; });
-    contactFolder.close();
   }
 
   private bindCacheGui(gui: GUI): void {
@@ -161,15 +153,13 @@ export class TraceStages {
     folder.open();
   }
 
-  update(scene: THREE.Scene, frameGraph: FrameGraph): void {
+  update(frameGraph: FrameGraph): void {
     const { width, height } = this.renderer.domElement;
-    const tree = this.tree(scene);
+    const tree = this.tree();
     const gi = this.gi;
     const scenePass = frameGraph.scenePass;
     const depth = scenePass.getTexture('depth');
     const normal = scenePass.getTexture('normal');
-    this.contact.update(this.contact.enabled ? tree : null, gi.dynamicBvhBundle, depth, normal, width, height, true);
-    this.syncContact(frameGraph);
     if (this.cache) {
       this.cache.update(performance.now(), 1, gi.dynamicBvhBundle ? gi.dynamicBvhBundle.enabled.value > 0 : false);
       return;
@@ -177,13 +167,6 @@ export class TraceStages {
     this.reflections.update(tree, gi.dynamicBvhBundle, gi.diffuseArrayTexture, depth, normal,
       scenePass.getTexture('velocity'), scenePass.getTexture('albedo'), frameGraph.taa.historyTexture, width, height, 1);
     this.syncReflections(frameGraph);
-  }
-
-  private syncContact(frameGraph: FrameGraph): void {
-    const reader = this.contact.enabled ? this.contact.reader : null;
-    if (reader === this.contactReaderBound) return;
-    this.contactReaderBound = reader;
-    frameGraph.setContactOcclusion(reader ? { intensity: this.contactIntensity, sample: bilinearReader(reader as unknown as Reader) } : null);
   }
 
   private syncReflections(frameGraph: FrameGraph): void {
@@ -196,11 +179,6 @@ export class TraceStages {
 
   hooks(frameGraph: FrameGraph) {
     return {
-      contact: (value?: boolean) => {
-        if (typeof value === 'boolean') { this.contact.setEnabled(value); this.syncContact(frameGraph); }
-        return this.contact.enabled;
-      },
-      contactSettings: this.contact.settings,
       reflections: (value?: boolean) => {
         if (typeof value === 'boolean') { this.reflections.setEnabled(value); this.syncReflections(frameGraph); }
         return this.reflections.enabled;

@@ -21,7 +21,11 @@ import assert from 'node:assert/strict';
 
 const out = 'shots/contact';
 await mkdir(out, { recursive: true });
-const url = `http://127.0.0.1:5188/?scene=beach&hud=0&freezeAt=0&still=1&gputime=1&cam=rocks&contact=1${process.env.GI_QUERY ?? ''}`;
+// Contact occlusion lives in the legacy pipeline alone: the default one dropped the pass
+// and its tree in 5ca686c, so this check asks for the pipeline that still has it, and for
+// the pass inside it - it has not been a default since 2026-09-09.
+const port = process.env.PORT ?? '5188';
+const url = `http://127.0.0.1:${port}/?scene=beach&hud=0&freezeAt=0&still=1&gputime=1&cam=rocks&pipeline=legacy&contact=1${process.env.GI_QUERY ?? ''}`;
 const browser = await chromium.launch({
   channel: 'chrome',
   headless: false,

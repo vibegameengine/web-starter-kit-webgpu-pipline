@@ -1,7 +1,7 @@
 import * as THREE from 'three/webgpu';
 import type GUI from 'lil-gui';
 import { FrameGraph, GiMode, SplitView, type Antialiasing } from '../../shared/render/index.ts';
-import { CacheStats, WorldState, Mobility, applyMobility } from '../../shared/world/index.ts';
+import { CacheStats, WorldState, Mobility, Layer, applyMobility } from '../../shared/world/index.ts';
 import { Hud } from '../../shared/ui/hud.ts';
 import { SurfelGI } from '../../shared/gi/index.ts';
 import { PROBE_LAYER_INTERIOR, type ProbeVolume } from '../../shared/gi/probes/index.ts';
@@ -17,7 +17,6 @@ import { leakHookApi } from '../../shared/gi/bake/leakStages.ts';
 import { TraceStages } from './traceStages.ts';
 import { PostStages } from './postStages.ts';
 import { gpuPasses } from './audit.ts';
-import { LodLab } from '../../widgets/lod-lab/index.ts';
 import { bootStage } from '../../shared/ui/bootProgress.ts';
 import { ReflectionCache, deriveReflectionVolume, type ReflectionVolume } from '../../shared/gi/reflect/cache/index.ts';
 import type { ContactBVHBundle } from '../../shared/gi/contact/contactBvh.ts';
@@ -119,24 +118,7 @@ interface Pipeline {
   renderer: THREE.WebGPURenderer; gi: SurfelGI; host: SceneHost; url: UrlParams; frameGraph: FrameGraph;
   staticLight: StaticLight; trace: TraceStages; post: PostStages; sun: ReturnType<typeof setupSun>; live: { on: boolean }; giScale: () => number;
   dynamic: ReturnType<typeof addMovers>; world: WorldState; stats: CacheStats; hud: Hud | null;
-  lab: LodLab | null;
   cine: { name: string };
-}
-
-function openLodLab(renderer: THREE.WebGPURenderer, staticLight: StaticLight, camera: THREE.PerspectiveCamera, frameGraph: FrameGraph): LodLab | null {
-  if (!staticLight.lod) {
-    console.warn('[lod-lab] needs ?lod=1');
-    return null;
-  }
-  const lab = new LodLab(renderer, staticLight.lod);
-  const guiElement = document.querySelector<HTMLElement>('.lil-gui.root');
-  const gutter = guiElement ? guiElement.getBoundingClientRect().width : 0;
-  document.documentElement.style.setProperty('--lod-lab-gutter', `${Math.ceil(gutter)}px`);
-  document.body.classList.add('lod-lab');
-  camera.aspect = (window.innerWidth / 2) / window.innerHeight;
-  camera.updateProjectionMatrix();
-  frameGraph.setSize(window.innerWidth / 2, window.innerHeight);
-  return lab;
 }
 
 function bindCineGui(gui: GUI, p: Pipeline): void {
@@ -180,16 +162,55 @@ function bindLightingGui(gui: GUI, p: Pipeline, ui: PipelineUi): void {
   }
   const bake = gui.addFolder('GI bake');
   bake.add(staticLight.bakeParams, 'passes', 8, 256, 1).name('lightmap passes');
-  const bakeState = { status: 'baking' };
+  const bakeState = { status: 'baking', layout: 'unwrapping' };
   bake.add(bakeState, 'status').name('baked light').listen().disable();
-  setInterval(() => { bakeState.status = staticLight.ready ? staticLight.bakeStatusText() : 'baking'; }, 500);
+  bake.add(bakeState, 'layout').name('atlas layout').listen().disable();
+  setInterval(() => {
+    bakeState.status = staticLight.ready ? staticLight.bakeStatusText() : 'baking';
+    const layout = staticLight.layout;
+    bakeState.layout = layout
+      ? `${layout.metresPerTexel.toFixed(3)} m/texel, ${layout.pages} page(s), sample ${(p.url.num('sample') ?? 0.1).toFixed(2)} m`
+      : 'unwrapping';
+  }, 500);
   bake.add({ rebake: () => {
-    void staticLight.prepare(frameGraph, { forceBake: true, contactTree: p.trace.buildTree(p.host.scene), interiorVolumes: p.host.interiorVolumes })
+    void staticLight.prepare(frameGraph, { forceBake: true, bakeTree: () => p.trace.detailedTree(p.host.scene), interiorVolumes: p.host.interiorVolumes })
       .then(() => ui.clearLoading())
       .catch(ui.showError);
   } }, 'rebake').name('re-bake now');
-  const envParams = { env: p.url.num('env') ?? 1, lod: 4 };
+  const envParams = { env: p.url.num('env') ?? 1, lod: p.url.num('envLod') ?? 4 };
   giFolder.add(envParams, 'env', 0, 5, 0.05).name('env').onChange(() => gi.setEnvControls(envParams.env, envParams.lod));
+  bindBakedOnly(lighting, p, envParams);
+}
+
+/* @important The one view that answers "what did the bake actually produce". `?split=baked`
+   shows the baked term in half the frame while the other half still carries the sun and the
+   panorama, and a facade lit by direct light reads as a lit facade whatever the atlas holds.
+   This switch takes the sun and the environment out of the frame instead, so what is left is
+   the baked light on every surface - charted ones through the atlas, instanced ones through
+   the probes. `?bakedOnly=1` for a script. */
+function bindBakedOnly(folder: GUI, p: Pipeline, envParams: { env: number; lod: number }): void {
+  const state = { only: p.url.flag('bakedOnly', false) };
+  let sunIntensity = p.sun.lightCfg.intensity;
+  const apply = () => {
+    /* @important Through `lightCfg`, not through the light: the frame re-applies the
+       configured intensity every tick, so zeroing `sun.intensity` lasts one frame. */
+    if (state.only) {
+      sunIntensity = p.sun.lightCfg.intensity || sunIntensity;
+      p.sun.lightCfg.intensity = 0;
+      p.gi.setEnvControls(0, envParams.lod);
+    } else {
+      p.sun.lightCfg.intensity = sunIntensity;
+      p.gi.setEnvControls(envParams.env, envParams.lod);
+    }
+    p.sun.updateLightFromAngles();
+    p.host.scene.background = state.only ? null : p.host.scene.background;
+  };
+  folder.add(state, 'only').name('baked light only').onChange(apply);
+  hook('__bakedOnly', (value?: boolean) => {
+    if (typeof value === 'boolean') { state.only = value; apply(); }
+    return state.only;
+  });
+  if (state.only) apply();
 }
 
 function atlasTexelUnderPointer(p: Pipeline, event: MouseEvent): [number, number] | null {
@@ -236,7 +257,7 @@ function installHooks(p: Pipeline, state: { paused: boolean; stepOnce: boolean; 
   hook('__camera', (px: number, py: number, pz: number, tx: number, ty: number, tz: number) => {
     camera.position.set(px, py, pz); controls.target.set(tx, ty, tz); controls.update(); camera.updateMatrixWorld(); return true;
   });
-  installLodHooks(p);
+  installAtlasHooks(p);
   hook('__gpuPasses', (frames = 60) => gpuPasses(renderer, frames));
   if (p.staticLight.leak) hook('__leak', leakHookApi(p.staticLight.leak, () => frameGraph.setSplitView(SplitView.Leak)));
   hook('__fog', { ...p.post.hooks(), ...p.trace.hooks(frameGraph) });
@@ -254,28 +275,8 @@ function installHooks(p: Pipeline, state: { paused: boolean; stepOnce: boolean; 
   installAuditHooks(p, state);
 }
 
-function installLodHooks(p: Pipeline): void {
-  const { renderer, staticLight } = p;
-  hook('__lod', () => {
-    const lod = staticLight.lod;
-    if (!lod) return null;
-    return {
-      charts: staticLight.layout?.regions.length ?? 0,
-      pages: lod.pool.pages.length,
-      poolMiB: +(lod.pool.bytes / 1048576).toFixed(2),
-      atlasSize: lod.atlas.size,
-      resident: lod.atlas.residentCount(),
-      usedCells: lod.atlas.usedCells(),
-      totalCells: lod.atlas.totalCells(),
-      copies: lod.atlas.copiesLastFrame,
-      ...lod.plan,
-      demands: undefined,
-      mips: lod.plan.demands.reduce((counts: Record<number, number>, demand) => {
-        counts[demand.mip] = (counts[demand.mip] ?? 0) + 1;
-        return counts;
-      }, {}),
-    };
-  });
+function installAtlasHooks(p: Pipeline): void {
+  const { staticLight } = p;
   hook('__pages', () => {
     const layout = staticLight.layout;
     const pixels = staticLight.atlasPixels;
@@ -301,6 +302,100 @@ function installLodHooks(p: Pipeline): void {
         meshes: [...meshes].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([name, count]) => `${name}:${count}`) };
     });
   });
+  /* @important The baked atlas itself, texel for texel, so a dark frame can be answered by
+     looking at what the bake produced instead of arguing about it. Alpha is the coverage
+     mark: 1 measured by its own surfel, 0.5 carried or padded, 0 nothing. */
+  hook('__atlasDump', (page = -1) => {
+    const layout = staticLight.layout;
+    const pixels = staticLight.atlasPixels;
+    if (!layout || !pixels) return null;
+    const size = staticLight.atlasSize;
+    const height = staticLight.atlasHeight();
+    /* @important One page per call by default. The whole stack of a five-page atlas is
+       5.2 M floats, and handing that to a harness as one JSON array throws
+       ERR_STRING_TOO_LONG before anything can be looked at. */
+    if (page < 0) return { width: size, height, pages: layout.pages };
+    const start = page * size * size * 4;
+    return { width: size, height: size, page, data: [...pixels.slice(start, start + size * size * 4)] };
+  });
+  /* @important Per mesh, not per chart: "which surfaces came out of the bake black" is the
+     question a dark frame actually raises, and answering it by clicking texels one at a
+     time is how an afternoon disappears. */
+  /* @important The bake's rays live on the GPU and cannot be looked at, so this casts the same
+     hemisphere from the same point with three's own raycaster and draws it. A texel that the
+     bake leaves at zero while this says the sky is open is a fault in the tracer, not a dark
+     corner - and that question was asked five times today by guesswork instead. */
+  hook('__rays', (x: number, y: number, z: number, nx: number, ny: number, nz: number, count = 64) => {
+    const origin = new THREE.Vector3(x, y, z);
+    const normal = new THREE.Vector3(nx, ny, nz).normalize();
+    const tangent = Math.abs(normal.y) < 0.9 ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(1, 0, 0);
+    const u = new THREE.Vector3().crossVectors(tangent, normal).normalize();
+    const v = new THREE.Vector3().crossVectors(normal, u);
+    const raycaster = new THREE.Raycaster();
+    const positions: number[] = [];
+    const hits = new Map<string, number>();
+    let missed = 0;
+    for (let ray = 0; ray < count; ray++) {
+      const r = Math.sqrt((ray + 0.5) / count);
+      const phi = ray * Math.PI * (3 - Math.sqrt(5));
+      const direction = u.clone().multiplyScalar(Math.cos(phi) * r)
+        .addScaledVector(v, Math.sin(phi) * r)
+        .addScaledVector(normal, Math.sqrt(Math.max(0, 1 - r * r)))
+        .normalize();
+      raycaster.set(origin.clone().addScaledVector(normal, 1e-3), direction);
+      const hit = raycaster.intersectObjects(p.host.scene.children, true).find((candidate) => (candidate.object as THREE.Mesh).isMesh);
+      const end = hit ? hit.point : origin.clone().addScaledVector(direction, 20);
+      if (hit) hits.set(hit.object.name || hit.object.type, (hits.get(hit.object.name || hit.object.type) ?? 0) + 1);
+      else missed++;
+      positions.push(origin.x, origin.y, origin.z, end.x, end.y, end.z);
+    }
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    const lines = new THREE.LineSegments(geometry, new THREE.LineBasicMaterial({ color: 0xff2020 }));
+    lines.layers.set(Layer.Debug);
+    lines.frustumCulled = false;
+    p.host.scene.add(lines);
+    p.host.camera.layers.enable(Layer.Debug);
+    return { count, sky: missed, skyFraction: +(missed / count).toFixed(3), hits: [...hits].sort((a, b) => b[1] - a[1]).slice(0, 6) };
+  });
+  hook('__meshLight', () => {
+    const layout = staticLight.layout;
+    const pixels = staticLight.atlasPixels;
+    if (!layout || !pixels) return null;
+    const size = staticLight.atlasSize;
+    const perMesh = new Map<string, { charts: number; dark: number; texels: number; measured: number; zeros: number; sum: number }>();
+    for (const placement of layout.placements) {
+      const name = placement.mesh.name || placement.mesh.geometry.type;
+      const row = perMesh.get(name) ?? { charts: 0, dark: 0, texels: 0, measured: 0, zeros: 0, sum: 0 };
+      const { x, y, width, height } = placement.region;
+      let chartSum = 0;
+      for (let row2 = 0; row2 < height; row2++) {
+        for (let column = 0; column < width; column++) {
+          const index = ((y + row2) * size + x + column) * 4;
+          const value = (pixels[index] + pixels[index + 1] + pixels[index + 2]) / 3;
+          row.texels++;
+          if (pixels[index + 3] >= 0.75) {
+            row.measured++;
+            if (value <= 1e-5) row.zeros++;
+          }
+          chartSum += value;
+          row.sum += value;
+        }
+      }
+      row.charts++;
+      if (chartSum / Math.max(1, width * height) <= 1e-5) row.dark++;
+      perMesh.set(name, row);
+    }
+    return [...perMesh].map(([name, row]) => ({
+      name,
+      charts: row.charts,
+      darkCharts: row.dark,
+      texels: row.texels,
+      measured: row.measured,
+      zeros: row.zeros,
+      mean: +(row.sum / Math.max(1, row.texels)).toFixed(5),
+    })).sort((a, b) => a.mean - b.mean);
+  });
   hook('__chartLight', (name = 'bench') => {
     const layout = staticLight.layout;
     const pixels = staticLight.atlasPixels;
@@ -322,27 +417,6 @@ function installLodHooks(p: Pipeline): void {
       return [{ chart, region: placement.region, centre: placement.centre.toArray().map((v) => +v.toFixed(2)),
         mean: +(sum / (width * height)).toFixed(5), litFraction: +(lit / (width * height)).toFixed(2) }];
     });
-  });
-  hook('__lodChart', (name = 'bench') => {
-    const lod = staticLight.lod;
-    const layout = staticLight.layout;
-    if (!lod || !layout) return null;
-    return layout.placements.flatMap((placement, chart) => {
-      if (placement.mesh.name !== name) return [];
-      return [{
-        chart, region: placement.region, lastMip: lod.pool.lastMip(chart),
-        centre: placement.centre.toArray().map((v) => +v.toFixed(2)),
-        extent: [+placement.extentU.toFixed(2), +placement.extentV.toFixed(2)],
-        root: [lod.pool.rootColours[chart * 3], lod.pool.rootColours[chart * 3 + 1], lod.pool.rootColours[chart * 3 + 2]].map((v) => +v.toFixed(5)),
-        residentMip: lod.atlas.residentMip(chart),
-      }];
-    }).slice(0, 8);
-  });
-  hook('__lodPixels', async (x = 0, y = 0, width = 32, height = 4) => {
-    const lod = staticLight.lod;
-    if (!lod) return null;
-    const pixels = await renderer.readRenderTargetPixelsAsync(lod.atlas.target, x, y, width, height);
-    return Array.from(pixels.slice(0, Math.min(pixels.length, 256)));
   });
 }
 
@@ -479,14 +553,12 @@ function startLoop(p: Pipeline, ui: PipelineUi, state: { paused: boolean; stepOn
     } else {
       frameGraph.setGiTextures(null, null);
     }
-    p.staticLight.lod?.update(camera, window.innerHeight);
-    trace.update(scene, frameGraph);
+    trace.update(frameGraph);
     scene.background = host.skyIsBackground ? gi.envTexture : null;
     post.beforeRender(now, dt);
     frameGraph.render();
     frameGraph.endFrame();
     stats.endFrame(world.dt);
-    p.lab?.update();
     hud?.update(world.dt);
     if (framesShown < 2 && ++framesShown === 2) ui.clearLoading();
   });
@@ -505,7 +577,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   dynamic?.update(0);
   await bootStage('Building the static BVH', () => gi.buildScene(renderer, scene));
   gi.setDynamicTracing(url.flag('dyntrace', true));
-  gi.setEnvControls(url.num('env') ?? 1, 4);
+  gi.setEnvControls(url.num('env') ?? 1, url.num('envLod') ?? 4);
   const frameGraph = await bootStage('Compiling the frame graph', () => createFrameGraph(renderer, host, url));
   const post = new PostStages(renderer, host, gi.envTexture as THREE.DataTexture, frameGraph, url);
   const trace = new TraceStages(renderer, gi, host, url);
@@ -513,16 +585,23 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   const stats = new CacheStats();
   const hud = ui.showChrome ? new Hud(world, stats, () => staticLight.ready ? `atlas ${staticLight.atlasSize}px + probes` : 'baking', () => staticLight.ready ? staticLight.bakeStatusText() : 'baking') : null;
   ui.applySavedSettings?.(gui);
-  const contactTree = await bootStage('Building the contact BVH', () => trace.buildTree(scene));
+  /* @important The bake gets a full-detail tree, the frame does not. Visibility between two
+     lightmap texels and the probes' own distances are metre-scale queries: the GI tree
+     demotes what does not fit its 500k budget to cluster proxy boxes - 1.8 M triangles of
+     the village stand behind 706 boxes - and a ray that starts on a surface starts inside
+     its own proxy, which reads as "blocked" (measured 2026-09-08: open sand 0.45 with the
+     demoted tree, 1.0 without). It is built only when a bake actually runs, so a launch
+     that restores the saved bake never pays for it. */
+  const bakeTree = () => trace.detailedTree(scene);
   const lighting = await savedLightingFromUrl(window.location.search);
   if (lighting.bakePasses !== undefined) staticLight.bakeParams.passes = lighting.bakePasses;
   if (lighting.atlasIntensity !== undefined) staticLight.atlasParams.intensity = lighting.atlasIntensity;
   if (lighting.environmentIntensity !== undefined) gi.setEnvControls(lighting.environmentIntensity, 4);
-  await staticLight.prepare(frameGraph, { contactTree, interiorVolumes: host.interiorVolumes });
+  await staticLight.prepare(frameGraph, { bakeTree, interiorVolumes: host.interiorVolumes });
   if (lighting.probeIntensity !== undefined && staticLight.probes) staticLight.probes.intensity.value = lighting.probeIntensity;
   const live = { on: url.flag('surfelGi', false) };
   const cachedReflections = trace.mode === 'cached'
-    ? installReflectionCache(renderer, gi, host, { contactTree, probes: staticLight.probes, trace, frameGraph, url })
+    ? installReflectionCache(renderer, gi, host, { contactTree: trace.tree(), probes: staticLight.probes, trace, frameGraph, url })
     : null;
   if (staticLight.probes && url.flag('probeSpecular', true) && !cachedReflections) {
     const volume = staticLight.probes;
@@ -530,7 +609,6 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   }
   const giScale = () => (live.on ? 1 : (url.num('giScale') ?? HALF_GBUFFER));
   staticLight.setLiveChainServesReceivers(live.on);
-  const lab = url.flag('lodLab', false) ? openLodLab(renderer, staticLight, camera, frameGraph) : null;
   const requestedCine = url.get('cine');
   const cine = { name: requestedCine && requestedCine in CINE_CAMERAS ? requestedCine : DEFAULT_CINE_CAMERA };
   if (requestedCine) {
@@ -538,7 +616,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
     post.motionBlur.settings.shutter = CINE_CAMERAS[cine.name].shutterAngleDeg / 360;
     console.log(`[cine] ${CINE_CAMERAS[cine.name].label}, ${horizontalFovDeg(CINE_CAMERAS[cine.name]).toFixed(1)}° horizontal`);
   }
-  const p: Pipeline = { renderer, gi, host, url, frameGraph, staticLight, trace, post, sun, live, dynamic, world, stats, hud, giScale, lab, cine };
+  const p: Pipeline = { renderer, gi, host, url, frameGraph, staticLight, trace, post, sun, live, dynamic, world, stats, hud, giScale, cine };
   gi.resize(renderer, giScale());
   bindLightingGui(gui, p, ui);
   bindCineGui(gui, p);
@@ -547,7 +625,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   post.bindGui(gui);
   trace.bindGui(gui, frameGraph);
   window.addEventListener('resize', () => {
-    const width = lab ? window.innerWidth / 2 : window.innerWidth;
+    const width = window.innerWidth;
     camera.aspect = width / window.innerHeight;
     camera.updateProjectionMatrix();
     frameGraph.setSize(width, window.innerHeight);
@@ -559,7 +637,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   installHooks(p, state);
   await bootStage('Compiling shaders', async () => {
     const programs = url.flag('warmup', true) ? renderer.compileAsync(scene, camera) : Promise.resolve();
-    trace.tree(scene);
+    trace.tree();
     await programs;
   });
   await bootStage('Waiting for the first frame', () => startLoop(p, ui, state));

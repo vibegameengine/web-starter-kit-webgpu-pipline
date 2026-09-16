@@ -20,9 +20,14 @@ export function padLightmapCharts(pixels: Float32Array, size: number, regions: L
   const queue = new Int32Array(size * height);
   let tail = 0, filled = 0;
   const seeds = new Uint32Array(regions.length);
+  /* @important Three states now, not two. A texel measured by its own surfel (alpha 1) is a
+     seed for the gutter fill; a texel the bake's spread carried here along a traced link
+     (alpha 0.5) is content and must survive - zeroing it threw away everything between the
+     sample lattice's points; anything else is empty and is cleared. */
   for (let i = 0; i < owners.length; i++) {
     if (owners[i] < 0) { pixels.fill(0, i * 4, i * 4 + 4); continue; }
     if (pixels[i * 4 + 3] >= .75) { queue[tail++] = i; seeds[owners[i]]++; }
+    else if (pixels[i * 4 + 3] >= .25) { queue[tail++] = i; seeds[owners[i]]++; }
     else pixels.fill(0, i * 4, i * 4 + 4);
   }
   /** @important A chart the GPU rasterisation missed used to throw and take the whole

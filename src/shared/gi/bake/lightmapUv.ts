@@ -121,7 +121,7 @@ interface ChartRequest {
  */
 export function assignLightmapUvs(
   scene: THREE.Scene,
-  options: { padding?: number; atlasSize?: number; filterMip?: number; maxPages?: number } = {},
+  options: { padding?: number; atlasSize?: number; filterMip?: number; maxPages?: number; metresPerTexel?: number } = {},
 ): LightmapLayout {
   const atlasSize = options.atlasSize ?? 512;
   const safeMip = options.filterMip ?? Math.log2(atlasSize / Math.min(128, atlasSize / 2));
@@ -208,8 +208,14 @@ export function assignLightmapUvs(
   // fit a chosen atlas. Splitting folded bins raised the chart count and that loop
   // answered by taking the corridor from 0.1156 to 0.1856 m/texel, eight texels for a
   // whole bench seat. The atlas grows instead, up to `maxAtlasSize`.
-  const maxPages = options.maxPages ?? 8;
-  const metresPerTexel = Math.sqrt(mappedArea / (TARGET_FILL * atlasSize * atlasSize));
+  /* @important The density is ours to choose and the atlas pages to hold it. Solved from the
+     scene's area it made the same bench 0.1156 m per texel in the corridor and 0.0691 on the
+     beach - quality as a by-product of how much surface a scene has. `?lmDensity=0` goes back
+     to the area estimate. The page ceiling is what one texture can be: 8192 texels. */
+  const maxPages = options.maxPages ?? Math.floor(8192 / atlasSize);
+  const metresPerTexel = options.metresPerTexel && options.metresPerTexel > 0
+    ? options.metresPerTexel
+    : Math.sqrt(mappedArea / (TARGET_FILL * atlasSize * atlasSize));
   const placed: ChartRequest[] = requests;
   for (const chart of placed) {
     chart.w = Math.max(2 * alignment, Math.ceil((chart.extentU / metresPerTexel + 2 * inset) / alignment) * alignment);
@@ -718,7 +724,13 @@ function packOnePage(charts: ChartRequest[], side: number, alignment: number, fi
   const skyline: { x: number; y: number; width: number }[] = [{ x: 0, y: 0, width: side }];
   const rejected: ChartRequest[] = [];
   for (const chart of order) {
-    if (chart.w > side || chart.h > side) return [];
+    /* @important Throws where it used to return an empty list of leftovers, which the caller
+       read as "everything fitted": the oversized chart and every chart after it kept
+       x = y = page = 0, took a uv1 anyway, and two charts shared one rectangle. A fixed
+       density cannot coarsen its way out of this, so it has to say so here. */
+    if (chart.w > side || chart.h > side) {
+      throw new Error(`[lightmap] a chart of ${chart.w}x${chart.h} texels does not fit a ${side}² page at this density`);
+    }
     const spot = lowestFit(skyline, chart.w, chart.h, side, alignment);
     if (!spot) { rejected.push(chart); continue; }
     chart.x = spot.x;

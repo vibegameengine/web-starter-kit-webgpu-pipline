@@ -17,7 +17,8 @@ const tag = extra.replace(/[^a-z0-9]+/gi, '') || 'default';
 
 const scaleMatch = /[?&]scale=([0-9.eE+-]+)/.exec(extra);
 const SCALE = scaleMatch && Number.isFinite(Number(scaleMatch[1])) ? Number(scaleMatch[1]) : 1;
-const base = `http://127.0.0.1:5188/?scene=leak-room&cam=${cam}&leak=1&hud=0&inspector=0&still=1&aa=none&grain=0&exposure=1${extra}`;
+const port = process.env.PORT ?? '5188';
+const base = `http://127.0.0.1:${port}/?scene=leak-room&cam=${cam}&leak=1&hud=0&inspector=0&still=1&aa=none&grain=0&exposure=1${extra}`;
 const scaled = (points) => points.map((p) => p.map((v) => v * SCALE));
 const INTERIOR = scaled([[0.15, 0.001, 0.1], [0.6, 0.001, 0.6], [-0.6, 0.001, -0.6], [0.9, 0.001, 0], [-0.998, 1, 0], [0, 1, -0.998], [0, 1.998, 0]]);
 const OUTSIDE = scaled([[2.4, 0.001, 0], [0, 0.001, 2.4]]);

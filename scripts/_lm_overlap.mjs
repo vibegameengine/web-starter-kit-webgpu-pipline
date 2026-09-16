@@ -94,7 +94,7 @@ try {
     assert.notEqual(patched, body, 'probe must attach to the real layout pass');
     await route.fulfill({ response, body: patched });
   });
-  await page.goto(`http://127.0.0.1:5188/${query}`);
+  await page.goto(`http://127.0.0.1:${process.env.PORT ?? '5188'}/${query}`);
   await Promise.race([watchPipelineError(page), page.waitForFunction(() => globalThis.__lmDump, null, { timeout: 300000 })]);
   const dump = await page.evaluate(() => globalThis.__lmDump);
   console.log(JSON.stringify({ query, errors, ...dump }, null, 1));

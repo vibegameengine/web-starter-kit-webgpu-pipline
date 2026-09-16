@@ -61,7 +61,28 @@ export type SceneBVHStats = {
  * slow, it fails to allocate — and the failure mode we refuse to have is a tracer
  * that quietly holds a fraction of the world it claims to represent.
  */
-export const BVH_TRIANGLE_BUDGET = 500_000;
+/* @important Raised from 500k on 2026-09-16, because the demotion it forced is what put the
+   holes in the lightmap. A surfel seeded on a demoted surface sits INSIDE the cluster proxy box
+   that replaced its geometry, so every ray it casts reads as blocked and the texel bakes at
+   zero - not dark, zero. Measured on the village stand at 0.05 m/texel: 111715 charted texels
+   at zero and an atlas mean of 0.0437 with the 500k budget, 37338 and 0.0832 with the scene at
+   full detail (1815596 triangles across 75 meshes were being replaced by 706 boxes). The same
+   mechanism was already recorded for contact rays in contactBvh.ts; it reaches the bake too.
+   4 M triangles is ~432 MB of GPU storage at 108 bytes each, and `?bvhBudget=` still overrides. */
+export const BVH_TRIANGLE_BUDGET = 4_000_000;
+
+/** Bytes one triangle costs in the tracer's buffers: 3 vertices x (position, normal, colour). */
+export const BVH_BYTES_PER_TRIANGLE = 108;
+
+/* @important The ceiling belongs to the device, not to a constant. WebGPU guarantees only
+   128 MiB per storage binding; this machine reports 2 GiB, and a budget written for one is a
+   failed allocation on the other. The tracer asks the adapter and takes a third of what one
+   binding may hold, so the number moves with the hardware instead of with a guess. */
+export function deviceTriangleBudget(renderer: THREE.WebGPURenderer): number {
+  const limit = (renderer.backend as { device?: { limits?: { maxStorageBufferBindingSize?: number } } })?.device?.limits?.maxStorageBufferBindingSize;
+  if (!limit || !Number.isFinite(limit)) return BVH_TRIANGLE_BUDGET;
+  return Math.max(100_000, Math.min(BVH_TRIANGLE_BUDGET, Math.floor((limit / 3) / BVH_BYTES_PER_TRIANGLE)));
+}
 
 /**
  * One drawable copy of one geometry: the object-space template plus the world matrix
@@ -255,9 +276,13 @@ export function gatherBvhGeometries(
 } {
   const { materialIdByUUID, include, label } = options;
   const budgetOverride = giKnobs.bvhBudget();
-  const budget =
-    options.triangleBudget ??
-    (budgetOverride > 0 ? budgetOverride : BVH_TRIANGLE_BUDGET);
+  /* @important `?bvhBudget=` wins over the caller's number, which in turn wins over the
+     constant: the knob is the ablation this defect was found with, and a caller that passes a
+     device-derived budget must not silence it. */
+  const budget = budgetOverride > 0
+    ? budgetOverride
+    : (options.triangleBudget ?? BVH_TRIANGLE_BUDGET);
+  console.info(`[BVH:${label}] triangle budget ${budget}`);
   const expandInstances = giKnobs.bvhInstances();
   const farRadius = Math.max(0, options.farRadius ?? 0);
   const focus = options.focus ?? new THREE.Vector3();
@@ -476,6 +501,7 @@ export function createSceneBVH(
     include: (mesh) => mesh.userData.mobility !== Mobility.Movable && mesh.userData.giExclude !== true,
     focus,
     farRadius: giKnobs.bvhFarRadius(),
+    triangleBudget: deviceTriangleBudget(renderer),
   });
   const entries = gathered.entries;
 

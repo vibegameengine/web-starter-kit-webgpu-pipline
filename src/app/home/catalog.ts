@@ -11,9 +11,6 @@ export type Entry = {
 const cams = (scene: string, names: string[]) =>
   names.map((name) => ({ label: name, href: `/?scene=${scene}&cam=${name}` }));
 
-const withLodLab = (scene: string, names: string[]) =>
-  [{ label: 'lod-lab', href: `/?scene=${scene}&cam=${names[0]}&lod=1&lodLab=1` }, ...cams(scene, names)];
-
 export const SCENES: Entry[] = [
   {
     title: 'Пляж',
@@ -22,7 +19,7 @@ export const SCENES: Entry[] = [
       'Песчаный слой из фотографий, пальмы с биологической оптикой листа, вода с преломлением, объёмный туман и блики. Главная площадка качества.',
     href: '/?scene=beach',
     open: 'Открыть',
-    chips: withLodLab('beach', ['shore', 'rocks', 'water', 'surf', 'eye', 'leaves', 'trunkLit', 'shrub', 'sunward', 'van']),
+    chips: cams('beach', ['shore', 'rocks', 'water', 'surf', 'eye', 'leaves', 'trunkLit', 'shrub', 'sunward', 'van']),
   },
   {
     title: 'Лес',
@@ -31,7 +28,7 @@ export const SCENES: Entry[] = [
       'Поляна на адаптивном рельефе: хвойные из ez-tree, ручей, скальные срезы, подрост. Проверка растительности и теней в массе.',
     href: '/?scene=forest',
     open: 'Открыть',
-    chips: withLodLab('forest', ['hero', 'wide', 'trail', 'stream', 'ledge', 'canopy', 'rim']),
+    chips: cams('forest', ['hero', 'wide', 'trail', 'stream', 'ledge', 'canopy', 'rim']),
   },
   {
     title: 'Коридор',
@@ -42,7 +39,9 @@ export const SCENES: Entry[] = [
     open: 'Открыть',
     chips: [
       { label: 'bake-leak', href: '/?scene=corridor&cam=floor&leak=1&split=leak&hud=1' },
-      ...withLodLab('corridor', ['hero', 'wide', 'bench', 'panels', 'floor', 'deep']),
+      { label: 'грубее: 0.1 м/тексель', href: '/?scene=corridor&cam=bench&lmDensity=0.1' },
+      { label: 'тоньше: 0.03 м/тексель', href: '/?scene=corridor&cam=bench&lmDensity=0.03' },
+      ...cams('corridor', ['hero', 'wide', 'bench', 'panels', 'floor', 'deep']),
     ],
   },
   {
@@ -67,8 +66,10 @@ export const SCENES: Entry[] = [
       { label: 'ALEXA 35 · 32mm', href: '/?scene=midsee-village&cam=front&cine=alexa35-32' },
       { label: 'анаморфот 2x', href: '/?scene=midsee-village&cam=front&cine=anamorphic-2x-40' },
       { label: 'IMAX 65', href: '/?scene=midsee-village&cam=front&cine=imax65-50' },
-      ...withLodLab('midsee-village', ['front', 'side', 'rear', 'quay', 'roofs']),
+      ...cams('midsee-village', ['front', 'side', 'rear', 'quay', 'roofs']),
       { label: 'лёгкий стенд (1 дом)', href: '/?scene=village-light' },
+      { label: 'грубее: 0.1 м/тексель', href: '/?scene=midsee-village&cam=front&lmDensity=0.1' },
+      { label: 'тоньше: 0.03 м/тексель', href: '/?scene=midsee-village&cam=front&lmDensity=0.03' },
     ],
   },
   {
@@ -93,8 +94,9 @@ export const SCENES: Entry[] = [
     href: '/?hud=1',
     open: 'Открыть',
     chips: [
-      { label: 'lod-lab', href: '/?hud=1&lod=1&lodLab=1' },
       { label: 'split=baked', href: '/?hud=1&split=baked' },
+      { label: 'lmDensity=0.1', href: '/?hud=1&lmDensity=0.1' },
+      { label: 'lmDensity=0.03', href: '/?hud=1&lmDensity=0.03' },
       { label: 'surfelGi=1', href: '/?hud=1&surfelGi=1' },
       { label: 'bakeCache=0', href: '/?hud=1&bakeCache=0' },
     ],
@@ -157,8 +159,8 @@ export const FLAGS: { key: string; effect: string }[] = [
   { key: '?reflections=0', effect: 'Отключить трассированные отражения.' },
   { key: '?contact=1', effect: 'Контактное затенение короткими лучами.' },
   { key: '?split=baked', effect: 'Показать отдельный слой освещения.' },
-  { key: '?lodLab=1', effect: 'Лаба LOD: слева сцена, справа атлас с чартами по требуемому mip. Нужен адрес сцены: /?scene=corridor&cam=bench&lod=1&lodLab=1' },
-  { key: '?lod=1', effect: 'LOD лайтмапы: GPU-пул страниц + рабочий атлас, собираемый под вид. ?lodAtlas= размер атласа, ?lodPage= страница, ?lodCopies= копий за кадр.' },
+  { key: '?lmDensity=', effect: 'Метры мира на тексель лайтмапа. 0.05 по умолчанию; атлас растёт страницами, чтобы удержать заданную плотность. 0 возвращает плотность, посчитанную от площади сцены.' },
+  { key: '?sample=', effect: 'Шаг решётки замеров в метрах (0.1 по умолчанию): столько мира приходится на один сурфель бейка, остальное разносится по протрассированным связям. 0 ставит сурфель на каждый тексель.' },
   { key: '?pipeline=legacy', effect: 'Старый конвейер с живыми сурфелями.' },
   { key: '?look=0', effect: 'Отключить художественный слой целиком (папка Look в GUI).' },
   { key: '?cine=', effect: 'Пресет реальной киношной камеры: alexa35-32, alexa-lf-40, venice2-24, raptor-50, anamorphic-2x-40, imax65-50. Сенсор и фокусное задают кадр, угол обтюратора — смаз. Папка Cine camera в GUI.' },

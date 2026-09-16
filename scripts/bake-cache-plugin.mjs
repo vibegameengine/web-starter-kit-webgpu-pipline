@@ -42,14 +42,14 @@ export function bakeCachePlugin() {
           const chunks = []; let size = 0;
           for await (const chunk of req) {
             size += chunk.length;
-            if (size > 128 * 1024 * 1024) throw new Error('Bake exceeds development storage limit');
+            if (size > 512 * 1024 * 1024) throw new Error('Bake exceeds development storage limit');
             chunks.push(chunk);
           }
           const payload = Buffer.concat(chunks);
           const encoding = req.headers['content-encoding'];
           if (encoding && encoding !== 'gzip') throw new Error('Unsupported bake encoding');
           const data = encoding === 'gzip'
-            ? await decompressBake(payload, { maxOutputLength: 128 * 1024 * 1024 })
+            ? await decompressBake(payload, { maxOutputLength: 512 * 1024 * 1024 })
             : payload;
           if (data.length < 32 || data.readUInt32LE(0) !== 0x42474957) throw new Error('Invalid bake');
           // One bake of each kind per scene: this key's files are replaced, the

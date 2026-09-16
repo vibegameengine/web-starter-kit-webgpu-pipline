@@ -34,6 +34,11 @@ export async function initRenderer(
   if (!('gpu' in navigator)) {
     throw new Error('WebGPU is not available in this browser; this application does not fall back to WebGL.');
   }
+  const adapter = await navigator.gpu.requestAdapter();
+  const adapterLimits = {
+    maxStorageBufferBindingSize: adapter?.limits.maxStorageBufferBindingSize ?? 134217728,
+    maxBufferSize: adapter?.limits.maxBufferSize ?? 268435456,
+  };
   const renderer = new THREE.WebGPURenderer({
     antialias: false,
     forceWebGL: false,
@@ -48,10 +53,19 @@ export async function initRenderer(
     // cannot take a storage binding as a function argument, so there is no way to
     // reuse one set of bindings for two structures; the count is the price of the
     // static/dynamic split.
+    /* @important The storage limits are asked for too, and this is what the tracer's
+       triangle budget rests on. WebGPU's default is 128 MiB per binding whatever the card
+       can do - this one reports 2 GiB - and at 108 bytes a triangle that default caps the
+       static BVH at 414252 triangles. Everything past the cap was replaced by cluster proxy
+       boxes, and a surfel seeded on a replaced surface sits inside its own box and bakes a
+       hole. Asking for the adapter's own maximum is what makes the budget a decision instead
+       of an accident; where the hardware really offers 128 MiB, the budget follows it down. */
     requiredLimits: {
       maxStorageBuffersPerShaderStage: 14,
       maxComputeWorkgroupSizeX: 1024,
       maxComputeInvocationsPerWorkgroup: 1024,
+      maxStorageBufferBindingSize: adapterLimits.maxStorageBufferBindingSize,
+      maxBufferSize: adapterLimits.maxBufferSize,
     },
   });
 
