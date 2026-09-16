@@ -1382,7 +1382,7 @@ export class SurfelGI {
     const start = performance.now();
 
     if (filterLinks) {
-      if (!this.lightmapFilterLinks) this.lightmapFilterLinks = createFilterLinks(size, lm.links);
+      if (!this.lightmapFilterLinks) this.lightmapFilterLinks = createFilterLinks(size, height, lm.links);
       const reach = this.staticBounds(scene).getSize(new THREE.Vector3()).length() * 0.05;
       this.lightmapFilterLinks.run(renderer, gbuffer, filterLinks, { supportMetres: reach, hiddenTest: giKnobs.bakeHiddenTexels() });
       const linkStats = await this.lightmapFilterLinks.readStats(renderer);

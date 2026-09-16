@@ -3,7 +3,7 @@ import type GUI from 'lil-gui';
 import { cameraProjectionMatrixInverse, cameraWorldMatrix, float, getViewPosition, normalize, screenUV, uint, uniform, vec3, vec4 } from 'three/tsl';
 import type { SurfelGI } from '../../shared/gi/index.ts';
 import type { ReflectionCache } from '../../shared/gi/reflect/cache/index.ts';
-import type { ContactBVHBundle } from '../../shared/gi/contact/contactBvh.ts';
+import { createContactBVH, type ContactBVHBundle } from '../../shared/gi/contact/contactBvh.ts';
 import { ReflectionPass } from '../../shared/gi/reflect/reflectionPass.ts';
 import { meanEnvironmentRadiance } from '../../shared/render/atmosphere/volumetricFog.ts';
 import type { FrameGraph } from '../../shared/render/index.ts';
@@ -36,6 +36,7 @@ export class TraceStages {
   readonly reflectionsIntensity: THREE.UniformNode<number>;
   readonly mode: 'legacy' | 'cached';
   private staticTree: ContactBVHBundle | null = null;
+  private bakeTree: ContactBVHBundle | null = null;
   private reflectionsReaderBound: unknown = null;
   private cache: ReflectionCache | null = null;
   private cachedReader: { sample: (uv: TslNode) => TslNode; intensity: THREE.UniformNode<number> } | null = null;
@@ -112,6 +113,19 @@ export class TraceStages {
       dispose: () => {},
     };
     return this.staticTree;
+  }
+
+  /* @important Full detail, no demotion, built on demand and kept: the bake's visibility
+     queries and the probe distances need the triangles the GI tree replaced with boxes.
+     A launch that reads its bake from disk never calls this. */
+  detailedTree(scene: THREE.Scene): ContactBVHBundle | null {
+    if (!this.bakeTree && this.gi.staticBvh) this.bakeTree = createContactBVH(scene, this.gi.staticBvh.materialIdByUUID);
+    return this.bakeTree;
+  }
+
+  disposeDetailedTree(): void {
+    this.bakeTree?.dispose();
+    this.bakeTree = null;
   }
 
   bindGui(gui: GUI, frameGraph: FrameGraph): void {

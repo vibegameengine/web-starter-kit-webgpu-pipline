@@ -166,7 +166,7 @@ function bindLightingGui(gui: GUI, p: Pipeline, ui: PipelineUi): void {
   bake.add(bakeState, 'status').name('baked light').listen().disable();
   setInterval(() => { bakeState.status = staticLight.ready ? staticLight.bakeStatusText() : 'baking'; }, 500);
   bake.add({ rebake: () => {
-    void staticLight.prepare(frameGraph, { forceBake: true, contactTree: p.trace.tree(), interiorVolumes: p.host.interiorVolumes })
+    void staticLight.prepare(frameGraph, { forceBake: true, bakeTree: () => p.trace.detailedTree(p.host.scene), interiorVolumes: p.host.interiorVolumes })
       .then(() => ui.clearLoading())
       .catch(ui.showError);
   } }, 'rebake').name('re-bake now');
@@ -452,16 +452,23 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   const stats = new CacheStats();
   const hud = ui.showChrome ? new Hud(world, stats, () => staticLight.ready ? `atlas ${staticLight.atlasSize}px + probes` : 'baking', () => staticLight.ready ? staticLight.bakeStatusText() : 'baking') : null;
   ui.applySavedSettings?.(gui);
-  const contactTree = trace.tree();
+  /* @important The bake gets a full-detail tree, the frame does not. Visibility between two
+     lightmap texels and the probes' own distances are metre-scale queries: the GI tree
+     demotes what does not fit its 500k budget to cluster proxy boxes - 1.8 M triangles of
+     the village stand behind 706 boxes - and a ray that starts on a surface starts inside
+     its own proxy, which reads as "blocked" (measured 2026-09-08: open sand 0.45 with the
+     demoted tree, 1.0 without). It is built only when a bake actually runs, so a launch
+     that restores the saved bake never pays for it. */
+  const bakeTree = () => trace.detailedTree(scene);
   const lighting = await savedLightingFromUrl(window.location.search);
   if (lighting.bakePasses !== undefined) staticLight.bakeParams.passes = lighting.bakePasses;
   if (lighting.atlasIntensity !== undefined) staticLight.atlasParams.intensity = lighting.atlasIntensity;
   if (lighting.environmentIntensity !== undefined) gi.setEnvControls(lighting.environmentIntensity, 4);
-  await staticLight.prepare(frameGraph, { contactTree, interiorVolumes: host.interiorVolumes });
+  await staticLight.prepare(frameGraph, { bakeTree, interiorVolumes: host.interiorVolumes });
   if (lighting.probeIntensity !== undefined && staticLight.probes) staticLight.probes.intensity.value = lighting.probeIntensity;
   const live = { on: url.flag('surfelGi', false) };
   const cachedReflections = trace.mode === 'cached'
-    ? installReflectionCache(renderer, gi, host, { contactTree, probes: staticLight.probes, trace, frameGraph, url })
+    ? installReflectionCache(renderer, gi, host, { contactTree: trace.tree(), probes: staticLight.probes, trace, frameGraph, url })
     : null;
   if (staticLight.probes && url.flag('probeSpecular', true) && !cachedReflections) {
     const volume = staticLight.probes;

@@ -496,7 +496,10 @@ export function createLightmapSurfels(pool: SurfelPool, size: number, height = s
           });
 
           If(weight.greaterThan(0), () => {
-            atlas.element(tid.add(int(U_DST))).assign(vec4(sum.div(weight), float(1)));
+            /* @important 0.5, the same mark the gutter fill uses: this texel was carried
+               here from a measured one, not measured itself. The statistics must not count
+               it as coverage and the leak capture must be able to tell the two apart. */
+            atlas.element(tid.add(int(U_DST))).assign(vec4(sum.div(weight), float(0.5)));
           }).Else(() => {
             atlas.element(tid.add(int(U_DST))).assign(self);
           });

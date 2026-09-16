@@ -7,7 +7,7 @@ import { BakeLeakStages, leakHookApi } from '../../shared/gi/bake/leakStages.ts'
 import { bakeKey, loadBake, loadBakeManifest, saveBake } from '../../shared/gi/bake/persistedBake.ts';
 import { captureLightingProvenance, compareLightingProvenance, describeProvenance, environmentDigest, transportDigest, type LightingProvenance, type ProvenanceStatus } from '../../shared/gi/bake/lightingProvenance.ts';
 import { readFloatAttachment, readFloatTexture } from '../../shared/render/gpuReadback.ts';
-import { MAX_TEMPORAL_M } from '../../shared/gi/surfel/constants.ts';
+import { MAX_SURFELS, MAX_TEMPORAL_M } from '../../shared/gi/surfel/constants.ts';
 import { Layer } from '../../shared/world/index.ts';
 import { ProbeLiveUpdate, ProbeVolume, applyProbeVolume, bakeProbeVolume, fitProbeLayout, seedResidentProbes, setProbeReceiversBaked, storageMatchesLayout, type ProbeReceivers, type ProbeVolumeStorage, type ResidentProbeSurfels } from '../../shared/gi/probes/index.ts';
 import type { FrozenSurfelData } from '../../shared/gi/bake/persistedBake.ts';
@@ -94,17 +94,18 @@ export class StaticLight {
     }
   }
 
-  async prepare(frameGraph: FrameGraph, options: { forceBake?: boolean; contactTree?: ContactBVHBundle | null; interiorVolumes?: THREE.Box3[] } = {}): Promise<void> {
+  async prepare(frameGraph: FrameGraph, options: { forceBake?: boolean; bakeTree?: () => ContactBVHBundle | null; interiorVolumes?: THREE.Box3[] } = {}): Promise<void> {
     if (this.busy) { console.warn('[static-light] bake ignored: one is already running'); return; }
     this.busy = true;
     this.ready = false;
     try {
       await this.warmProvenance();
       frameGraph.setGiTextures(null, null);
-      const atlas = await this.prepareAtlas(frameGraph, options.forceBake === true, options.contactTree ?? null);
+      const bakeTree = options.bakeTree ?? (() => null);
+      const atlas = await this.prepareAtlas(frameGraph, options.forceBake === true, bakeTree);
       this.atlasPixels = atlas.pixels;
       this.atlasIntensity.value = this.atlasParams.intensity;
-      const probesBaked = await this.prepareProbes(options.contactTree ?? null, atlas.probes, options.interiorVolumes ?? []);
+      const probesBaked = await this.prepareProbes(bakeTree, atlas.probes, options.interiorVolumes ?? []);
       if ((atlas.fresh || probesBaked) && atlas.surfels) await this.save(atlas.pixels, atlas.surfels);
       this.gi.setFrozen(true);
       this.ready = true;
@@ -113,7 +114,7 @@ export class StaticLight {
     }
   }
 
-  private async prepareAtlas(frameGraph: FrameGraph, forceBake: boolean, contactTree: ContactBVHBundle | null): Promise<AtlasResult> {
+  private async prepareAtlas(frameGraph: FrameGraph, forceBake: boolean, bakeTree: () => ContactBVHBundle | null): Promise<AtlasResult> {
     const cache = this.bakeCache;
     Object.assign(cache, { source: 'none', storage: 'none', saved: false, error: '', probes: 'none' });
     if (this.leak) console.log('[leak] stage capture on: this bake is fresh and is neither read from nor written to the saved cache');
@@ -136,7 +137,7 @@ export class StaticLight {
         console.warn(`[bake-cache] cannot reuse saved data: ${error}`);
       }
     }
-    const baked = await this.bakeAtlas(frameGraph, contactTree);
+    const baked = await this.bakeAtlas(frameGraph, bakeTree());
     Object.assign(cache, { source: 'baked', storage: 'computed' });
     return { ...baked, fresh: true };
   }
@@ -217,6 +218,13 @@ export class StaticLight {
     const stride = sampleMetres > 0 && this.layout.metresPerTexel > 0
       ? Math.max(1, Math.round(sampleMetres / this.layout.metresPerTexel))
       : 1;
+    /* @important Counted the way the lattice is actually laid out - per chart, from that
+       chart's own corner - and checked before the bake, not after it. Dividing the whole
+       coverage by stride squared undercounts by up to two on scenes of small charts, and
+       the old check ran after 200 integration passes, so a pool that could never hold the
+       scene was discovered seventeen seconds late. */
+    const atLeast = Math.ceil(this.coverage / (stride * stride));
+    if (atLeast > MAX_SURFELS) throw new Error(`[lightmap] at least ${atLeast} lattice points over ${this.coverage} covered texels, against a ${MAX_SURFELS} surfel pool. Raise ?sample= or lower ?lmDensity=`);
     const result = await this.gi.bakeLightmap(this.renderer, this.scene, this.gbuffer, size, {
       height,
       sampleStride: stride,
@@ -232,8 +240,12 @@ export class StaticLight {
       onStage: this.leak ? (name, pixels) => this.leak!.recordPage(name, 0, pixels) : undefined,
       onProgress: (fraction, iteration) => bootNote(`Baking lightmap ${(fraction * 100).toFixed(0)}% · pass ${iteration}`),
     });
-    const wanted = Math.ceil(this.coverage / (stride * stride));
-    if (result && result.seeded < wanted * 0.9) throw new Error(`[lightmap] surfel pool exhausted: ${result.seeded} surfels for ${wanted} lattice points over ${this.coverage} covered texels. Raise ?sample= or lower ?lmDensity=`);
+    /* @important Exhaustion is exact, not estimated: the seed kernel takes a slot with an
+       atomic add and skips the write when the slot is past the end, so a pool that ran out
+       ends at exactly its capacity. Counting expected lattice points instead was wrong both
+       ways - dividing coverage by the stride undercounts on small charts, counting chart
+       rectangles overcounts by the four fifths of a rectangle that geometry never covers. */
+    if (result && result.seeded >= Math.min(MAX_SURFELS, size * height)) throw new Error(`[lightmap] surfel pool exhausted at ${result.seeded} slots, at least ${atLeast} lattice points over ${this.coverage} covered texels. Raise ?sample= or lower ?lmDensity=`);
     if (!result?.texture) throw new Error('lightmap: the bake produced no texture');
     const stacked = (await readFloatTexture(this.renderer, result.texture)).data;
     const surfels = await this.gi.captureStaticBake(this.renderer, result.seeded);
@@ -263,7 +275,7 @@ export class StaticLight {
     if (this.url.flag('atlasHits', true)) this.gi.useBakedAtlas(texture, this.atlasIntensity);
   }
 
-  private async prepareProbes(contactTree: ContactBVHBundle | null, saved: ProbeVolumeStorage | undefined, interiorVolumes: THREE.Box3[]): Promise<boolean> {
+  private async prepareProbes(bakeTree: () => ContactBVHBundle | null, saved: ProbeVolumeStorage | undefined, interiorVolumes: THREE.Box3[]): Promise<boolean> {
     if (!this.url.flag('probes', true)) return false;
     const bounds = staticBounds(this.scene);
     if (bounds.isEmpty()) return false;
@@ -284,8 +296,13 @@ export class StaticLight {
       this.bakeCache.probes = 'saved'; console.log('[probes] restored from the bake');
       if (live) resident = await seedResidentProbes(this.renderer, this.gi, volume);
     }
-    else if (contactTree) { resident = await this.bakeProbes(volume, viewpoint, contactTree, live); this.bakeCache.probes = classify ? 'baked' : 'baked-unclassified'; baked = classify; }
-    else throw new Error('probes: the bake needs the contact tree');
+    else {
+      const tree = bakeTree();
+      if (!tree) throw new Error('probes: the bake needs the detailed tree');
+      resident = await this.bakeProbes(volume, viewpoint, tree, live);
+      this.bakeCache.probes = classify ? 'baked' : 'baked-unclassified';
+      baked = classify;
+    }
     if (resident) {
       this.probeLive = new ProbeLiveUpdate(this.renderer, this.gi, this.scene, volume, resident, viewpoint);
       const budget = this.url.num('probeRayBudget'); if (budget !== null) this.probeLive.settings.rayBudget = budget;
