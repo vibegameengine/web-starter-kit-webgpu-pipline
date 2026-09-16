@@ -17,7 +17,6 @@ import { leakHookApi } from '../../shared/gi/bake/leakStages.ts';
 import { TraceStages } from './traceStages.ts';
 import { PostStages } from './postStages.ts';
 import { gpuPasses } from './audit.ts';
-import { LodLab } from '../../widgets/lod-lab/index.ts';
 import { bootStage } from '../../shared/ui/bootProgress.ts';
 import { ReflectionCache, deriveReflectionVolume, type ReflectionVolume } from '../../shared/gi/reflect/cache/index.ts';
 import type { ContactBVHBundle } from '../../shared/gi/contact/contactBvh.ts';
@@ -119,24 +118,7 @@ interface Pipeline {
   renderer: THREE.WebGPURenderer; gi: SurfelGI; host: SceneHost; url: UrlParams; frameGraph: FrameGraph;
   staticLight: StaticLight; trace: TraceStages; post: PostStages; sun: ReturnType<typeof setupSun>; live: { on: boolean }; giScale: () => number;
   dynamic: ReturnType<typeof addMovers>; world: WorldState; stats: CacheStats; hud: Hud | null;
-  lab: LodLab | null;
   cine: { name: string };
-}
-
-function openLodLab(renderer: THREE.WebGPURenderer, staticLight: StaticLight, camera: THREE.PerspectiveCamera, frameGraph: FrameGraph): LodLab | null {
-  if (!staticLight.lod) {
-    console.warn('[lod-lab] needs ?lod=1');
-    return null;
-  }
-  const lab = new LodLab(renderer, staticLight.lod);
-  const guiElement = document.querySelector<HTMLElement>('.lil-gui.root');
-  const gutter = guiElement ? guiElement.getBoundingClientRect().width : 0;
-  document.documentElement.style.setProperty('--lod-lab-gutter', `${Math.ceil(gutter)}px`);
-  document.body.classList.add('lod-lab');
-  camera.aspect = (window.innerWidth / 2) / window.innerHeight;
-  camera.updateProjectionMatrix();
-  frameGraph.setSize(window.innerWidth / 2, window.innerHeight);
-  return lab;
 }
 
 function bindCineGui(gui: GUI, p: Pipeline): void {
@@ -236,7 +218,7 @@ function installHooks(p: Pipeline, state: { paused: boolean; stepOnce: boolean; 
   hook('__camera', (px: number, py: number, pz: number, tx: number, ty: number, tz: number) => {
     camera.position.set(px, py, pz); controls.target.set(tx, ty, tz); controls.update(); camera.updateMatrixWorld(); return true;
   });
-  installLodHooks(p);
+  installAtlasHooks(p);
   hook('__gpuPasses', (frames = 60) => gpuPasses(renderer, frames));
   if (p.staticLight.leak) hook('__leak', leakHookApi(p.staticLight.leak, () => frameGraph.setSplitView(SplitView.Leak)));
   hook('__fog', { ...p.post.hooks(), ...p.trace.hooks(frameGraph) });
@@ -254,28 +236,8 @@ function installHooks(p: Pipeline, state: { paused: boolean; stepOnce: boolean; 
   installAuditHooks(p, state);
 }
 
-function installLodHooks(p: Pipeline): void {
-  const { renderer, staticLight } = p;
-  hook('__lod', () => {
-    const lod = staticLight.lod;
-    if (!lod) return null;
-    return {
-      charts: staticLight.layout?.regions.length ?? 0,
-      pages: lod.pool.pages.length,
-      poolMiB: +(lod.pool.bytes / 1048576).toFixed(2),
-      atlasSize: lod.atlas.size,
-      resident: lod.atlas.residentCount(),
-      usedCells: lod.atlas.usedCells(),
-      totalCells: lod.atlas.totalCells(),
-      copies: lod.atlas.copiesLastFrame,
-      ...lod.plan,
-      demands: undefined,
-      mips: lod.plan.demands.reduce((counts: Record<number, number>, demand) => {
-        counts[demand.mip] = (counts[demand.mip] ?? 0) + 1;
-        return counts;
-      }, {}),
-    };
-  });
+function installAtlasHooks(p: Pipeline): void {
+  const { staticLight } = p;
   hook('__pages', () => {
     const layout = staticLight.layout;
     const pixels = staticLight.atlasPixels;
@@ -322,27 +284,6 @@ function installLodHooks(p: Pipeline): void {
       return [{ chart, region: placement.region, centre: placement.centre.toArray().map((v) => +v.toFixed(2)),
         mean: +(sum / (width * height)).toFixed(5), litFraction: +(lit / (width * height)).toFixed(2) }];
     });
-  });
-  hook('__lodChart', (name = 'bench') => {
-    const lod = staticLight.lod;
-    const layout = staticLight.layout;
-    if (!lod || !layout) return null;
-    return layout.placements.flatMap((placement, chart) => {
-      if (placement.mesh.name !== name) return [];
-      return [{
-        chart, region: placement.region, lastMip: lod.pool.lastMip(chart),
-        centre: placement.centre.toArray().map((v) => +v.toFixed(2)),
-        extent: [+placement.extentU.toFixed(2), +placement.extentV.toFixed(2)],
-        root: [lod.pool.rootColours[chart * 3], lod.pool.rootColours[chart * 3 + 1], lod.pool.rootColours[chart * 3 + 2]].map((v) => +v.toFixed(5)),
-        residentMip: lod.atlas.residentMip(chart),
-      }];
-    }).slice(0, 8);
-  });
-  hook('__lodPixels', async (x = 0, y = 0, width = 32, height = 4) => {
-    const lod = staticLight.lod;
-    if (!lod) return null;
-    const pixels = await renderer.readRenderTargetPixelsAsync(lod.atlas.target, x, y, width, height);
-    return Array.from(pixels.slice(0, Math.min(pixels.length, 256)));
   });
 }
 
@@ -479,14 +420,12 @@ function startLoop(p: Pipeline, ui: PipelineUi, state: { paused: boolean; stepOn
     } else {
       frameGraph.setGiTextures(null, null);
     }
-    p.staticLight.lod?.update(camera, window.innerHeight);
     trace.update(frameGraph);
     scene.background = host.skyIsBackground ? gi.envTexture : null;
     post.beforeRender(now, dt);
     frameGraph.render();
     frameGraph.endFrame();
     stats.endFrame(world.dt);
-    p.lab?.update();
     hud?.update(world.dt);
     if (framesShown < 2 && ++framesShown === 2) ui.clearLoading();
   });
@@ -530,7 +469,6 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   }
   const giScale = () => (live.on ? 1 : (url.num('giScale') ?? HALF_GBUFFER));
   staticLight.setLiveChainServesReceivers(live.on);
-  const lab = url.flag('lodLab', false) ? openLodLab(renderer, staticLight, camera, frameGraph) : null;
   const requestedCine = url.get('cine');
   const cine = { name: requestedCine && requestedCine in CINE_CAMERAS ? requestedCine : DEFAULT_CINE_CAMERA };
   if (requestedCine) {
@@ -538,7 +476,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
     post.motionBlur.settings.shutter = CINE_CAMERAS[cine.name].shutterAngleDeg / 360;
     console.log(`[cine] ${CINE_CAMERAS[cine.name].label}, ${horizontalFovDeg(CINE_CAMERAS[cine.name]).toFixed(1)}° horizontal`);
   }
-  const p: Pipeline = { renderer, gi, host, url, frameGraph, staticLight, trace, post, sun, live, dynamic, world, stats, hud, giScale, lab, cine };
+  const p: Pipeline = { renderer, gi, host, url, frameGraph, staticLight, trace, post, sun, live, dynamic, world, stats, hud, giScale, cine };
   gi.resize(renderer, giScale());
   bindLightingGui(gui, p, ui);
   bindCineGui(gui, p);
@@ -547,7 +485,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   post.bindGui(gui);
   trace.bindGui(gui, frameGraph);
   window.addEventListener('resize', () => {
-    const width = lab ? window.innerWidth / 2 : window.innerWidth;
+    const width = window.innerWidth;
     camera.aspect = width / window.innerHeight;
     camera.updateProjectionMatrix();
     frameGraph.setSize(width, window.innerHeight);

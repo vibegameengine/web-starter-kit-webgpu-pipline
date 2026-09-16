@@ -203,21 +203,26 @@ export function assignLightmapUvs(
     };
   }
 
-  // @important The old loop coarsened `metresPerTexel` until the charts fitted one 512
-  // atlas, which is the step the streaming design replaces: charts must not be shrunk to
-  // fit a chosen atlas. Splitting folded bins raised the chart count and that loop
-  // answered by taking the corridor from 0.1156 to 0.1856 m/texel, eight texels for a
-  // whole bench seat. The atlas grows instead, up to `maxAtlasSize`.
-  const maxPages = options.maxPages ?? 8;
-  const metresPerTexel = Math.sqrt(mappedArea / (TARGET_FILL * atlasSize * atlasSize));
+  /* @important One atlas, one bake. The pool holds one surfel per texel and stops at
+     MAX_SURFELS, so a stack of pages cannot be baked together: every page is another full
+     bake of the scene, and that is what the launch pays for. The density is searched
+     again, as it was before pages: start where the charts would fill TARGET_FILL and
+     coarsen until they fit. The skyline packer stays - it wastes far less than the
+     shelves the search used to feed, so the same scene lands at a finer density. */
+  const maxPages = options.maxPages ?? 1;
+  let metresPerTexel = Math.sqrt(mappedArea / (TARGET_FILL * atlasSize * atlasSize));
   const placed: ChartRequest[] = requests;
-  for (const chart of placed) {
-    chart.w = Math.max(2 * alignment, Math.ceil((chart.extentU / metresPerTexel + 2 * inset) / alignment) * alignment);
-    chart.h = Math.max(2 * alignment, Math.ceil((chart.extentV / metresPerTexel + 2 * inset) / alignment) * alignment);
+  let pages = 0;
+  for (let attempt = 0; attempt < 40 && pages === 0; attempt++) {
+    for (const chart of placed) {
+      chart.w = Math.max(2 * alignment, Math.ceil((chart.extentU / metresPerTexel + 2 * inset) / alignment) * alignment);
+      chart.h = Math.max(2 * alignment, Math.ceil((chart.extentV / metresPerTexel + 2 * inset) / alignment) * alignment);
+    }
+    pages = packPages(placed, atlasSize, alignment, maxPages);
+    if (pages === 0) metresPerTexel *= 1.07;
   }
-  const pages = packPages(placed, atlasSize, alignment, maxPages);
   if (pages === 0) {
-    throw new Error(`[lightmap] a single chart is larger than a ${atlasSize}² page at ${metresPerTexel.toFixed(4)} m/texel`);
+    throw new Error(`[lightmap] could not pack ${requests.length} charts into a ${atlasSize}² atlas`);
   }
   const atlasHeight = atlasSize * pages;
   const measurable = new Set(placed.filter((chart) => coversTexelCentre(chart, inset)));

@@ -7,7 +7,6 @@ import { BakeLeakStages, leakHookApi } from '../../shared/gi/bake/leakStages.ts'
 import { bakeKey, loadBake, loadBakeManifest, saveBake } from '../../shared/gi/bake/persistedBake.ts';
 import { captureLightingProvenance, compareLightingProvenance, describeProvenance, environmentDigest, transportDigest, type LightingProvenance, type ProvenanceStatus } from '../../shared/gi/bake/lightingProvenance.ts';
 import { readFloatAttachment, readFloatTexture } from '../../shared/render/gpuReadback.ts';
-import { LightmapLod } from '../../shared/gi/lod/index.ts';
 import { MAX_TEMPORAL_M } from '../../shared/gi/surfel/constants.ts';
 import { Layer } from '../../shared/world/index.ts';
 import { ProbeLiveUpdate, ProbeVolume, applyProbeVolume, bakeProbeVolume, fitProbeLayout, seedResidentProbes, setProbeReceiversBaked, storageMatchesLayout, type ProbeReceivers, type ProbeVolumeStorage, type ResidentProbeSurfels } from '../../shared/gi/probes/index.ts';
@@ -52,7 +51,6 @@ export class StaticLight {
   layout: LightmapLayout | null = null;
   atlas: THREE.Texture | null = null;
   atlasPixels: Float32Array | null = null;
-  lod: LightmapLod | null = null;
   leak: BakeLeakStages | null = null;
   probes: ProbeVolume | null = null;
   probeLive: ProbeLiveUpdate | null = null;
@@ -98,7 +96,6 @@ export class StaticLight {
       frameGraph.setGiTextures(null, null);
       const atlas = await this.prepareAtlas(frameGraph, options.forceBake === true, options.contactTree ?? null);
       this.atlasPixels = atlas.pixels;
-      this.enableLod(atlas.pixels);
       this.atlasIntensity.value = this.atlasParams.intensity;
       const probesBaked = await this.prepareProbes(options.contactTree ?? null, atlas.probes, options.interiorVolumes ?? []);
       if ((atlas.fresh || probesBaked) && atlas.surfels) await this.save(atlas.pixels, atlas.surfels);
@@ -135,22 +132,6 @@ export class StaticLight {
     const baked = await this.bakeAtlas(frameGraph, contactTree);
     Object.assign(cache, { source: 'baked', storage: 'computed' });
     return { ...baked, fresh: true };
-  }
-
-  private lodRequested(): boolean {
-    return this.url.flag('lod', false) || this.url.flag('lodLab', false);
-  }
-
-  private enableLod(pixels: Float32Array): void {
-    if (!this.lodRequested() || !this.layout || this.layout.regions.length === 0) {
-      if (this.lodRequested()) applyLightmap(this.scene, this.atlas!, this.atlasIntensity);
-      return;
-    }
-    this.lod = new LightmapLod(this.renderer, this.scene, this.layout, pixels, this.atlasIntensity, {
-      pageSize: this.url.num('lodPage') ?? 2048,
-      atlasSize: this.url.num('lodAtlas') ?? 512,
-      copyBudget: this.url.num('lodCopies') ?? 32,
-    });
   }
 
   /* @important The two digests are taken once and kept: the panorama and the transport
@@ -257,7 +238,7 @@ export class StaticLight {
 
   private publishAtlas(frameGraph: FrameGraph, texture: THREE.Texture): void {
     this.atlas = texture;
-    if (!this.lodRequested()) applyLightmap(this.scene, texture, this.atlasIntensity);
+    applyLightmap(this.scene, texture, this.atlasIntensity);
     frameGraph.setLightmapTexture(texture);
     frameGraph.hybridReceivers.value = 1;
     if (this.url.flag('atlasHits', true)) this.gi.useBakedAtlas(texture, this.atlasIntensity);
