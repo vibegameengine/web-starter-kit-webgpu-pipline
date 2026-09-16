@@ -184,7 +184,7 @@ function bindLightingGui(gui: GUI, p: Pipeline, ui: PipelineUi): void {
   bake.add(bakeState, 'status').name('baked light').listen().disable();
   setInterval(() => { bakeState.status = staticLight.ready ? staticLight.bakeStatusText() : 'baking'; }, 500);
   bake.add({ rebake: () => {
-    void staticLight.prepare(frameGraph, { forceBake: true, contactTree: p.trace.buildTree(p.host.scene), interiorVolumes: p.host.interiorVolumes })
+    void staticLight.prepare(frameGraph, { forceBake: true, contactTree: p.trace.tree(), interiorVolumes: p.host.interiorVolumes })
       .then(() => ui.clearLoading())
       .catch(ui.showError);
   } }, 'rebake').name('re-bake now');
@@ -480,7 +480,7 @@ function startLoop(p: Pipeline, ui: PipelineUi, state: { paused: boolean; stepOn
       frameGraph.setGiTextures(null, null);
     }
     p.staticLight.lod?.update(camera, window.innerHeight);
-    trace.update(scene, frameGraph);
+    trace.update(frameGraph);
     scene.background = host.skyIsBackground ? gi.envTexture : null;
     post.beforeRender(now, dt);
     frameGraph.render();
@@ -513,7 +513,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   const stats = new CacheStats();
   const hud = ui.showChrome ? new Hud(world, stats, () => staticLight.ready ? `atlas ${staticLight.atlasSize}px + probes` : 'baking', () => staticLight.ready ? staticLight.bakeStatusText() : 'baking') : null;
   ui.applySavedSettings?.(gui);
-  const contactTree = await bootStage('Building the contact BVH', () => trace.buildTree(scene));
+  const contactTree = trace.tree();
   const lighting = await savedLightingFromUrl(window.location.search);
   if (lighting.bakePasses !== undefined) staticLight.bakeParams.passes = lighting.bakePasses;
   if (lighting.atlasIntensity !== undefined) staticLight.atlasParams.intensity = lighting.atlasIntensity;
@@ -559,7 +559,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   installHooks(p, state);
   await bootStage('Compiling shaders', async () => {
     const programs = url.flag('warmup', true) ? renderer.compileAsync(scene, camera) : Promise.resolve();
-    trace.tree(scene);
+    trace.tree();
     await programs;
   });
   await bootStage('Waiting for the first frame', () => startLoop(p, ui, state));
