@@ -21,7 +21,7 @@ import assert from 'node:assert/strict';
 
 const out = 'shots/contact';
 await mkdir(out, { recursive: true });
-const url = `http://127.0.0.1:5188/?scene=beach&hud=0&freezeAt=0&still=1&gputime=1&cam=rocks${process.env.GI_QUERY ?? ''}`;
+const url = `http://127.0.0.1:5188/?scene=beach&hud=0&freezeAt=0&still=1&gputime=1&cam=rocks&contact=1${process.env.GI_QUERY ?? ''}`;
 const browser = await chromium.launch({
   channel: 'chrome',
   headless: false,
@@ -78,7 +78,9 @@ try {
   const boulderFoot = [1000, 420, 120, 60];
   const backdrop = [20, 20, 150, 80];
 
-  assert.equal(await page.evaluate(() => window.__fog.contact()), true, 'contact occlusion must be on by default');
+  // The pass is off by default now (the user judged it noise without visible gain),
+  // so the URL above turns it on. This asserts the switch worked, not a default.
+  assert.equal(await page.evaluate(() => window.__fog.contact()), true, 'contact=1 must turn the pass on');
 
   // Beauty on, then off, then on again, each after two seconds of settling: the
   // comparison is off against the second on, so no view switch sits between them.
