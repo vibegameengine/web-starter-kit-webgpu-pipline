@@ -11,6 +11,8 @@ function isNearZero( value ) {
 
 }
 
+let coplanarWarned = false;
+
 export class ExtendedTriangle extends Triangle {
 
 	constructor( ...args ) {
@@ -242,9 +244,13 @@ ExtendedTriangle.prototype.intersectsTriangle = ( function () {
 		if ( target ) {
 
 			// TODO find two points that intersect on the edges and make that the result
-			if ( ! suppressLog ) {
+			if ( ! suppressLog && ! coplanarWarned ) {
 
-				console.warn( 'ExtendedTriangle.intersectsTriangle: Triangles are coplanar which does not support an output edge. Setting edge to 0, 0, 0.' );
+				// @important Once, not per pair. At full detail the tracer holds 1.5 M triangles and this
+				// fired for every coplanar pair a shapecast met - millions of console messages, enough to
+				// overflow the devtools pipe past 512 MB and kill any harness listening to the console.
+				coplanarWarned = true;
+				console.warn( 'ExtendedTriangle.intersectsTriangle: Triangles are coplanar which does not support an output edge. Setting edge to 0, 0, 0. (reported once)' );
 
 			}
 

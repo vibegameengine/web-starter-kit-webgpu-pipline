@@ -20,6 +20,7 @@ import { bootNote, bootStage } from '../../shared/ui/bootProgress.ts';
 const DEFAULT_ATLAS_SIZE = 512;
 const DEFAULT_PROBE_SPACING = 2;
 const DEFAULT_SAMPLE_METRES = 0.1;
+const DEFAULT_BAKE_SECONDS = 15;
 const DEFAULT_METRES_PER_TEXEL = 0.05;
 const DEFAULT_PROBE_ITERATIONS = 100;
 const MAX_PROBES = 65536;
@@ -237,6 +238,7 @@ export class StaticLight {
     const result = await this.gi.bakeLightmap(this.renderer, this.scene, this.gbuffer, size, {
       height,
       sampleStride: stride,
+      budgetMs: (this.url.num('bakeSeconds') ?? DEFAULT_BAKE_SECONDS) * 1000,
       sampleFallback: this.url.flag('sampleFallback', true),
       regions: this.layout.regions,
       iterations: this.bakeParams.passes,

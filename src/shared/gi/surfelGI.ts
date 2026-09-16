@@ -18,6 +18,7 @@ import type { FrozenSurfelData } from './bake/persistedBake.ts';
 import {
   CASCADES,
   MAX_SURFELS,
+  TARGET_SAMPLE_COUNT,
   MAX_TEMPORAL_M,
   RESOLVE_FETCH_CAP,
   SURFEL_CS,
@@ -1333,6 +1334,8 @@ export class SurfelGI {
       /** Atlas texels between measured samples, and the chart rectangles they sit in. */
       sampleStride?: number;
       sampleFallback?: boolean;
+      /** Milliseconds the integration may take; 0 runs `iterations` passes regardless. */
+      budgetMs?: number;
       regions?: { x: number; y: number; width: number; height: number }[];
       onStage?: (name: string, pixels: Float32Array) => void;
       onProgress?: (fraction: number, iteration: number) => void;
@@ -1360,6 +1363,7 @@ export class SurfelGI {
       freshSurfels,
       sampleStride = 1,
       sampleFallback = true,
+      budgetMs = 0,
       regions = [],
       onStage,
       onProgress,
@@ -1410,7 +1414,17 @@ export class SurfelGI {
     camera.position.copy(viewpoint ?? bounds.getCenter(new THREE.Vector3()));
     camera.updateMatrixWorld();
 
+    /* @important A budget in seconds, not a pass count. 200 passes was `MAX_TEMPORAL_M`, a
+       realtime temporal ceiling copied into the bake as a recipe; nothing measured that 200
+       was needed. The bake now runs until its time is spent, never past `iterations`, and
+       never below TARGET_SAMPLE_COUNT - the immortaliser pins only surfels with that many
+       samples, and a bake that stops short of it refuses to persist. */
+    const minimumPasses = Math.min(iterations, TARGET_SAMPLE_COUNT);
+    const budgetStart = performance.now();
+    let passesRun = 0;
     for (let i = 0; i < iterations; i++) {
+      if (i >= minimumPasses && budgetMs > 0 && performance.now() - budgetStart >= budgetMs) break;
+      passesRun = i + 1;
       // The integrator keys its blue-noise sequence and MSME window off the frame
       // counter, and nothing renders during a bake — so without advancing it by hand
       // every iteration would cast the *same* directions and never converge.
@@ -1433,10 +1447,16 @@ export class SurfelGI {
       );
       this.pool.swapMoments();
 
-      onProgress?.((i + 1) / iterations, i + 1);
+      const byTime = budgetMs > 0 ? (performance.now() - budgetStart) / budgetMs : 0;
+      onProgress?.(Math.min(1, Math.max((i + 1) / iterations, byTime)), i + 1);
       // Yield so the GPU actually executes and the page stays responsive; a whole
       // bake submitted in one tick is how a driver reset happens.
       await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      /* @important The budget is measured against work the GPU has finished, not work handed to
+         it. A frame's yield returns long before the queue drains, so the first version submitted
+         all 200 passes inside the first seconds and then spent 24 s executing them under a 15 s
+         budget. Waiting on the queue makes the clock honest. */
+      if (budgetMs > 0) await (renderer.backend as { device?: GPUDevice }).device?.queue.onSubmittedWorkDone();
     }
 
     // Plane epsilon scales with the world: it decides which neighbouring texels are
@@ -1469,7 +1489,7 @@ export class SurfelGI {
 
     const ms = performance.now() - start;
     console.log(
-      `[lightmap] ${iterations} integrations × ${raysPerSurfel} rays in ${(ms / 1000).toFixed(2)}s — ` +
+      `[lightmap] ${passesRun} of ${iterations} integrations × ${raysPerSurfel} rays in ${(ms / 1000).toFixed(2)}s${budgetMs > 0 ? ` (budget ${(budgetMs / 1000).toFixed(0)}s)` : ''} — ` +
         `${stats.lit}/${stats.total} texels lit, ${stats.filled} gutter-filled, ` +
         `${stats.black} black, ` +
         `mean ${stats.meanLuma.toFixed(4)}, max ${stats.maxLuma.toFixed(3)}` +
