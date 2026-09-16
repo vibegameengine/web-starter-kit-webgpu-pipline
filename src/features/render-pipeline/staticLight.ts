@@ -288,7 +288,11 @@ export class StaticLight {
      branch produced was exactly that mistake. `?zeroGreen=0` turns it off for a capture that
      has to show the real colours. */
   private markUnlit(pixels: Float32Array, regions: LightmapRegion[], size: number): number {
-    const threshold = this.url.num('zeroGreen') ?? 1e-4;
+    /* @important Off unless asked for. The mark is for a hunt, not for a frame: most of what it
+       paints is correct - the inside of a closed house shell, a cavity under the terrace where
+       64 rays out of 64 hit the shell itself - and a frame covered in green over correct black
+       teaches nothing. `?zeroGreen=1` (or a threshold) turns it on. */
+    const threshold = this.url.num('zeroGreen') ?? (this.url.flag('zeroGreen', false) ? 1e-4 : 0);
     if (threshold <= 0) return 0;
     let dark = 0;
     let uncovered = 0;

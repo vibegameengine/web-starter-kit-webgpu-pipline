@@ -363,10 +363,10 @@ function installAtlasHooks(p: Pipeline): void {
     const pixels = staticLight.atlasPixels;
     if (!layout || !pixels) return null;
     const size = staticLight.atlasSize;
-    const perMesh = new Map<string, { charts: number; dark: number; texels: number; measured: number; sum: number }>();
+    const perMesh = new Map<string, { charts: number; dark: number; texels: number; measured: number; zeros: number; sum: number }>();
     for (const placement of layout.placements) {
       const name = placement.mesh.name || placement.mesh.geometry.type;
-      const row = perMesh.get(name) ?? { charts: 0, dark: 0, texels: 0, measured: 0, sum: 0 };
+      const row = perMesh.get(name) ?? { charts: 0, dark: 0, texels: 0, measured: 0, zeros: 0, sum: 0 };
       const { x, y, width, height } = placement.region;
       let chartSum = 0;
       for (let row2 = 0; row2 < height; row2++) {
@@ -374,7 +374,10 @@ function installAtlasHooks(p: Pipeline): void {
           const index = ((y + row2) * size + x + column) * 4;
           const value = (pixels[index] + pixels[index + 1] + pixels[index + 2]) / 3;
           row.texels++;
-          if (pixels[index + 3] >= 0.75) row.measured++;
+          if (pixels[index + 3] >= 0.75) {
+            row.measured++;
+            if (value <= 1e-5) row.zeros++;
+          }
           chartSum += value;
           row.sum += value;
         }
@@ -389,6 +392,7 @@ function installAtlasHooks(p: Pipeline): void {
       darkCharts: row.dark,
       texels: row.texels,
       measured: row.measured,
+      zeros: row.zeros,
       mean: +(row.sum / Math.max(1, row.texels)).toFixed(5),
     })).sort((a, b) => a.mean - b.mean);
   });
