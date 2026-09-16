@@ -78,7 +78,7 @@ export const SCENES: Entry[] = [
     title: 'Небо',
     art: 'home-art-beach',
     description:
-      'Физическая атмосфера: LUT пропускания, многократного рассеяния и вида неба, диск солнца с потемнением к краю. То же небо освещает сцену: запекание, пробы, отражения и цвет солнца.',
+      'Физическая атмосфера и объёмные облака: LUT пропускания, многократного рассеяния и вида неба, диск солнца с потемнением к краю, слой кучевых облаков с многократным рассеянием. Небо освещает сцену: запекание, пробы, отражения и цвет солнца.',
     href: '/?scene=sky&cam=objects',
     open: 'Открыть лабу',
     chips: [
@@ -88,6 +88,10 @@ export const SCENES: Entry[] = [
       { label: 'сумерки', href: '/?scene=sky&cam=sunward&sunAz=-40&sunEl=-4&bakeCache=0' },
       { label: 'зенит', href: '/?scene=sky&cam=zenith&sunAz=-60&sunEl=30&bakeCache=0' },
       { label: 'с высоты 12 км', href: '/?scene=sky&cam=horizon&sunAz=-90&sunEl=8&skyAltitude=12&bakeCache=0' },
+      { label: 'облака снизу', href: '/?scene=sky&cam=zenith&sunAz=-60&sunEl=40&bakeCache=0' },
+      { label: 'разорванные облака', href: '/?scene=sky&cam=horizon&sunAz=-60&sunEl=40&cloudCoverage=0.5&bakeCache=0' },
+      { label: 'пасмурно (слоистые)', href: '/?scene=sky&cam=horizon&sunAz=-60&sunEl=40&cloudCoverage=0.97&bakeCache=0' },
+      { label: 'ясно', href: '/?scene=sky&cam=horizon&sunAz=-60&sunEl=40&clouds=0&bakeCache=0' },
       { label: 'без неба (панорама)', href: '/?scene=sky&cam=objects&sky=0' },
     ],
   },

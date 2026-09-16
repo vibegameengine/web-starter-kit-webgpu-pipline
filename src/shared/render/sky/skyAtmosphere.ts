@@ -86,9 +86,10 @@ export class SkyAtmosphere {
     return texture(this.luts.skyView, texelCentreUv(unit, this.luts.skyViewSize)).level(float(0)).rgb.mul(this.sunIlluminance);
   }
 
-  backgroundNode(): N {
+  backgroundNode(overlay?: (sky: N) => N): N {
     const direction = normalize(positionWorldDirection);
-    return vec4(this.skyLuminance(direction).add(this.sunDisc(direction, this.luts.viewRadius)), 1);
+    const sky = this.skyLuminance(direction).add(this.sunDisc(direction, this.luts.viewRadius));
+    return vec4(overlay ? overlay(sky) : sky, 1);
   }
 
   private sunDisc(direction: N, radius: N): N {

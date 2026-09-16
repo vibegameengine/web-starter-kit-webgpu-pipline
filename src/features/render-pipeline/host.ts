@@ -4,7 +4,7 @@ import type { VolumetricFogSettings } from '../../shared/render/index.ts';
 import type { ContactOcclusionSettings } from '../../shared/gi/contact/contactOcclusionPass.ts';
 import type { ReflectionSettings } from '../../shared/gi/reflect/reflectionPass.ts';
 import type { MotionBlurSettings } from '../../shared/render/motionBlur.ts';
-import type { SkyAtmosphereSettings } from '../../shared/render/sky/index.ts';
+import type { CloudSettings, SkyAtmosphereSettings } from '../../shared/render/sky/index.ts';
 import type { SurfelGI } from '../../shared/gi/index.ts';
 import type { ReflectionVolumeSpec } from '../../shared/gi/reflect/cache/reflectionVolumes.ts';
 
@@ -27,6 +27,7 @@ export interface SceneHost {
   reflectionVolumes?: ReflectionVolumeSpec[];
   motionBlur?: Partial<MotionBlurSettings>;
   sky?: Partial<SkyAtmosphereSettings>;
+  clouds?: Partial<CloudSettings>;
   interiorVolumes?: THREE.Box3[];
 }
 

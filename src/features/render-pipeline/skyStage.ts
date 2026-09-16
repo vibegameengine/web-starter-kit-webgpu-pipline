@@ -1,6 +1,6 @@
 import type GUI from 'lil-gui';
 import * as THREE from 'three/webgpu';
-import { SkyAtmosphere, SkyEnvironment } from '../../shared/render/sky/index.ts';
+import { CloudLayer, DEFAULT_CLOUD_SETTINGS, SkyAtmosphere, SkyEnvironment } from '../../shared/render/sky/index.ts';
 import type { SunControls } from './sun.ts';
 import { hook, type SceneHost, type UrlParams } from './host.ts';
 
@@ -9,7 +9,9 @@ const ENVIRONMENT_RECAPTURE_COS = Math.cos(THREE.MathUtils.degToRad(0.25));
 
 export class SkyStage {
   readonly atmosphere: SkyAtmosphere;
-  private readonly background: THREE.Node;
+  private readonly clearSky: THREE.Node;
+  private readonly cloudySky: THREE.Node;
+  readonly clouds: CloudLayer;
   private environment: SkyEnvironment | null = null;
   private readonly capturedSun = new THREE.Vector3(0, -2, 0);
   private environmentStale = true;
@@ -21,7 +23,9 @@ export class SkyStage {
       altitudeKm: url.num('skyAltitude') ?? host.sky?.altitudeKm ?? 0,
       sunDiscScale: url.num('sunDiscScale') ?? host.sky?.sunDiscScale ?? 1,
     });
-    this.background = this.atmosphere.backgroundNode();
+    this.clouds = new CloudLayer(renderer, this.atmosphere, { ...host.clouds, enabled: url.flag('clouds', host.clouds?.enabled ?? true), resolutionDivisor: url.num('cloudRes') ?? host.clouds?.resolutionDivisor ?? 2, coverage: url.num('cloudCoverage') ?? host.clouds?.coverage ?? DEFAULT_CLOUD_SETTINGS.coverage });
+    this.clearSky = this.atmosphere.backgroundNode();
+    this.cloudySky = this.atmosphere.backgroundNode((sky) => this.clouds.composite(sky));
     this.apply();
   }
 
@@ -45,6 +49,7 @@ export class SkyStage {
   update(): void {
     if (!this.enabled) return;
     this.atmosphere.update(this.host.camera, this.host.sun);
+    if (this.clouds.settings.enabled) this.clouds.update(this.host.camera, performance.now() / 1000);
     this.recaptureWhenSunMoved();
   }
 
@@ -77,10 +82,29 @@ export class SkyStage {
     folder.add(parameters.groundAlbedo, 'x', 0, 1, 0.01).name('planet albedo').onChange((v: number) => { parameters.groundAlbedo.set(v, v, v); rebuild(); });
     folder.add(parameters, 'multiScattering', 0, 2, 0.01).name('multiple scattering').onChange(rebuild);
     folder.open();
-    hook('__sky', { settings, parameters, rebuild, sunLight: () => this.atmosphere.sunLightTransmittance.toArray(), environment: () => this.environment?.summary() ?? null, environmentTexture: () => this.environmentTexture });
+    this.bindCloudGui(gui);
+    hook('__sky', { settings, parameters, rebuild, sunLight: () => this.atmosphere.sunLightTransmittance.toArray(), environment: () => this.environment?.summary() ?? null, environmentTexture: () => this.environmentTexture, clouds: this.clouds.settings });
+  }
+
+  private bindCloudGui(gui: GUI): void {
+    const folder = gui.addFolder('Clouds');
+    const settings = this.clouds.settings;
+    folder.add(settings, 'enabled').name('volumetric clouds').onChange(() => this.apply());
+    folder.add(settings, 'coverage', 0, 1, 0.01).name('coverage');
+    folder.add(settings, 'bottomKm', 0.2, 6, 0.05).name('base altitude (km)');
+    folder.add(settings, 'thicknessKm', 0.2, 8, 0.05).name('thickness (km)');
+    folder.add(settings, 'densityPerKm', 1, 200, 1).name('density (1/km)');
+    folder.add(settings, 'shapeScaleKm', 1, 40, 0.1).name('shape size (km)');
+    folder.add(settings, 'detailScaleKm', 0.1, 4, 0.05).name('detail size (km)');
+    folder.add(settings, 'detailErosion', 0, 1, 0.01).name('edge erosion');
+    folder.add(settings, 'forwardScattering', 0, 0.95, 0.01).name('silver lining (g)');
+    folder.add(settings, 'windSpeedKmPerMinute', 0, 10, 0.1).name('wind (km/min)');
+    folder.add(settings, 'windHeadingDeg', -180, 180, 1).name('wind heading');
+    folder.add(settings, 'historyWeight', 0, 0.97, 0.01).name('temporal history');
+    folder.open();
   }
 
   private apply(): void {
-    this.host.scene.backgroundNode = this.enabled ? this.background : null;
+    this.host.scene.backgroundNode = this.enabled ? (this.clouds.settings.enabled ? this.cloudySky : this.clearSky) : null;
   }
 }
