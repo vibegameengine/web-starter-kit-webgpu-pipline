@@ -21,6 +21,7 @@ import { bootStage } from '../../shared/ui/bootProgress.ts';
 import { ReflectionCache, deriveReflectionVolume, type ReflectionVolume } from '../../shared/gi/reflect/cache/index.ts';
 import type { ContactBVHBundle } from '../../shared/gi/contact/contactBvh.ts';
 import { addReflectionFixture } from './reflectionFixture.ts';
+import { LodLab } from '../../widgets/lod-lab/index.ts';
 
 export type { SceneHost, PipelineUi, RenderPipeline } from './host.ts';
 
@@ -118,7 +119,24 @@ interface Pipeline {
   renderer: THREE.WebGPURenderer; gi: SurfelGI; host: SceneHost; url: UrlParams; frameGraph: FrameGraph;
   staticLight: StaticLight; trace: TraceStages; post: PostStages; sun: ReturnType<typeof setupSun>; live: { on: boolean }; giScale: () => number;
   dynamic: ReturnType<typeof addMovers>; world: WorldState; stats: CacheStats; hud: Hud | null;
+  lab: LodLab | null;
   cine: { name: string };
+}
+
+function openLodLab(renderer: THREE.WebGPURenderer, staticLight: StaticLight, camera: THREE.PerspectiveCamera, frameGraph: FrameGraph): LodLab | null {
+  if (!staticLight.lod) {
+    console.warn('[lod-lab] the scene has no lightmap pages to show');
+    return null;
+  }
+  const lab = new LodLab(renderer, staticLight.lod);
+  const guiElement = document.querySelector<HTMLElement>('.lil-gui.root');
+  const gutter = guiElement ? guiElement.getBoundingClientRect().width : 0;
+  document.documentElement.style.setProperty('--lod-lab-gutter', `${Math.ceil(gutter)}px`);
+  document.body.classList.add('lod-lab');
+  camera.aspect = (window.innerWidth / 2) / window.innerHeight;
+  camera.updateProjectionMatrix();
+  frameGraph.setSize(window.innerWidth / 2, window.innerHeight);
+  return lab;
 }
 
 function bindCineGui(gui: GUI, p: Pipeline): void {
@@ -174,9 +192,25 @@ function bindLightingGui(gui: GUI, p: Pipeline, ui: PipelineUi): void {
   }, 500);
   bake.add({ rebake: () => {
     void staticLight.prepare(frameGraph, { forceBake: true, bakeTree: () => p.trace.detailedTree(p.host.scene), interiorVolumes: p.host.interiorVolumes })
-      .then(() => ui.clearLoading())
+      .then(() => {
+        if (p.lab && staticLight.lod) { p.lab.element.remove(); p.lab = new LodLab(p.renderer, staticLight.lod); }
+        ui.clearLoading();
+      })
       .catch(ui.showError);
   } }, 'rebake').name('re-bake now');
+  const lodState = { streaming: 'baking' };
+  bake.add(lodState, 'streaming').name('lightmap LOD').listen().disable();
+  setInterval(() => {
+    const lod = staticLight.lod;
+    lodState.streaming = lod
+      ? `${lod.pool.pages.length}×${lod.pool.pageSize}² pages → ${lod.atlas.size}², ${lod.atlas.residentCount()} resident, ${lod.plan.rootOnly} on root`
+      : staticLight.ready ? 'off' : 'baking';
+  }, 500);
+  bake.add({ lab: () => {
+    const params = new URLSearchParams(window.location.search);
+    params.set('lodLab', params.get('lodLab') === '1' ? '0' : '1');
+    window.location.search = params.toString();
+  } }, 'lab').name('LOD lab (scene | working atlas)');
   const envParams = { env: p.url.num('env') ?? 1, lod: p.url.num('envLod') ?? 4 };
   giFolder.add(envParams, 'env', 0, 5, 0.05).name('env').onChange(() => gi.setEnvControls(envParams.env, envParams.lod));
   bindBakedOnly(lighting, p, envParams);
@@ -276,7 +310,55 @@ function installHooks(p: Pipeline, state: { paused: boolean; stepOnce: boolean; 
 }
 
 function installAtlasHooks(p: Pipeline): void {
-  const { staticLight } = p;
+  const { renderer, staticLight } = p;
+  hook('__lod', () => {
+    const lod = staticLight.lod;
+    if (!lod) return null;
+    return {
+      charts: staticLight.layout?.regions.length ?? 0,
+      bakePages: staticLight.layout?.pages ?? 0,
+      metresPerTexel: staticLight.layout?.metresPerTexel ?? 0,
+      pages: lod.pool.pages.length,
+      pageSize: lod.pool.pageSize,
+      poolMiB: +(lod.pool.bytes / 1048576).toFixed(2),
+      atlasSize: lod.atlas.size,
+      resident: lod.atlas.residentCount(),
+      usedCells: lod.atlas.usedCells(),
+      totalCells: lod.atlas.totalCells(),
+      freeCells: lod.atlas.freeCells(),
+      asked: lod.feedback.count(),
+      feedbackReads: lod.feedback.readsDone,
+      feedbackDrawn: lod.feedback.drawnLastRead,
+      copies: lod.atlas.copiesLastFrame,
+      refused: lod.atlas.refusedLastFrame,
+      released: lod.atlas.releasedLastFrame,
+      ...lod.plan,
+      demands: undefined,
+      mips: lod.plan.demands.reduce((counts: Record<number, number>, demand) => {
+        counts[demand.mip] = (counts[demand.mip] ?? 0) + 1;
+        return counts;
+      }, {}),
+    };
+  });
+  hook('__lodChart', (name = 'bench') => {
+    const lod = staticLight.lod;
+    const layout = staticLight.layout;
+    if (!lod || !layout) return null;
+    return layout.placements.flatMap((placement, chart) => {
+      if (placement.mesh.name !== name) return [];
+      return [{
+        chart, region: placement.region, lastMip: lod.pool.lastMip(chart),
+        root: [lod.pool.rootColours[chart * 3], lod.pool.rootColours[chart * 3 + 1], lod.pool.rootColours[chart * 3 + 2]].map((v) => +v.toFixed(5)),
+        residentMip: lod.atlas.residentMip(chart),
+      }];
+    }).slice(0, 8);
+  });
+  hook('__lodPixels', async (x = 0, y = 0, width = 32, height = 4) => {
+    const lod = staticLight.lod;
+    if (!lod) return null;
+    const pixels = await renderer.readRenderTargetPixelsAsync(lod.atlas.target, x, y, width, height);
+    return Array.from(pixels.slice(0, Math.min(pixels.length, 256)));
+  });
   hook('__pages', () => {
     const layout = staticLight.layout;
     const pixels = staticLight.atlasPixels;
@@ -521,6 +603,7 @@ function startLoop(p: Pipeline, ui: PipelineUi, state: { paused: boolean; stepOn
   const { scene, camera, controls } = host;
   let previous = performance.now();
   let framesShown = 0;
+  const lodViewport = new THREE.Vector2();
   let fatal = false;
   window.addEventListener('error', () => { fatal = true; });
   window.addEventListener('unhandledrejection', () => { fatal = true; });
@@ -553,12 +636,14 @@ function startLoop(p: Pipeline, ui: PipelineUi, state: { paused: boolean; stepOn
     } else {
       frameGraph.setGiTextures(null, null);
     }
+    p.staticLight.lod?.update(camera, renderer.getDrawingBufferSize(lodViewport));
     trace.update(frameGraph);
     scene.background = host.skyIsBackground ? gi.envTexture : null;
     post.beforeRender(now, dt);
     frameGraph.render();
     frameGraph.endFrame();
     stats.endFrame(world.dt);
+    p.lab?.update();
     hud?.update(world.dt);
     if (framesShown < 2 && ++framesShown === 2) ui.clearLoading();
   });
@@ -609,6 +694,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   }
   const giScale = () => (live.on ? 1 : (url.num('giScale') ?? HALF_GBUFFER));
   staticLight.setLiveChainServesReceivers(live.on);
+  const lab = url.flag('lodLab', false) ? openLodLab(renderer, staticLight, camera, frameGraph) : null;
   const requestedCine = url.get('cine');
   const cine = { name: requestedCine && requestedCine in CINE_CAMERAS ? requestedCine : DEFAULT_CINE_CAMERA };
   if (requestedCine) {
@@ -616,7 +702,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
     post.motionBlur.settings.shutter = CINE_CAMERAS[cine.name].shutterAngleDeg / 360;
     console.log(`[cine] ${CINE_CAMERAS[cine.name].label}, ${horizontalFovDeg(CINE_CAMERAS[cine.name]).toFixed(1)}° horizontal`);
   }
-  const p: Pipeline = { renderer, gi, host, url, frameGraph, staticLight, trace, post, sun, live, dynamic, world, stats, hud, giScale, cine };
+  const p: Pipeline = { renderer, gi, host, url, frameGraph, staticLight, trace, post, sun, live, dynamic, world, stats, hud, giScale, lab, cine };
   gi.resize(renderer, giScale());
   bindLightingGui(gui, p, ui);
   bindCineGui(gui, p);
@@ -625,7 +711,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   post.bindGui(gui);
   trace.bindGui(gui, frameGraph);
   window.addEventListener('resize', () => {
-    const width = window.innerWidth;
+    const width = p.lab ? window.innerWidth / 2 : window.innerWidth;
     camera.aspect = width / window.innerHeight;
     camera.updateProjectionMatrix();
     frameGraph.setSize(width, window.innerHeight);
