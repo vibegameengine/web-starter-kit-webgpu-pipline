@@ -3,8 +3,7 @@ import react from '@vitejs/plugin-react';
 import { fileURLToPath } from 'node:url';
 import { bakeCachePlugin } from './scripts/bake-cache-plugin.mjs';
 import { guiSettingsPlugin } from './scripts/gui-settings-plugin.mjs';
-import { feedComments } from './dashboard/vite.feed-comments.ts';
-import { feedAgents } from './dashboard/vite.feed-agents.ts';
+import { existsSync } from 'node:fs';
 
 /**
  * @important The fiber fork resolves to its SOURCE, not to `dist`: we expect to patch
@@ -37,11 +36,36 @@ const forkedThree = process.env.VITE_THREE_STOCK === '1' ? [] : [
  * webgiya is kept vendored and runs under `npm run dev:gi` for A/B only —
  * it is the donor of the WGSL BVH traversal, not the application.
  */
-export default defineConfig({
-  plugins: [react(), bakeCachePlugin(), guiSettingsPlugin(), feedComments(), feedAgents()],
+
+/* @important Port 5188 belongs to the root checkout alone. Worktrees used to inherit it and win it by
+   accident whenever the root server restarted, so the browser kept loading another branch's bytes from
+   the address the root tree was being edited at - read as a frozen transform cache for a whole evening.
+   The root binds 5188 strictly and fails loudly on a conflict; a worktree derives a stable port of its
+   own from its folder name and is free to slide off a collision. Override either with --port. */
+const treeDirectory = fileURLToPath(new URL('.', import.meta.url));
+const worktreeName = treeDirectory.replace(/[\\/]$/, '').split(/[\\/]/).slice(-2).join('/').match(/worktrees[\\/](.+)$/)?.[1];
+const isRootTree = worktreeName === undefined;
+const worktreePort = 5200 + ([...(worktreeName ?? '')].reduce((hash, character) => (hash * 31 + character.charCodeAt(0)) % 90, 7));
+const devPort = isRootTree ? 5188 : worktreePort;
+
+/* @important The agent feed plugins are optional. `dashboard/` is untracked and local to
+   whoever runs the feed, and on 2026-09-16 it was found empty in the root checkout: the two
+   static imports then failed to resolve, the config failed to load, and `npm run dev`
+   refused to start for every session sharing this tree. A missing dashboard now costs the
+   feed, not the renderer. */
+async function feedPlugins() {
+  const comments = fileURLToPath(new URL('dashboard/vite.feed-comments.ts', import.meta.url));
+  const agents = fileURLToPath(new URL('dashboard/vite.feed-agents.ts', import.meta.url));
+  if (!existsSync(comments) || !existsSync(agents)) return [];
+  const [{ feedComments }, { feedAgents }] = await Promise.all([import(comments), import(agents)]);
+  return [feedComments(), feedAgents()];
+}
+
+export default defineConfig(async () => ({
+  plugins: [react(), bakeCachePlugin(), guiSettingsPlugin(), ...(await feedPlugins())],
   define: {},
-  server: { port: 5188, host: '127.0.0.1', watch: { ignored: ['**/public/bakes/**', '**/config/gui-settings.json*'] } },
-  preview: { port: 5188, host: '127.0.0.1' },
+  server: { port: devPort, strictPort: isRootTree, host: '127.0.0.1', watch: { ignored: ['**/public/bakes/**', '**/config/gui-settings.json*'] } },
+  preview: { port: devPort, strictPort: isRootTree, host: '127.0.0.1' },
   resolve: {
     dedupe: ['three', 'lil-gui', 'three-mesh-bvh', 'react', 'react-dom'],
     alias: [
@@ -52,4 +76,4 @@ export default defineConfig({
   },
   optimizeDeps: { entries: ['index.html'], exclude: ['three'] },
   build: { target: 'esnext', sourcemap: true },
-});
+}));
