@@ -5,6 +5,7 @@ import { PagePool } from './pagePool.ts';
 import { WorkingAtlas } from './workingAtlas.ts';
 import { planAtlas, type DemandPlan } from './demand.ts';
 import { DemandFeedback } from './feedback.ts';
+import { Layer } from '../../world/index.ts';
 
 export { PagePool } from './pagePool.ts';
 export { WorkingAtlas } from './workingAtlas.ts';
@@ -36,6 +37,10 @@ export class LightmapLod {
     this.atlas = new WorkingAtlas(renderer, this.pool, layout.regions.map(toOrigin), { width: layout.atlasSize, height: layout.atlasHeight }, settings.atlasSize);
     this.feedback = new DemandFeedback(renderer, scene, layout.regions.length, { width: layout.atlasSize, height: layout.atlasHeight }, settings.feedbackSpacing);
     applyLightmap(scene, this.atlas.texture, intensity, this.atlas.sampler());
+    scene.traverse((object) => {
+      const mesh = object as THREE.Mesh;
+      if (mesh.isMesh && mesh.geometry.getAttribute('lightmapChart') && mesh.layers.isEnabled(Layer.GiStatic)) mesh.layers.enable(Layer.LightmapDemand);
+    });
     console.log(
       `[lod] ${layout.regions.length} charts in ${this.pool.pages.length} source page(s) of ${settings.pageSize}² ` +
         `(${(this.pool.bytes / 1048576).toFixed(1)} MiB), working atlas ${settings.atlasSize}² ` +

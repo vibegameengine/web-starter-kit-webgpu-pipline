@@ -44,6 +44,7 @@ export const Layer = {
    * that feeds the G-buffer or the GI ever enables it.
    */
   Overlay: 5,
+  LightmapDemand: 6,
 } as const;
 export type Layer = (typeof Layer)[keyof typeof Layer];
 

@@ -1,5 +1,6 @@
 import * as THREE from 'three/webgpu';
 import { Fn, attribute, dFdx, dFdy, float, uniform, vec2, vec4 } from 'three/tsl';
+import { Layer } from '../../world/index.ts';
 
 const NOT_REQUESTED = 255;
 
@@ -68,10 +69,13 @@ export class DemandFeedback {
     if (this.pixels === 0) return;
     const previousTarget = this.renderer.getRenderTarget();
     const previousOverride = this.scene.overrideMaterial;
+    const previousLayers = camera.layers.mask;
+    camera.layers.set(Layer.LightmapDemand);
     this.scene.overrideMaterial = this.material;
     this.renderer.setRenderTarget(this.target);
     this.renderer.render(this.scene, camera);
     this.renderer.setRenderTarget(previousTarget);
+    camera.layers.mask = previousLayers;
     this.scene.overrideMaterial = previousOverride;
     if (this.frame % this.spacing === 0) void this.collect();
   }
