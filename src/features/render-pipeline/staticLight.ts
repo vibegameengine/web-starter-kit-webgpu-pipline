@@ -2,7 +2,7 @@ import * as THREE from 'three/webgpu';
 import { uniform } from 'three/tsl';
 import type { SurfelGI } from '../../shared/gi/index.ts';
 import { applyLightmap, assignLightmapUvs, measureCoverage, rasteriseLightmapGBuffer, type LightmapLayout } from '../../shared/gi/bake/index.ts';
-import { padLightmapCharts } from '../../shared/gi/bake/chartPadding.ts';
+import { padLightmapCharts, type LightmapRegion } from '../../shared/gi/bake/chartPadding.ts';
 import { BakeLeakStages, leakHookApi } from '../../shared/gi/bake/leakStages.ts';
 import { bakeKey, loadBake, loadBakeManifest, saveBake } from '../../shared/gi/bake/persistedBake.ts';
 import { captureLightingProvenance, compareLightingProvenance, describeProvenance, environmentDigest, transportDigest, type LightingProvenance, type ProvenanceStatus } from '../../shared/gi/bake/lightingProvenance.ts';
@@ -89,7 +89,7 @@ export class StaticLight {
     }));
     this.atlasSize = this.layout.atlasSize;
     if (this.url.flag('leak', false)) {
-      this.leak = new BakeLeakStages(this.atlasSize, this.layout.atlasHeight, this.layout.regions, this.layout.pageOfRegion);
+      this.leak = new BakeLeakStages(this.atlasSize, this.layout.atlasHeight, this.layout.regions);
       hook('__leak', leakHookApi(this.leak));
       console.log(`[leak] capturing ${this.leak.slots} charted texels of the ${this.atlasSize}x${this.layout.atlasHeight} atlas per stage, ${this.layout.regions.length} charts on ${this.layout.pages} page(s)`);
     }
@@ -133,6 +133,7 @@ export class StaticLight {
         } else if (saved) {
           bootNote('Restoring the saved static lighting');
           this.gi.restoreStaticBake(this.renderer, saved.surfels, this.url.get('atlasSurfels') === '1');
+          this.markUnlit(saved.pixels, this.layout?.regions ?? [], saved.size);
           this.publishAtlas(frameGraph, halfFloatTexture(this.renderer, saved.pixels, saved.size, saved.size * (saved.pages ?? 1)));
           Object.assign(cache, { source: 'saved', storage: 'bundle', saved: true });
           this.bakedProvenance = ((await loadBakeManifest(cache.key).catch(() => null))?.provenance as LightingProvenance | undefined) ?? null;
@@ -197,7 +198,7 @@ export class StaticLight {
     if (!this.layout) throw new Error('lightmap: unwrap before baking');
     this.bakedWith = { passes: this.bakeParams.passes, rays: this.bakeParams.rays, atlasIntensity: this.atlasParams.intensity, atlasSize: this.atlasSize };
     const direction = this.sun.position.clone().normalize();
-    console.log(`[bake] ${this.bakedWith.passes} passes, ${this.bakedWith.rays} rays, atlas mul ${this.bakedWith.atlasIntensity}, sun ${this.sun.intensity.toFixed(3)} from ${direction.x.toFixed(2)},${direction.y.toFixed(2)},${direction.z.toFixed(2)} (elevation ${(Math.asin(direction.y) * 180 / Math.PI).toFixed(1)}°), ${giLightSummary().length} analytic light(s) in the tracer`);
+    console.log(`[bake] ${this.bakedWith.passes} passes, ${this.bakedWith.rays} rays, atlas mul ${this.bakedWith.atlasIntensity}, sun ${this.sun.intensity.toFixed(3)} from ${direction.x.toFixed(2)},${direction.y.toFixed(2)},${direction.z.toFixed(2)} (elevation ${(Math.asin(direction.y) * 180 / Math.PI).toFixed(1)}°)`);
     const size = this.atlasSize;
     const pages = Math.max(1, this.layout.pages);
     const height = size * pages;
@@ -246,7 +247,7 @@ export class StaticLight {
       denoiseIgnoresSurface: this.url.get('leakMutation') === 'denoiseAll',
       atlasGain: this.url.get('leakMutation') === 'atlasHalf' ? 0.5 : 1,
       filterLinks: this.url.flag('filterLinks', true) ? contactTree : null,
-      onStage: this.leak ? (name, pixels) => this.leak!.recordPage(name, 0, pixels) : undefined,
+      onStage: this.leak ? (name, pixels) => this.leak!.record(name, pixels) : undefined,
       onProgress: (fraction, iteration) => bootNote(`Baking lightmap ${(fraction * 100).toFixed(0)}% · pass ${iteration}`),
     });
     /* @important Exhaustion is exact, not estimated: the seed kernel takes a slot with an
@@ -256,6 +257,10 @@ export class StaticLight {
        rectangles overcounts by the four fifths of a rectangle that geometry never covers. */
     if (result && result.seeded >= Math.min(MAX_SURFELS, size * height)) throw new Error(`[lightmap] surfel pool exhausted at ${result.seeded} slots, at least ${atLeast} lattice points over ${this.coverage} covered texels. Raise ?sample= or lower ?lmDensity=`);
     if (!result?.texture) throw new Error('lightmap: the bake produced no texture');
+    /* @important Read after the bake, not before it: the light list is filled by the first
+       integration pass, so a count taken at the top of this function is always zero and says
+       nothing about what the rays actually saw. */
+    console.log(`[bake] the tracer carried ${giLightSummary().length} analytic light(s) through this bake`);
     const stacked = (await readFloatTexture(this.renderer, result.texture)).data;
     const surfels = await this.gi.captureStaticBake(this.renderer, result.seeded);
     if (!surfels) throw new Error('lightmap: nothing was baked');
@@ -263,6 +268,7 @@ export class StaticLight {
     const filled = padLightmapCharts(stacked, size, this.layout.regions, size * pages);
     this.leak?.record('padded', stacked);
     if (filled > 0) console.log(`[lightmap] padded ${filled} unmeasured texels within ${this.layout.regions.length} charts on ${pages} page(s); safe mip ${this.layout.safeMip}`);
+    this.markUnlit(stacked, this.layout.regions, size);
     this.publishAtlas(frameGraph, halfFloatTexture(this.renderer, stacked, size, size * pages));
     await this.captureLeakStages(frameGraph);
     return { pixels: stacked, surfels };
@@ -274,6 +280,44 @@ export class StaticLight {
     leak.record('resident', (await readFloatTexture(this.renderer, this.atlas)).data);
     frameGraph.setLeakTexture(leak.view);
     console.log(`[leak] ${leak.stages.length} stages captured: ${leak.stages.map((stage) => stage.name).join(' -> ')}`);
+  }
+
+  /* @important A texel a chart covers and the bake left at zero is painted loud green before
+     the atlas is published, and it is on by default. A hole in the lightmap otherwise reads as
+     shade - the frame still has the sun and the sky on it - and every "looks lit to me" this
+     branch produced was exactly that mistake. `?zeroGreen=0` turns it off for a capture that
+     has to show the real colours. */
+  private markUnlit(pixels: Float32Array, regions: LightmapRegion[], size: number): number {
+    const threshold = this.url.num('zeroGreen') ?? 1e-4;
+    if (threshold <= 0) return 0;
+    let dark = 0;
+    let uncovered = 0;
+    /* @important Two failures, two colours, because they need different fixes. GREEN: the
+       chart covers this texel and the bake left it at (or below) the threshold - the transport
+       found no light. MAGENTA: the chart's rectangle holds this texel and nothing ever wrote
+       it - neither a surfel, nor the spread, nor the gutter fill - so the surface is not in the
+       atlas at all. Marking only exact zeros hid the second class entirely. */
+    for (const region of regions) {
+      const right = Math.min(size, region.x + region.width);
+      const bottom = region.y + region.height;
+      for (let y = region.y; y < bottom; y++) {
+        for (let x = region.x; x < right; x++) {
+          const texel = (y * size + x) * 4;
+          if (texel + 3 >= pixels.length) continue;
+          if (pixels[texel + 3] < 0.25) {
+            pixels[texel] = 1; pixels[texel + 1] = 0; pixels[texel + 2] = 1;
+            uncovered++;
+            continue;
+          }
+          const luma = 0.2126 * pixels[texel] + 0.7152 * pixels[texel + 1] + 0.0722 * pixels[texel + 2];
+          if (luma > threshold) continue;
+          pixels[texel] = 0; pixels[texel + 1] = 1; pixels[texel + 2] = 0;
+          dark++;
+        }
+      }
+    }
+    if (dark + uncovered > 0) console.warn(`[lightmap] ${dark} chart texel(s) below ${threshold} painted green, ${uncovered} never written painted magenta; ?zeroGreen=0 hides both`);
+    return dark + uncovered;
   }
 
   private publishAtlas(frameGraph: FrameGraph, texture: THREE.Texture): void {

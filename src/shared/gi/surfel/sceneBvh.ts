@@ -61,7 +61,15 @@ export type SceneBVHStats = {
  * slow, it fails to allocate — and the failure mode we refuse to have is a tracer
  * that quietly holds a fraction of the world it claims to represent.
  */
-export const BVH_TRIANGLE_BUDGET = 500_000;
+/* @important Raised from 500k on 2026-09-16, because the demotion it forced is what put the
+   holes in the lightmap. A surfel seeded on a demoted surface sits INSIDE the cluster proxy box
+   that replaced its geometry, so every ray it casts reads as blocked and the texel bakes at
+   zero - not dark, zero. Measured on the village stand at 0.05 m/texel: 111715 charted texels
+   at zero and an atlas mean of 0.0437 with the 500k budget, 37338 and 0.0832 with the scene at
+   full detail (1815596 triangles across 75 meshes were being replaced by 706 boxes). The same
+   mechanism was already recorded for contact rays in contactBvh.ts; it reaches the bake too.
+   4 M triangles is ~432 MB of GPU storage at 108 bytes each, and `?bvhBudget=` still overrides. */
+export const BVH_TRIANGLE_BUDGET = 4_000_000;
 
 /**
  * One drawable copy of one geometry: the object-space template plus the world matrix
