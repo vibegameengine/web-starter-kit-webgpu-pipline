@@ -270,6 +270,15 @@ function installAtlasHooks(p: Pipeline): void {
         meshes: [...meshes].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([name, count]) => `${name}:${count}`) };
     });
   });
+  /* @important The baked atlas itself, texel for texel, so a dark frame can be answered by
+     looking at what the bake produced instead of arguing about it. Alpha is the coverage
+     mark: 1 measured by its own surfel, 0.5 carried or padded, 0 nothing. */
+  hook('__atlasDump', () => {
+    const layout = staticLight.layout;
+    const pixels = staticLight.atlasPixels;
+    if (!layout || !pixels) return null;
+    return { width: staticLight.atlasSize, height: staticLight.atlasHeight(), data: [...pixels] };
+  });
   hook('__chartLight', (name = 'bench') => {
     const layout = staticLight.layout;
     const pixels = staticLight.atlasPixels;
