@@ -92,6 +92,7 @@ export const SCENES: Entry[] = [
       { label: 'разорванные облака', href: '/?scene=sky&cam=horizon&sunAz=-60&sunEl=40&cloudCoverage=0.5&bakeCache=0' },
       { label: 'пасмурно (слоистые)', href: '/?scene=sky&cam=horizon&sunAz=-60&sunEl=40&cloudCoverage=0.97&bakeCache=0' },
       { label: 'тени облаков сверху', href: '/?scene=sky&cam=objects&sunAz=-60&sunEl=55&cloudCoverage=0.55&bakeCache=0' },
+      { label: 'воздушная перспектива ×400', href: '/?scene=sky&cam=horizon&sunAz=-60&sunEl=25&clouds=0&aerialScale=400&bakeCache=0' },
       { label: 'ясно', href: '/?scene=sky&cam=horizon&sunAz=-60&sunEl=40&clouds=0&bakeCache=0' },
       { label: 'без неба (панорама)', href: '/?scene=sky&cam=objects&sky=0' },
     ],

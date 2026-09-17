@@ -714,6 +714,7 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   bindCineGui(gui, p);
   bindLeakGui(gui, p);
   host.bindGui?.(gui);
+  sky?.attachFrameGraph(frameGraph);
   sky?.onEnvironmentCaptured(() => {
     trace.reflections.setAmbient(meanEnvironmentRadiance(gi.envTexture as THREE.DataTexture).multiplyScalar(0.5));
     post.fog.setEnvironment(gi.envTexture as THREE.DataTexture);

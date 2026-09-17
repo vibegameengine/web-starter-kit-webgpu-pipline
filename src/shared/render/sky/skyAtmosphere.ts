@@ -26,6 +26,8 @@ export interface SkyAtmosphereSettings {
   sunDiscScale: number;
   discPeak: number;
   tintSunLight: boolean;
+  aerialPerspective: boolean;
+  aerialDistanceScale: number;
 }
 
 export const DEFAULT_SKY_SETTINGS: SkyAtmosphereSettings = {
@@ -34,6 +36,8 @@ export const DEFAULT_SKY_SETTINGS: SkyAtmosphereSettings = {
   sunDiscScale: 1,
   discPeak: 0.6,
   tintSunLight: true,
+  aerialPerspective: true,
+  aerialDistanceScale: 1,
 };
 
 export class SkyAtmosphere {

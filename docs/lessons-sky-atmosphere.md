@@ -125,6 +125,25 @@ and `composite()` puts the result over the sky in the background node. GUI folde
 - Under overcast the plinth reads very dark. It may be the same unverified shade-fill deficit
   listed below.
 
+## Aerial perspective (step 3 of 3)
+
+`aerialPerspective.ts` builds a camera-aligned volume (32×32 columns, 16 linear slices to 32 km) every
+frame. Each texel holds the in-scattered light and the mean transmittance from the camera to the end
+of that slice. It uses the same medium, phases, planet shadow and multi-scattering LUT as the sky.
+`FrameGraph.setAerialPerspective` applies it to opaque pixels before the local fog, using the linear
+view depth. `?aerial=0`, `?aerialScale=` and the Sky folder's "aerial distance scale" stretch scene
+metres into atmosphere distance, because at scale 1 a 20 m diorama has no visible air (physically
+right). Catalog chip "воздушная перспектива ×400".
+
+- **A TSL `select` over the composite's beauty node blacks out the sky.** The divide-and-conquer
+  record for this is session 1520ae9e. A pass-through apply rendered correctly. The full apply
+  returned without its sky mask also rendered correctly. `select(cond, beauty, beauty)` alone
+  turned the sky black, and the auto exposure then washed the geometry white, which first looked
+  like a distance bug. The sky is now masked with `mix(beauty, hazed, step(depth, far))`.
+- **Samples below the planet surface lost the sun.** A near-horizontal ray kilometres out passes
+  under the ground sphere. The planet-shadow test there cut the direct light, and a hard line ran
+  along the horizon across every object. Samples are lifted to 0.5 m above the surface.
+
 ## Open
 
 - Aerial perspective on geometry: there is no froxel volume yet. The existing volumetric fog is
@@ -134,7 +153,6 @@ and `composite()` puts the result over the sky in the background node. GUI folde
 - The planet ground below the horizon is a flat albedo. A scene with terrain covers it.
 - Spectral integration: the LUTs are RGB.
 - Only the lab opts in; the beach, forest and village still use the panorama.
-- No aerial perspective volume for geometry (step 3).
 - From altitude the 96³ shape volume visibly repeats as rows running to the horizon.
 - Not verified: shadow fill in the shade 2-10x below the panorama's own sky irradiance, and backlit
   clouds that read flat at low sun (the critic's suspicion is the octave weights plus the two-stream

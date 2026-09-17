@@ -127,6 +127,7 @@ export class FrameGraph {
   private readonly camera: THREE.PerspectiveCamera;
   onScreenTextures: ((color: THREE.Texture, depth: THREE.Texture, normal: THREE.Texture) => void) | null = null;
   private atmosphere: ((beauty: TslNode, depth: TslNode) => TslNode) | null = null;
+  private aerialPerspective: ((beauty: TslNode, depth: TslNode) => TslNode) | null = null;
   private glare: { strength: THREE.UniformNode<number>; radius: THREE.UniformNode<number> } | null = null;
   private antialiasing: Antialiasing;
   /** Scene-referred exposure multiplier (a GPU value from the meter), applied after AA, before tone mapping. Null = 1. */
@@ -255,6 +256,12 @@ export class FrameGraph {
   setSplitView(view: SplitView): void {
     if (view === this.splitView) return;
     this.splitView = view;
+    this.needsComposite = true;
+  }
+
+  setAerialPerspective(apply: ((beauty: THREE.Node, depth: THREE.Node) => THREE.Node) | null): void {
+    if (apply === this.aerialPerspective) return;
+    this.aerialPerspective = apply;
     this.needsComposite = true;
   }
 
@@ -457,14 +464,15 @@ export class FrameGraph {
       this.onScreenTextures?.(sceneColor.value as THREE.Texture, this.scenePass.getTexture('depth'), this.scenePass.getTexture('normal'));
     }
 
-    if (this.atmosphere) {
+    if (this.atmosphere || this.aerialPerspective) {
       // The overlay pass clears its depth to the far plane where it drew nothing, so
       // the nearer of the two is the surface the pixel actually shows.
       let depth: TslNode = this.scenePass.getTextureNode('depth');
       if (this.overlayPass) {
         depth = (depth as ReturnType<typeof texture>).min(this.overlayPass.getTextureNode('depth')) as unknown as TslNode;
       }
-      beauty = this.atmosphere(beauty, depth).toInspector('Atmosphere / Fogged') as unknown as TslNode;
+      if (this.aerialPerspective) beauty = this.aerialPerspective(beauty, depth).toInspector('Atmosphere / Aerial perspective') as unknown as TslNode;
+      if (this.atmosphere) beauty = this.atmosphere(beauty, depth).toInspector('Atmosphere / Fogged') as unknown as TslNode;
     }
 
     if (this.glare) {

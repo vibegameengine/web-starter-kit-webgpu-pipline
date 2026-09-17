@@ -65,7 +65,9 @@
   loaded panorama in place. Reflections and fog ambient follow each capture; the atlas and probes follow
   only through "bake light from this sky" (GUI Sky, `__skyBake`), which waits for the capture first.
   Volumetric clouds (`cloud*.ts`) cast shadows through a top-down transmittance map multiplied into the
-  sun's shadow filter, and are traced into the panorama (512x256) so reflections and a new bake see them. Host opt-in `sky: {}`, `?sky=0 skyAltitude= sunDiscScale=
+  sun's shadow filter, and are traced into the panorama (512x256) so reflections and a new bake see them.
+  Aerial perspective: a 32x32x16 froxel volume to 32 km applied before the fog (`FrameGraph.setAerialPerspective`,
+  `?aerial=0 aerialScale=`); never use a TSL `select` over the composite beauty node there, it blacks the sky. Host opt-in `sky: {}`, `?sky=0 skyAltitude= sunDiscScale=
   skyEnvironment=0`, GUI folder Sky, hook `__sky`, lab `?scene=sky` (R3F) with catalog chips,
   `scripts/check-sky.mjs`. Details in [lessons-sky-atmosphere.md](docs/lessons-sky-atmosphere.md).
 

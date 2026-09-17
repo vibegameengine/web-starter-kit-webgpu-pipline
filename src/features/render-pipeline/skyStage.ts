@@ -1,7 +1,8 @@
 import type GUI from 'lil-gui';
 import * as THREE from 'three/webgpu';
 import { positionWorld } from 'three/tsl';
-import { CloudLayer, CloudShadowMap, DEFAULT_CLOUD_SETTINGS, SkyAtmosphere, SkyEnvironment } from '../../shared/render/sky/index.ts';
+import { AerialPerspective, CloudLayer, CloudShadowMap, DEFAULT_CLOUD_SETTINGS, SkyAtmosphere, SkyEnvironment } from '../../shared/render/sky/index.ts';
+import type { FrameGraph } from '../../shared/render/index.ts';
 import type { SunControls } from './sun.ts';
 import { hook, type SceneHost, type UrlParams } from './host.ts';
 
@@ -22,6 +23,9 @@ export class SkyStage {
   private readonly cloudySky: THREE.Node;
   readonly clouds: CloudLayer;
   readonly cloudShadow: CloudShadowMap;
+  readonly aerial: AerialPerspective;
+  private frameGraph: FrameGraph | null = null;
+  private readonly applyAerial = (beauty: THREE.Node, depth: THREE.Node) => this.aerial.apply(beauty, depth) as THREE.Node;
   private lastCaptureMs = 0;
   private cloudSettingsSeen = '';
   private environment: SkyEnvironment | null = null;
@@ -35,7 +39,10 @@ export class SkyStage {
       ...host.sky,
       altitudeKm: url.num('skyAltitude') ?? host.sky?.altitudeKm ?? 0,
       sunDiscScale: url.num('sunDiscScale') ?? host.sky?.sunDiscScale ?? 1,
+      aerialPerspective: url.flag('aerial', host.sky?.aerialPerspective ?? true),
+      aerialDistanceScale: url.num('aerialScale') ?? host.sky?.aerialDistanceScale ?? 1,
     });
+    this.aerial = new AerialPerspective(renderer, this.atmosphere);
     this.clouds = new CloudLayer(renderer, this.atmosphere, { ...host.clouds, enabled: url.flag('clouds', host.clouds?.enabled ?? true), resolutionDivisor: url.num('cloudRes') ?? host.clouds?.resolutionDivisor ?? 2, coverage: url.num('cloudCoverage') ?? host.clouds?.coverage ?? DEFAULT_CLOUD_SETTINGS.coverage });
     this.cloudShadow = new CloudShadowMap(renderer, this.atmosphere, this.clouds);
     this.shadeSunlightUnderClouds();
@@ -59,6 +66,11 @@ export class SkyStage {
     this.environmentTexture = environment;
     this.update();
     await this.capture();
+  }
+
+  attachFrameGraph(frameGraph: FrameGraph): void {
+    this.frameGraph = frameGraph;
+    this.apply();
   }
 
   onEnvironmentCaptured(listener: () => void): void {
@@ -86,6 +98,7 @@ export class SkyStage {
     const cloudy = this.clouds.settings.enabled;
     if (cloudy) this.clouds.update(this.host.camera, performance.now() / 1000);
     this.cloudShadow.update(this.host.camera, cloudy);
+    if (this.atmosphere.settings.aerialPerspective) this.aerial.update(this.host.camera, this.atmosphere.settings.aerialDistanceScale);
     if (this.environment) this.environment.cloudPresence.value = cloudy ? 1 : 0;
     this.recaptureWhenSunMoved();
   }
@@ -118,6 +131,8 @@ export class SkyStage {
     folder.add(settings, 'sunDiscScale', 0.5, 8, 0.1).name('sun disc size');
     folder.add(settings, 'tintSunLight').name('sun light through air');
     folder.add(settings, 'discPeak', 0.2, 20, 0.1).name('sun disc brightness');
+    folder.add(settings, 'aerialPerspective').name('aerial perspective').onChange(() => this.apply());
+    folder.add(settings, 'aerialDistanceScale', 1, 500, 1).name('aerial distance scale');
     this.bindBakeStatus(folder, bake);
     folder.add(parameters, 'mieScattering', 0, 0.05, 0.0005).name('haze (Mie, 1/km)').onChange(rebuild);
     folder.add(parameters, 'mieScaleHeightKm', 0.2, 5, 0.05).name('haze height (km)').onChange(rebuild);
@@ -174,5 +189,6 @@ export class SkyStage {
   private apply(): void {
     this.host.scene.backgroundNode = this.enabled ? (this.clouds.settings.enabled ? this.cloudySky : this.clearSky) : null;
     if (!this.enabled) this.host.sun.color.setRGB(1, 1, 1);
+    this.frameGraph?.setAerialPerspective(this.enabled && this.atmosphere.settings.aerialPerspective ? this.applyAerial : null);
   }
 }
