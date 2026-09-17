@@ -41,6 +41,19 @@ export const DEFAULT_CLOUD_SETTINGS: CloudSettings = {
 };
 
 const COVERAGE_TO_THRESHOLD = 0.75;
+const GOLDEN = 1.6180339887;
+const WEATHER_SCALE = 0.23;
+const WARP_KM = 3;
+
+function turn(degrees: number): { cos: number; sin: number } {
+  const radians = (degrees * Math.PI) / 180;
+  return { cos: Math.cos(radians), sin: Math.sin(radians) };
+}
+
+const WEATHER_TURN_A = turn(23);
+const WEATHER_TURN_B = turn(-67);
+const SHAPE_TURN_A = turn(37);
+const SHAPE_TURN_B = turn(-52);
 
 export class CloudUniforms {
   readonly coverage = uniform(0);
@@ -81,18 +94,43 @@ function heightProfile(fraction: N): N {
   return base.mul(top);
 }
 
+function turned(point: N, turn: { cos: number; sin: number }): N {
+  return vec3(point.x.mul(turn.cos).sub(point.z.mul(turn.sin)), point.y, point.x.mul(turn.sin).add(point.z.mul(turn.cos)));
+}
+
+/* @important The volumes tile, and a tiling lattice aligned with the world axes lines identical clouds up
+   along whatever axis the camera looks down: streaks converging on the vanishing point, reproduced in the
+   lab with the temporal history off (shots/streaks/axis-shape5.png), so not a reprojection smear. Every
+   lookup is now two samples of the same volume on lattices turned by unrelated angles and scaled by the
+   golden ratio, whose periods never coincide, and the weather map warps the horizontal position before
+   the shape is read, so no row of clouds repeats in a straight line. */
+function weatherAt(volumes: CloudNoiseVolumes, clouds: CloudUniforms, sample: N): N {
+  const flat = vec3(sample.x, 0, sample.z).mul(clouds.shapeFrequency.mul(WEATHER_SCALE));
+  const broad = texture3D(volumes.shape, turned(flat, WEATHER_TURN_A)).level(float(0)).b;
+  const fine = texture3D(volumes.shape, turned(flat, WEATHER_TURN_B).mul(GOLDEN).add(0.37)).level(float(0)).b;
+  return broad.mul(0.6).add(fine.mul(0.4));
+}
+
+function shapeAt(volumes: CloudNoiseVolumes, clouds: CloudUniforms, sample: N, warp: N): N {
+  const warped = sample.add(vec3(warp, 0, warp.negate()).mul(WARP_KM));
+  const lattice = warped.mul(clouds.shapeFrequency);
+  const first = texture3D(volumes.shape, turned(lattice, SHAPE_TURN_A)).level(float(0));
+  const second = texture3D(volumes.shape, turned(lattice, SHAPE_TURN_B).mul(GOLDEN).add(0.61)).level(float(0));
+  return vec3(first.r.mul(0.6).add(second.r.mul(0.4)), first.g.mul(0.5).add(second.g.mul(0.5)), 0);
+}
+
 export function cloudDensity(volumes: CloudNoiseVolumes, clouds: CloudUniforms, position: N, withDetail: boolean): N {
   const radius = length(position);
   const fraction = radius.sub(clouds.bottomRadius).div(clouds.thickness);
   const sample = vec3(position.x, radius, position.z).add(clouds.offset);
-  const shape = texture3D(volumes.shape, sample.mul(clouds.shapeFrequency)).level(float(0));
-  const weather = texture3D(volumes.shape, vec3(sample.x, 0, sample.z).mul(clouds.shapeFrequency.mul(0.23))).level(float(0)).b;
+  const weather = weatherAt(volumes, clouds, sample);
+  const shape = shapeAt(volumes, clouds, sample, weather.sub(0.5));
   const regions = remap(weather, float(0.3), float(0.7));
   const coverage = clouds.coverage.mul(regions.mul(0.7).add(0.5)).clamp(0, 1);
-  const billow = remap(shape.r, shape.g.oneMinus().mul(0.6), float(1));
+  const billow = remap(shape.x, shape.y.oneMinus().mul(0.6), float(1));
   const body = remap(billow.mul(heightProfile(fraction.clamp(0, 1))), float(1).sub(coverage.mul(COVERAGE_TO_THRESHOLD)), float(1));
   if (!withDetail) return body.mul(clouds.density);
-  const detail = texture3D(volumes.detail, sample.mul(clouds.detailFrequency)).level(float(0)).r;
+  const detail = texture3D(volumes.detail, turned(sample, SHAPE_TURN_B).mul(clouds.detailFrequency)).level(float(0)).r;
   const erosion = detail.mul(clouds.detailErosion).mul(fraction.mul(0.6).add(0.4));
   return remap(body, erosion, float(1)).mul(clouds.density);
 }

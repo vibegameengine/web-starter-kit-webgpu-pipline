@@ -144,6 +144,19 @@ right). Catalog chip "воздушная перспектива ×400".
   under the ground sphere. The planet-shadow test there cut the direct light, and a hard line ran
   along the horizon across every object. Samples are lifted to 0.5 m above the surface.
 
+## Cloud streaks to the vanishing point (2026-09-17)
+
+The user saw clouds lined up in straight rows that converged on the vanishing point, in the mustang
+worktree's `?scene=car`. The lab reproduces it with the camera looking down the -z axis. It survives
+`historyWeight: 0` (`shots/streaks/axis-nohistory.png`), and a 5 km shape scale makes it strongest
+(`shots/streaks/axis-shape5.png`), so it is the tiling volumes and not a reprojection smear.
+Identical clouds repeat every period along the axis the camera looks down. `cloudDensity` now reads
+the shape and the weather map twice each, on lattices turned by unrelated angles (37/-52 and
+23/-67 degrees), with the second lattice scaled by the golden ratio. The weather also warps the
+horizontal position by up to ±1.5 km before the shape is read. The same views show no rows
+afterwards (`shots/streaks/fixed2-shape5.png`, `fixed2-coverage06.png`). The cost is two more
+volume reads per density sample.
+
 ## Open
 
 - Aerial perspective on geometry: there is no froxel volume yet. The existing volumetric fog is
@@ -153,7 +166,6 @@ right). Catalog chip "воздушная перспектива ×400".
 - The planet ground below the horizon is a flat albedo. A scene with terrain covers it.
 - Spectral integration: the LUTs are RGB.
 - Only the lab opts in; the beach, forest and village still use the panorama.
-- From altitude the 96³ shape volume visibly repeats as rows running to the horizon.
 - Not verified: shadow fill in the shade 2-10x below the panorama's own sky irradiance, and backlit
   clouds that read flat at low sun (the critic's suspicion is the octave weights plus the two-stream
   term). Both still need an ablation.

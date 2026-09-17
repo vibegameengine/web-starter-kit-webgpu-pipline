@@ -8,7 +8,7 @@ await page.goto(`http://127.0.0.1:${port}/?scene=sky&cam=${process.env.CAM ?? 'h
 const ok = await page.waitForFunction(() => window.__sky && document.querySelector('#loading-overlay')?.hidden, null, { timeout: 150000 }).then(() => true).catch(() => false);
 if (!ok || errors.length) { console.log('FAIL', errors.slice(0, 4)); await browser.close(); process.exit(1); }
 for (const [index, variant] of variants.entries()) {
-  await page.evaluate((v) => { Object.assign(window.__sky.clouds, v.clouds ?? {}); if (v.sun) window.__audit.sun(...v.sun); }, variant);
+  await page.evaluate((v) => { Object.assign(window.__sky.clouds, v.clouds ?? {}); if (v.sun) window.__audit.sun(...v.sun); if (v.camera) window.__camera(...v.camera); }, variant);
   await page.waitForTimeout(3500);
   if (errors.length) { console.log('FAIL', errors.slice(0, 4)); break; }
   await page.screenshot({ path: `${process.env.OUT}/${variant.name ?? index}.png` });
