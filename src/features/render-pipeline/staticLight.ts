@@ -231,13 +231,7 @@ export class StaticLight {
     const stride = sampleMetres > 0 && this.layout.metresPerTexel > 0
       ? Math.max(1, Math.round(sampleMetres / this.layout.metresPerTexel))
       : 1;
-    /* @important Quality is a sample count per texel, not a share of a clock. Fifteen seconds split
-       over four windows of lod-scale left each window 93 passes and the walls came out mottled with
-       blotches half a metre wide; 200 passes a window gave the smooth light the single bake had. A
-       window now runs its passes and the bake takes as long as the world needs; `?bakeSeconds=`
-       still caps a window when someone asks for a fast, noisier bake. */
-    const windowCapMs = (this.url.num('bakeSeconds') ?? 0) * 1000;
-    const budgetMs = DEFAULT_BAKE_SECONDS * 1000;
+    const budgetMs = (this.url.num('bakeSeconds') ?? DEFAULT_BAKE_SECONDS) * 1000;
     const cache = await this.gi.bakeBounceCache(this.renderer, this.scene, {
       budget: this.url.num('bounceCache') ?? DEFAULT_BOUNCE_CACHE_SURFELS,
       passes: this.bakeParams.passes,
@@ -249,13 +243,13 @@ export class StaticLight {
 
     const windows = this.bakeWindows(size, height);
     const pixels = new Float32Array(size * height * 4);
-    const bakeStarted = performance.now();
+    const windowBudget = (budgetMs * (1 - BOUNCE_CACHE_BUDGET_SHARE)) / Math.max(1, windows.length);
     let covered = 0;
     for (const [index, window] of windows.entries()) {
       bootNote(`Baking lightmap window ${index + 1} of ${windows.length}`);
-      covered += await this.bakeWindow(contactTree, window, { cache, stride, budgetMs: windowCapMs, pixels, size, height });
+      covered += await this.bakeWindow(contactTree, window, { cache, stride, budgetMs: windowBudget, pixels, size, height });
     }
-    console.log(`[lightmap] ${windows.length} window(s) of ${BAKE_WINDOW}² over a ${size}x${height} atlas, ${covered} covered texels, bounce cache ${cache.count} surfels, ${((performance.now() - bakeStarted) / 1000).toFixed(1)} s`);
+    console.log(`[lightmap] ${windows.length} window(s) of ${BAKE_WINDOW}² over a ${size}x${height} atlas, ${covered} covered texels, bounce cache ${cache.count} surfels`);
     if (covered === 0) throw new Error('lightmap: the atlas rasterised zero texels');
     console.log(`[bake] the tracer carried ${giLightSummary().length} analytic light(s) through this bake`);
     this.leak?.record('blit', pixels);
