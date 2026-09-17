@@ -8,7 +8,6 @@ import {
   normalGeometry,
   positionGeometry,
   varying,
-  vec2,
   vec4,
 } from 'three/tsl';
 import { Layer } from '../../world/index.ts';
@@ -40,14 +39,6 @@ export async function measureCoverage(
   return { covered, total, fraction: covered / total };
 }
 
-export interface AtlasWindow {
-  x: number;
-  y: number;
-  size: number;
-  atlasWidth: number;
-  atlasHeight: number;
-}
-
 export interface LightmapGBuffer {
   target: THREE.RenderTarget;
   /** xyz = world position, w = 1 where a chart covers the texel. */
@@ -72,9 +63,8 @@ export function rasteriseLightmapGBuffer(
   scene: THREE.Scene,
   size: number,
   pages = 1,
-  window?: AtlasWindow,
 ): LightmapGBuffer {
-  const target = new THREE.RenderTarget(window ? window.size : size, window ? window.size : size * pages, {
+  const target = new THREE.RenderTarget(size, size * pages, {
     count: 2,
     type: THREE.FloatType,
     format: THREE.RGBAFormat,
@@ -120,12 +110,9 @@ export function rasteriseLightmapGBuffer(
      required that - the seeder, the denoiser and the blit have always taken a height. What
      the surfel pool limits is the number of COVERED texels, not the number of pages. */
   const bakeMaterial = new THREE.MeshBasicNodeMaterial();
-  const windowUv = window
-    ? atlasUv.mul(vec2(window.atlasWidth, window.atlasHeight)).sub(vec2(window.x, window.y)).div(float(window.size))
-    : atlasUv;
   bakeMaterial.vertexNode = vec4(
-    windowUv.x.mul(2).sub(1),
-    windowUv.y.mul(2).sub(1).negate(),
+    atlasUv.x.mul(2).sub(1),
+    atlasUv.y.mul(2).sub(1).negate(),
     float(0),
     1,
   );

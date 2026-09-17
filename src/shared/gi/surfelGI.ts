@@ -1126,48 +1126,6 @@ export class SurfelGI {
     }
   }
 
-  /* @important The bounce cache has a fixed size and the world does not decide it. Surfels are
-     spread over every static surface with a budget, so a larger world gets them further apart,
-     never more of them; the lightmap windows then read their second bounce from this cache and
-     keep their own light in their own texels. Before this the pool held one surfel per lattice
-     point of the whole atlas, and a 60 m ground plate alone asked for more than the pool had. */
-  async bakeBounceCache(
-    renderer: THREE.WebGPURenderer,
-    scene: THREE.Scene,
-    options: { budget: number; passes: number; budgetMs: number; raysPerSurfel: number; onProgress?: (fraction: number) => void },
-  ): Promise<FrozenSurfelData | null> {
-    if (!this.bvh || !this.dynamicBvh || !this.integrate) return null;
-    this.resetCache(renderer);
-    this.lightmapSurfels = null;
-    this.lightmapFilterLinks = null;
-    this.geometrySeeder = null;
-    const seeded = this.seedFromGeometry(renderer, scene, options.budget);
-    if (seeded === 0) return null;
-    this.setBaseSampleCount(options.raysPerSurfel);
-    const camera = new THREE.PerspectiveCamera();
-    camera.position.copy(this.staticBounds(scene).getCenter(new THREE.Vector3()));
-    camera.updateMatrixWorld();
-    const minimumPasses = Math.min(options.passes, TARGET_SAMPLE_COUNT);
-    const started = performance.now();
-    let passes = 0;
-    for (; passes < options.passes; passes++) {
-      if (passes >= minimumPasses && performance.now() - started >= options.budgetMs) break;
-      renderer.info.frame++;
-      this.grid.build(renderer, this.pool, camera);
-      this.integratorArgs.run(renderer, this.pool);
-      this.integrate.run(renderer, this.pool, this.bvh, this.dynamicBvh, this.grid, camera, scene, this.integratorArgs.getIndirectAttr(), { includeDynamic: false });
-      this.pool.swapMoments();
-      options.onProgress?.(Math.min(1, (performance.now() - started) / Math.max(1, options.budgetMs)));
-      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
-      await (renderer.backend as { device?: GPUDevice }).device?.queue.onSubmittedWorkDone();
-    }
-    this.immortaliser.run(renderer, this.pool);
-    this.setBaseSampleCount(this.runtimeSampleCount);
-    const cache = await this.captureStaticBake(renderer, seeded);
-    console.log(`[bake] bounce cache: ${seeded} surfels over the static world, ${passes} passes in ${((performance.now() - started) / 1000).toFixed(1)} s`);
-    return cache;
-  }
-
   /**
    * Fills the pool from the static geometry, growing it first if the sample set needs
    * more slots than it currently holds.
@@ -1180,11 +1138,10 @@ export class SurfelGI {
   private seedFromGeometry(
     renderer: THREE.WebGPURenderer,
     scene: THREE.Scene,
-    requestedBudget = 0,
   ): number {
     if (!this.bvh) return 0;
 
-    const override = requestedBudget > 0 ? requestedBudget : giKnobs.geometrySeedBudget();
+    const override = giKnobs.geometrySeedBudget();
     const budget = Math.min(
       MAX_SURFELS,
       override > 0 ? override : Math.max(SURFEL_POOL_BASE, 65536),
@@ -1380,7 +1337,6 @@ export class SurfelGI {
       /** Milliseconds the integration may take; 0 runs `iterations` passes regardless. */
       budgetMs?: number;
       regions?: { x: number; y: number; width: number; height: number }[];
-      bounceCache?: FrozenSurfelData | null;
       onStage?: (name: string, pixels: Float32Array) => void;
       onProgress?: (fraction: number, iteration: number) => void;
     } = {},
@@ -1409,7 +1365,6 @@ export class SurfelGI {
       sampleFallback = true,
       budgetMs = 0,
       regions = [],
-      bounceCache = null,
       onStage,
       onProgress,
     } = options;
@@ -1419,8 +1374,7 @@ export class SurfelGI {
     // ~143 k of them. Growing here rather than discovering the shortfall during seeding
     // is what stops the tail of the atlas baking black — and this is the safe moment to
     // do it, because `resetCache` has already thrown the runtime cache away.
-    this.ensurePoolCapacity(renderer, Math.min(MAX_SURFELS, size * height + (bounceCache?.count ?? 0)));
-    if (bounceCache) this.restoreStaticBake(renderer, bounceCache, true);
+    this.ensurePoolCapacity(renderer, Math.min(MAX_SURFELS, size * height));
 
     /** @important The filter links belong to the page's own surfel set: keeping the
      * first page's buffer while `lm` was rebuilt wrote a later beach page entirely
