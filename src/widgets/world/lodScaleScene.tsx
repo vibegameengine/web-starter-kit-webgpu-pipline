@@ -15,7 +15,7 @@ export interface LodScaleScene {
   update: (elapsedSeconds: number) => void;
 }
 
-const GROUND_METRES = 24;
+const DEFAULT_GROUND_METRES = 24;
 const PERGOLA_SPAN = 8;
 const PERGOLA_HEIGHT = 2.6;
 const SLAT_PITCH = 0.5;
@@ -140,6 +140,7 @@ export async function createLodScaleScene(renderer: THREE.WebGPURenderer): Promi
   camera.near = 0.05;
   camera.far = 400;
   const params = new URLSearchParams(location.search);
+  const groundMetres = Number(params.get('ground') ?? DEFAULT_GROUND_METRES);
   const [position, target] = CAMERA_PRESETS[params.get('cam') ?? ''] ?? CAMERA_PRESETS.overview;
   camera.position.fromArray(position);
   controls.target.fromArray(target);
@@ -157,7 +158,7 @@ export async function createLodScaleScene(renderer: THREE.WebGPURenderer): Promi
   await bootStage('LOD scale stand: ground, pergola, cabins, wall', () => fiber.render(
     <group name="lod-scale">
       <StaticGroup name="ground">
-        <mesh name="ground-slab" position={[0, -0.1, 0]}><boxGeometry args={[GROUND_METRES, 0.2, GROUND_METRES]}/><meshStandardMaterial color="#77736b" roughness={1}/></mesh>
+        <mesh name="ground-slab" position={[0, -0.1, 0]}><boxGeometry args={[groundMetres, 0.2, groundMetres]}/><meshStandardMaterial color="#77736b" roughness={1}/></mesh>
       </StaticGroup>
       <Pergola/>
       <group position={[6, 0, -4]}>

@@ -13,7 +13,7 @@ mkdirSync(out, { recursive: true });
 const browser = await chromium.launch({ channel: 'chrome', headless: false, args: ['--enable-unsafe-webgpu', '--ignore-gpu-blocklist'] });
 const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
 page.on('pageerror', (error) => { console.error('pageerror:', String(error).slice(0, 300)); process.exit(3); });
-page.on('console', (message) => { const text = message.text(); if (/\[lod\]|\[lightmap\] \d+ meshes|refused|exhausted/.test(text)) console.log('  console:', text.slice(0, 260)); });
+page.on('console', (message) => { const text = message.text(); if (/\[lod\]|\[lightmap\]|\[bake|refused|exhausted|error/i.test(text)) console.log('  console:', text.slice(0, 260)); });
 const frames = (count) => page.evaluate((n) => new Promise((resolve) => { let i = 0; const tick = () => (++i > n ? resolve() : requestAnimationFrame(tick)); requestAnimationFrame(tick); }), count);
 for (const cam of cams) {
   await page.goto(`http://127.0.0.1:${port}/?scene=${scene}&cam=${cam}${extra}`);
