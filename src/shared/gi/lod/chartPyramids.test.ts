@@ -30,16 +30,23 @@ function storeTexel(set: ChartPyramidSet, key: number, x: number, y: number): nu
 describe('ChartPyramidSet', () => {
   it('tiles every level wider than a tile and puts the first level that fits into the tail', () => {
     const regions = [{ x: 0, y: 0, width: 200, height: 100 }];
-    const set = new ChartPyramidSet({ atlas: atlasWith([{ ...regions[0], value: 1 }]), atlasWidth: ATLAS_WIDTH, regions, tileSize: 64 });
+    const set = new ChartPyramidSet({ pages: [atlasWith([{ ...regions[0], value: 1 }])], pageSize: ATLAS_WIDTH, regions, tileSize: 64 });
     expect(set.charts[0].tailLevel).toBe(2);
     expect(set.tiles.filter((tile) => tile.level === 0)).toHaveLength(4 * 2);
     expect(set.tiles.filter((tile) => tile.level === 1)).toHaveLength(2 * 1);
     expect(set.tiles).toHaveLength(10);
   });
 
+  it('cuts a chart out of the page its region lies on', () => {
+    const pageOne = atlasWith([{ x: 10, y: 20, width: 100, height: 70, value: 7 }]);
+    const regions = [{ x: 10, y: ATLAS_WIDTH + 20, width: 100, height: 70 }];
+    const set = new ChartPyramidSet({ pages: [atlasWith([]), pageOne], pageSize: ATLAS_WIDTH, regions, tileSize: 64 });
+    for (const key of set.tiles.keys()) expect(Array.from(set.tiles[key].pixels.subarray(0, 4))).toEqual([7, 7, 7, 1]);
+  });
+
   it('keeps a small chart entirely in the tail', () => {
     const regions = [{ x: 10, y: 10, width: 40, height: 20 }];
-    const set = new ChartPyramidSet({ atlas: atlasWith([{ ...regions[0], value: 1 }]), atlasWidth: ATLAS_WIDTH, regions, tileSize: 64 });
+    const set = new ChartPyramidSet({ pages: [atlasWith([{ ...regions[0], value: 1 }])], pageSize: ATLAS_WIDTH, regions, tileSize: 64 });
     expect(set.charts[0].tailLevel).toBe(0);
     expect(set.tiles).toHaveLength(0);
   });
@@ -49,7 +56,7 @@ describe('ChartPyramidSet', () => {
       { x: 0, y: 0, width: 300, height: 300, value: 0 },
       { x: 300, y: 0, width: 200, height: 300, value: 5 },
     ];
-    const set = new ChartPyramidSet({ atlas: atlasWith(regions), atlasWidth: ATLAS_WIDTH, regions, tileSize: 64 });
+    const set = new ChartPyramidSet({ pages: [atlasWith(regions)], pageSize: ATLAS_WIDTH, regions, tileSize: 64 });
     for (const [key, tile] of set.tiles.entries()) {
       const expected = regions[tile.chart].value;
       for (let y = 0; y < set.physicalTile; y += 7) {
@@ -70,7 +77,7 @@ describe('ChartPyramidSet', () => {
 
   it('borders a tile with the real neighbouring texels of the same level', () => {
     const region = { x: 0, y: 0, width: 200, height: 70 };
-    const set = new ChartPyramidSet({ atlas: gradientAtlas(region), atlasWidth: ATLAS_WIDTH, regions: [region], tileSize: 64 });
+    const set = new ChartPyramidSet({ pages: [gradientAtlas(region)], pageSize: ATLAS_WIDTH, regions: [region], tileSize: 64 });
     const second = set.tileKey(0, 0, 1, 0);
     expect(storeTexel(set, second, 0, TILE_BORDER)).toEqual([62, 0, 0, 1]);
     expect(storeTexel(set, second, TILE_BORDER, TILE_BORDER)).toEqual([64, 0, 0, 1]);
@@ -80,7 +87,7 @@ describe('ChartPyramidSet', () => {
 
   it('resolves an atlas texel to the tile that holds it and walks to the parent', () => {
     const region = { x: 100, y: 50, width: 300, height: 130 };
-    const set = new ChartPyramidSet({ atlas: gradientAtlas(region), atlasWidth: ATLAS_WIDTH, regions: [region], tileSize: 64 });
+    const set = new ChartPyramidSet({ pages: [gradientAtlas(region)], pageSize: ATLAS_WIDTH, regions: [region], tileSize: 64 });
     const key = set.tileAt(0, 0, 100 + 200, 50 + 70)!;
     expect(set.tiles[key]).toMatchObject({ level: 0, tileX: 3, tileY: 1 });
     const parent = set.parentKey(key)!;
@@ -94,7 +101,7 @@ describe('TileResidency', () => {
     { x: 0, y: 0, width: 256, height: 256 },
     { x: 256, y: 0, width: 256, height: 256 },
   ];
-  const build = () => new ChartPyramidSet({ atlas: atlasWith(regions.map((region, index) => ({ ...region, value: index }))), atlasWidth: ATLAS_WIDTH, regions, tileSize: 64 });
+  const build = () => new ChartPyramidSet({ pages: [atlasWith(regions.map((region, index) => ({ ...region, value: index })))], pageSize: ATLAS_WIDTH, regions, tileSize: 64 });
 
   it('points every tile at its tail before anything is resident', () => {
     const set = build();

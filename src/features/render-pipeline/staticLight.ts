@@ -2,11 +2,12 @@ import * as THREE from 'three/webgpu';
 import { uniform } from 'three/tsl';
 import type { SurfelGI } from '../../shared/gi/index.ts';
 import { applyLightmap, assignLightmapUvs, measureCoverage, rasteriseLightmapGBuffer, type LightmapLayout } from '../../shared/gi/bake/index.ts';
+import type { LightmapGBuffer } from '../../shared/gi/bake/lightmapGBuffer.ts';
 import { padLightmapCharts, type LightmapRegion } from '../../shared/gi/bake/chartPadding.ts';
 import { BakeLeakStages, leakHookApi } from '../../shared/gi/bake/leakStages.ts';
 import { bakeKey, loadBake, loadBakeManifest, saveBake } from '../../shared/gi/bake/persistedBake.ts';
 import { captureLightingProvenance, compareLightingProvenance, describeProvenance, environmentDigest, transportDigest, type LightingProvenance, type ProvenanceStatus } from '../../shared/gi/bake/lightingProvenance.ts';
-import { readFloatAttachment, readFloatTexture } from '../../shared/render/gpuReadback.ts';
+import { readFloatTexture } from '../../shared/render/gpuReadback.ts';
 import { LightmapLod } from '../../shared/gi/lod/index.ts';
 import { MAX_SURFELS, MAX_TEMPORAL_M } from '../../shared/gi/surfel/constants.ts';
 import { giLightSummary } from '../../shared/gi/surfel/sceneLights.ts';
@@ -33,7 +34,7 @@ const DEFAULT_LOD_FEEDBACK_SPACING = 4;
 
 export interface BakeCacheState { source: string; storage: string; key: string; saved: boolean; error: string; probes: string }
 
-interface AtlasResult { pixels: Float32Array; surfels: FrozenSurfelData | null; probes?: ProbeVolumeStorage; fresh: boolean }
+interface AtlasResult { pages: Float32Array[]; surfels: FrozenSurfelData | null; probes?: ProbeVolumeStorage; fresh: boolean }
 
 function halfFloatTexture(renderer: THREE.WebGPURenderer, pixels: Float32Array, size: number, height = size): THREE.DataTexture {
   const texture = new THREE.DataTexture(Uint16Array.from(pixels, THREE.DataUtils.toHalfFloat), size, height, THREE.RGBAFormat, THREE.HalfFloatType);
@@ -41,6 +42,17 @@ function halfFloatTexture(renderer: THREE.WebGPURenderer, pixels: Float32Array, 
   texture.needsUpdate = true;
   renderer.initTexture(texture);
   return texture;
+}
+
+function stackPages(pages: Float32Array[]): Float32Array {
+  const stacked = new Float32Array(pages.reduce((total, page) => total + page.length, 0));
+  let offset = 0;
+  for (const page of pages) { stacked.set(page, offset); offset += page.length; }
+  return stacked;
+}
+
+function splitPages(pixels: Float32Array, size: number, count: number): Float32Array[] {
+  return Array.from({ length: count }, (_, page) => pixels.subarray(page * size * size * 4, (page + 1) * size * size * 4));
 }
 
 function staticBounds(scene: THREE.Scene): THREE.Box3 {
@@ -60,7 +72,7 @@ export class StaticLight {
   readonly bakeCache: BakeCacheState = { source: 'none', storage: 'none', key: '', saved: false, error: '', probes: 'none' };
   layout: LightmapLayout | null = null;
   atlas: THREE.Texture | null = null;
-  atlasPixels: Float32Array | null = null;
+  atlasPages: Float32Array[] = [];
   lod: LightmapLod | null = null;
   leak: BakeLeakStages | null = null;
   probes: ProbeVolume | null = null;
@@ -70,7 +82,6 @@ export class StaticLight {
   private probeIntensity = 1;
   ready = false;
   private gbuffer: ReturnType<typeof rasteriseLightmapGBuffer> | null = null;
-  private coverage = 0;
   private busy = false;
   private bakedProvenance: LightingProvenance | null = null;
   private digests = { environment: 'pending', transport: 'pending' };
@@ -112,11 +123,11 @@ export class StaticLight {
       frameGraph.setGiTextures(null, null);
       const bakeTree = options.bakeTree ?? (() => null);
       const atlas = await this.prepareAtlas(frameGraph, options.forceBake === true, bakeTree);
-      this.atlasPixels = atlas.pixels;
-      this.enableLod(atlas.pixels);
+      this.atlasPages = atlas.pages;
+      this.enableLod(atlas.pages);
       this.atlasIntensity.value = this.atlasParams.intensity;
       const probesBaked = await this.prepareProbes(bakeTree, atlas.probes, options.interiorVolumes ?? []);
-      if ((atlas.fresh || probesBaked) && atlas.surfels) await this.save(atlas.pixels, atlas.surfels);
+      if ((atlas.fresh || probesBaked) && atlas.surfels) await this.save(atlas.pages, atlas.surfels);
       this.gi.setFrozen(true);
       this.ready = true;
     } finally {
@@ -142,12 +153,13 @@ export class StaticLight {
         } else if (saved) {
           bootNote('Restoring the saved static lighting');
           this.gi.restoreStaticBake(this.renderer, saved.surfels, this.url.get('atlasSurfels') === '1');
-          this.markUnlit(saved.pixels, this.layout?.regions ?? [], saved.size);
-          this.publishAtlas(frameGraph, halfFloatTexture(this.renderer, saved.pixels, saved.size, saved.size * (saved.pages ?? 1)));
+          const pages = splitPages(saved.pixels, saved.size, saved.pages ?? 1);
+          pages.forEach((page, index) => this.markUnlit(page, this.pageRegions(index), saved.size));
+          this.publishPages(frameGraph, pages);
           Object.assign(cache, { source: 'saved', storage: 'bundle', saved: true });
           this.bakedProvenance = ((await loadBakeManifest(cache.key).catch(() => null))?.provenance as LightingProvenance | undefined) ?? null;
           console.log(`[bake-cache] restored ${cache.key}, indirect light ${this.bakeStatusText()}`);
-          return { pixels: saved.pixels, surfels: saved.surfels, probes: saved.probes, fresh: false };
+          return { pages, surfels: saved.surfels, probes: saved.probes, fresh: false };
         }
       } catch (error) {
         cache.error = String(error);
@@ -183,14 +195,14 @@ export class StaticLight {
     return describeProvenance(this.bakeStatus());
   }
 
-  private async save(pixels: Float32Array, surfels: FrozenSurfelData): Promise<void> {
+  private async save(pages: Float32Array[], surfels: FrozenSurfelData): Promise<void> {
     const cache = this.bakeCache;
     if (!this.url.flag('bakeCache', true) || this.leak || !cache.key) return;
     bootNote('Saving the static lighting in the project');
     try {
       const probes = cache.probes === 'baked' || cache.probes === 'saved' ? this.probes?.export() : undefined;
       this.bakedProvenance = this.currentProvenance();
-      await saveBake(cache.key, { size: this.atlasSize, pages: this.layout?.pages ?? 1, pixels, surfels, probes }, this.bakedProvenance);
+      await saveBake(cache.key, { size: this.atlasSize, pages: pages.length, pixels: pages, surfels, probes }, this.bakedProvenance);
       cache.saved = true;
       console.log(`[bake-cache] saved ${cache.key}${probes ? ' with probes' : ' without probes'}`);
     } catch (error) {
@@ -203,85 +215,100 @@ export class StaticLight {
     return this.layout?.atlasHeight ?? this.atlasSize;
   }
 
-  private async bakeAtlas(frameGraph: FrameGraph, contactTree: ContactBVHBundle | null): Promise<{ pixels: Float32Array; surfels: FrozenSurfelData }> {
-    if (!this.layout) throw new Error('lightmap: unwrap before baking');
+  private pageRegions(page: number): LightmapRegion[] {
+    const layout = this.layout;
+    if (!layout) return [];
+    const regions: LightmapRegion[] = [];
+    layout.regions.forEach((region, index) => {
+      if (layout.pageOfRegion[index] === page) regions.push({ x: region.x, y: region.y - page * this.atlasSize, width: region.width, height: region.height });
+    });
+    return regions;
+  }
+
+  private async bakeAtlas(frameGraph: FrameGraph, contactTree: ContactBVHBundle | null): Promise<{ pages: Float32Array[]; surfels: FrozenSurfelData }> {
+    const layout = this.layout;
+    if (!layout) throw new Error('lightmap: unwrap before baking');
     this.bakedWith = { passes: this.bakeParams.passes, rays: this.bakeParams.rays, atlasIntensity: this.atlasParams.intensity, atlasSize: this.atlasSize };
     const direction = this.sun.position.clone().normalize();
     console.log(`[bake] ${this.bakedWith.passes} passes, ${this.bakedWith.rays} rays, atlas mul ${this.bakedWith.atlasIntensity}, sun ${this.sun.intensity.toFixed(3)} from ${direction.x.toFixed(2)},${direction.y.toFixed(2)},${direction.z.toFixed(2)} (elevation ${(Math.asin(direction.y) * 180 / Math.PI).toFixed(1)}°)`);
     const size = this.atlasSize;
-    const pages = Math.max(1, this.layout.pages);
-    const height = size * pages;
-    /* @important One rasterisation of the whole stack and one bake over it. Pages used to
-       be baked one at a time, each with a cleared radiance cache and its own 200-pass
-       integration, so the village's six pages were six bakes - six minutes against the
-       forty seconds the scene took before pages existed - and every page lost the bounce
-       off the others. The pool limits COVERED texels, not pages, and the seeder, the
-       denoiser and the blit have always taken a height. */
-    this.gbuffer?.dispose();
-    this.gbuffer = rasteriseLightmapGBuffer(this.renderer, this.scene, size, pages);
-    const coverage = await measureCoverage(this.renderer, this.gbuffer, size, height);
-    console.log(`[lightmap] ${pages} page(s) cover ${coverage.covered}/${coverage.total} texels (${(coverage.fraction * 100).toFixed(1)}%)`);
-    if (coverage.covered === 0) throw new Error('lightmap: the atlas rasterised zero texels');
-    if (this.leak) this.leak.recordGeometryPage(0,
-      await readFloatAttachment(this.renderer, this.gbuffer.target, 0),
-      await readFloatAttachment(this.renderer, this.gbuffer.target, 1));
-    this.coverage = coverage.covered;
-    /* @important The light is measured every `sampleMetres` of world surface and carried
-       between those samples along the traced links, so the atlas resolution and the surfel
-       pool stop being the same number. A surfel per texel made a finer atlas cost more
-       surfels for the same light, and the pool ceiling (262144, 179 MiB on the GPU and the
-       same again on the host) then capped the atlas. `?sample=` is the spacing in metres;
-       `?sample=0` puts a surfel back on every texel. */
+    const pageCount = Math.max(1, layout.pages);
     const sampleMetres = this.url.num('sample') ?? DEFAULT_SAMPLE_METRES;
-    const stride = sampleMetres > 0 && this.layout.metresPerTexel > 0
-      ? Math.max(1, Math.round(sampleMetres / this.layout.metresPerTexel))
-      : 1;
-    /* @important Counted the way the lattice is actually laid out - per chart, from that
-       chart's own corner - and checked before the bake, not after it. Dividing the whole
-       coverage by stride squared undercounts by up to two on scenes of small charts, and
-       the old check ran after 200 integration passes, so a pool that could never hold the
-       scene was discovered seventeen seconds late. */
-    const atLeast = Math.ceil(this.coverage / (stride * stride));
-    if (atLeast > MAX_SURFELS) throw new Error(`[lightmap] at least ${atLeast} lattice points over ${this.coverage} covered texels, against a ${MAX_SURFELS} surfel pool. Raise ?sample= or lower ?lmDensity=`);
-    const result = await this.gi.bakeLightmap(this.renderer, this.scene, this.gbuffer, size, {
-      height,
-      sampleStride: stride,
-      budgetMs: (this.url.num('bakeSeconds') ?? DEFAULT_BAKE_SECONDS) * 1000,
-      sampleFallback: this.url.flag('sampleFallback', true),
-      regions: this.layout.regions,
+    const stride = sampleMetres > 0 && layout.metresPerTexel > 0 ? Math.max(1, Math.round(sampleMetres / layout.metresPerTexel)) : 1;
+    const sampleFallback = this.url.flag('sampleFallback', true);
+    const links = this.url.flag('filterLinks', true) ? contactTree : null;
+    const surfelBound = layout.regions.reduce((total, region) => total + Math.ceil(region.width / stride) * Math.ceil(region.height / stride) + 1, 0);
+    this.gi.beginLightmapPages(this.renderer, size, surfelBound);
+
+    this.gbuffer?.dispose();
+    let gbuffer: LightmapGBuffer | undefined;
+    const seeds: { texelSurfel: Int32Array; links: Uint32Array }[] = [];
+    let seeded = 0;
+    let covered = 0;
+    for (let page = 0; page < pageCount; page++) {
+      bootNote(`Seeding lightmap page ${page + 1} of ${pageCount}`);
+      gbuffer = rasteriseLightmapGBuffer(this.renderer, this.scene, size, pageCount, { index: page, into: gbuffer });
+      covered += (await measureCoverage(this.renderer, gbuffer, size, size)).covered;
+      const seed = await this.gi.seedLightmapPage(this.renderer, this.scene, gbuffer, { regions: this.pageRegions(page), sampleStride: stride, sampleFallback, filterLinks: links });
+      seeds.push(seed);
+      seeded += seed.seeded;
+    }
+    this.gbuffer = gbuffer ?? null;
+    console.log(`[lightmap] ${pageCount} page(s) of ${size}² cover ${covered} texels, ${seeded} surfels seeded every ${stride} texel(s)`);
+    if (covered === 0 || !gbuffer) throw new Error('lightmap: the atlas rasterised zero texels');
+    if (seeded >= MAX_SURFELS) throw new Error(`[lightmap] surfel pool exhausted at ${seeded} slots over ${covered} covered texels. Raise ?sample= or lower ?lmDensity=`);
+
+    await this.gi.integrateLightmapPages(this.renderer, this.scene, {
       iterations: this.bakeParams.passes,
       raysPerSurfel: this.bakeParams.rays,
-      freshSurfels: true,
-      dilate: 0,
-      dynamicReceivers: true,
-      denoiseIgnoresSurface: this.url.get('leakMutation') === 'denoiseAll',
-      atlasGain: this.url.get('leakMutation') === 'atlasHalf' ? 0.5 : 1,
-      filterLinks: this.url.flag('filterLinks', true) ? contactTree : null,
-      onStage: this.leak ? (name, pixels) => this.leak!.record(name, pixels) : undefined,
+      budgetMs: (this.url.num('bakeSeconds') ?? DEFAULT_BAKE_SECONDS) * 1000,
       onProgress: (fraction, iteration) => bootNote(`Baking lightmap ${(fraction * 100).toFixed(0)}% · pass ${iteration}`),
     });
-    /* @important Exhaustion is exact, not estimated: the seed kernel takes a slot with an
-       atomic add and skips the write when the slot is past the end, so a pool that ran out
-       ends at exactly its capacity. Counting expected lattice points instead was wrong both
-       ways - dividing coverage by the stride undercounts on small charts, counting chart
-       rectangles overcounts by the four fifths of a rectangle that geometry never covers. */
-    if (result && result.seeded >= Math.min(MAX_SURFELS, size * height)) throw new Error(`[lightmap] surfel pool exhausted at ${result.seeded} slots, at least ${atLeast} lattice points over ${this.coverage} covered texels. Raise ?sample= or lower ?lmDensity=`);
-    if (!result?.texture) throw new Error('lightmap: the bake produced no texture');
-    /* @important Read after the bake, not before it: the light list is filled by the first
-       integration pass, so a count taken at the top of this function is always zero and says
-       nothing about what the rays actually saw. */
     console.log(`[bake] the tracer carried ${giLightSummary().length} analytic light(s) through this bake`);
-    const stacked = (await readFloatTexture(this.renderer, result.texture)).data;
-    const surfels = await this.gi.captureStaticBake(this.renderer, result.seeded);
-    if (!surfels) throw new Error('lightmap: nothing was baked');
-    this.leak?.record('blit', stacked);
-    const filled = padLightmapCharts(stacked, size, this.layout.regions, size * pages);
-    this.leak?.record('padded', stacked);
-    if (filled > 0) console.log(`[lightmap] padded ${filled} unmeasured texels within ${this.layout.regions.length} charts on ${pages} page(s); safe mip ${this.layout.safeMip}`);
-    this.markUnlit(stacked, this.layout.regions, size);
-    this.publishAtlas(frameGraph, halfFloatTexture(this.renderer, stacked, size, size * pages));
+
+    const pages: Float32Array[] = [];
+    for (let page = 0; page < pageCount; page++) {
+      bootNote(`Resolving lightmap page ${page + 1} of ${pageCount}`);
+      gbuffer = rasteriseLightmapGBuffer(this.renderer, this.scene, size, pageCount, { index: page, into: gbuffer });
+      const regions = this.pageRegions(page);
+      const pixels = await this.gi.resolveLightmapPage(this.renderer, this.scene, gbuffer, {
+        ...seeds[page],
+        regions,
+        sampleStride: stride,
+        sampleFallback,
+        useLinks: links !== null,
+        denoiseIgnoresSurface: this.url.get('leakMutation') === 'denoiseAll',
+        atlasGain: this.url.get('leakMutation') === 'atlasHalf' ? 0.5 : 1,
+      });
+      padLightmapCharts(pixels, size, regions, size);
+      this.markUnlit(pixels, regions, size);
+      pages.push(pixels);
+    }
+    this.gi.finishLightmapPages(this.renderer, seeded);
+    const surfels = await this.gi.captureStaticBake(this.renderer, seeded);
+    if (this.leak) this.leak.record('padded', stackPages(pages));
+    this.publishPages(frameGraph, pages);
     await this.captureLeakStages(frameGraph);
-    return { pixels: stacked, surfels };
+    return { pages, surfels };
+  }
+
+  /* @important Only the pages exist. The frame reads them through the lightmap LOD and nothing
+     holds the whole atlas; the tracer's atlas hits are off, so a bounce ray reads the surfel cache
+     the bake left behind. The full texture is built only for `?lod=0` and `?leak=1`, which are
+     tools. */
+  private publishPages(frameGraph: FrameGraph, pages: Float32Array[]): void {
+    frameGraph.hybridReceivers.value = 1;
+    if (this.lodWanted() && !this.leak) {
+      this.atlas = null;
+      frameGraph.setLightmapTexture(null);
+      this.gi.useBakedAtlas(null);
+      return;
+    }
+    this.publishAtlas(frameGraph, halfFloatTexture(this.renderer, stackPages(pages), this.atlasSize, this.atlasSize * pages.length));
+  }
+
+  atlasStack(): Float32Array | null {
+    return this.atlasPages.length > 0 ? stackPages(this.atlasPages) : null;
   }
 
   private async captureLeakStages(frameGraph: FrameGraph): Promise<void> {
@@ -341,11 +368,11 @@ export class StaticLight {
     return this.url.flag('lod', true) && (this.layout?.regions.length ?? 0) > 0;
   }
 
-  private enableLod(pixels: Float32Array): void {
+  private enableLod(pages: Float32Array[]): void {
     this.lod?.dispose();
     this.lod = null;
     if (!this.lodWanted() || !this.layout) return;
-    this.lod = new LightmapLod(this.renderer, this.scene, this.layout, pixels, this.atlasIntensity, {
+    this.lod = new LightmapLod(this.renderer, this.scene, this.layout, pages, this.atlasIntensity, {
       tileSize: this.url.num('vtTile') ?? DEFAULT_LOD_TILE,
       slotsPerSide: this.url.num('vtPool') ?? DEFAULT_LOD_SLOTS_PER_SIDE,
       copyBudget: this.url.num('lodCopies') ?? DEFAULT_LOD_COPIES,

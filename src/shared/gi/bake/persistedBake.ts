@@ -18,6 +18,7 @@ export interface PersistedProbes {
   bakedSunIntensity: number;
 }
 export interface PersistedBake { size: number; pages?: number; pixels: Float32Array; surfels: FrozenSurfelData; probes?: PersistedProbes }
+export type PagedBake = Omit<PersistedBake, 'pixels'> & { pixels: Float32Array | Float32Array[] };
 const PROBE_BLOCK_MAGIC = 0x32425250;
 const PROBE_HEADER_WORDS = 16;
 const BAKE_VERSION = 3;
@@ -66,10 +67,10 @@ function decodeProbeBlock(buffer: ArrayBuffer, offset: number, end: number): Per
   return { min: [minX, minY, minZ], spacing, dims: [header[1], header[2], header[3]], irradiance: arrays[0], distance: arrays[1], probeData: arrays[2], irradianceSun: arrays[3], bakedSunIntensity };
 }
 
-export async function encodeBake(bake: PersistedBake): Promise<ArrayBuffer> {
+export async function encodeBake(bake: PagedBake): Promise<ArrayBuffer> {
   const { surfels: s } = bake;
   const probeBlock = bake.probes ? new Float32Array(encodeProbeBlock(bake.probes)) : new Float32Array(0);
-  const chunks = [bake.pixels, s.spatial, s.moments, s.depth, s.guiding, probeBlock];
+  const chunks = [...(Array.isArray(bake.pixels) ? bake.pixels : [bake.pixels]), s.spatial, s.moments, s.depth, s.guiding, probeBlock];
   const size = 32 + chunks.reduce((n, a) => n + a.byteLength, 0);
   const buffer = new ArrayBuffer(size + 32);
   new Uint32Array(buffer, 0, 8).set([0x42474957, BAKE_VERSION, bake.size | ((bake.pages ?? 1) << 16), s.capacity, s.count, s.spatial.length, s.moments.length, s.depth.length]);
@@ -140,7 +141,7 @@ export async function loadBakeManifest(key: string): Promise<Record<string, unkn
   return response.json();
 }
 
-export async function saveBake(key: string, bake: PersistedBake, provenance?: unknown): Promise<void> {
+export async function saveBake(key: string, bake: PagedBake, provenance?: unknown): Promise<void> {
   const encoded = await encodeBake(bake);
   const local = pageFs();
   if (local) {
