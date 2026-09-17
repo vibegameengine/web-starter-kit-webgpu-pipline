@@ -93,8 +93,10 @@ function inScattering(context: CloudLightContext, position: N, direction: N): N 
 
 /* @important Two exits keep the march affordable: a sample with no cloud skips the six-step march
    toward the sun entirely (a branch, not a select - a select evaluates both sides on the GPU), and
-   the ray stops once 99 % of the background is hidden. Measured at 1600x900, half resolution:
-   44.8 fps with every sample lit, against 120 (the vsync cap) with the clouds off. */
+   the ray stops once 99 % of the background is hidden. The steps themselves stay uniform; empty
+   space is not skipped. Measured by the harsh-critic run of 2026-09-17 with vsync off
+   (scripts/_critic_cloud_fps.mjs): +0.66 ms at coverage 0.73 and +2.3 ms at 0.3 with the sun at 8
+   degrees, 1600x900; +3.8 ms for the latter at 2560x1440. Sparse clouds under a low sun cost most. */
 export function marchCloudLayer(context: CloudLightContext, ray: { origin: N; direction: N; start: N; end: N; jitter: N; steps: number }): { luminance: N; transmittance: N; depth: N } {
   const luminance = vec3(0).toVar();
   const transmittance = float(1).toVar();

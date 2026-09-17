@@ -60,9 +60,11 @@
 
 - Iteration 31 (2026-09-17): physical sky. `src/shared/render/sky/` implements Hillaire 2020 from the
   paper (UE 5.8 source read for inspiration only, nothing copied): transmittance, 64-direction
-  multi-scattering and sky-view LUTs as TSL compute, a limb-darkened sun disc, sun light colour from
-  transmittance, and `SkyEnvironment` rewriting the loaded panorama in place so bake, probes,
-  reflections and fog see the same sky. Host opt-in `sky: {}`, `?sky=0 skyAltitude= sunDiscScale=
+  multi-scattering and sky-view LUTs as TSL compute, a sun disc with limb darkening in its data (washed
+  to white on screen at sunset), sun light colour from transmittance, and `SkyEnvironment` rewriting the
+  loaded panorama in place. Reflections and fog ambient follow each capture; the atlas and probes follow
+  only through "bake light from this sky" (GUI Sky, `__skyBake`), which waits for the capture first.
+  Volumetric clouds (`cloud*.ts`) are sky-only: no shadows, not in the environment. Host opt-in `sky: {}`, `?sky=0 skyAltitude= sunDiscScale=
   skyEnvironment=0`, GUI folder Sky, hook `__sky`, lab `?scene=sky` (R3F) with catalog chips,
   `scripts/check-sky.mjs`. Details in [lessons-sky-atmosphere.md](docs/lessons-sky-atmosphere.md).
 

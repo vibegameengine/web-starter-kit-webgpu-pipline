@@ -4,6 +4,11 @@ import { CloudLayer, DEFAULT_CLOUD_SETTINGS, SkyAtmosphere, SkyEnvironment } fro
 import type { SunControls } from './sun.ts';
 import { hook, type SceneHost, type UrlParams } from './host.ts';
 
+export interface SkyBake {
+  status(): string;
+  rebake(): Promise<void>;
+}
+
 const TWILIGHT_ELEVATION_DEG = -12;
 const ENVIRONMENT_RECAPTURE_COS = Math.cos(THREE.MathUtils.degToRad(0.25));
 
@@ -16,6 +21,7 @@ export class SkyStage {
   private readonly capturedSun = new THREE.Vector3(0, -2, 0);
   private environmentStale = true;
   private environmentTexture: THREE.DataTexture | null = null;
+  private readonly captureListeners: (() => void)[] = [];
 
   constructor(renderer: THREE.WebGPURenderer, private readonly host: SceneHost, url: UrlParams) {
     this.atmosphere = new SkyAtmosphere(renderer, {
@@ -43,7 +49,26 @@ export class SkyStage {
     this.environment = new SkyEnvironment(renderer, this.atmosphere, environment);
     this.environmentTexture = environment;
     this.update();
-    await this.environment.capture();
+    await this.capture();
+  }
+
+  onEnvironmentCaptured(listener: () => void): void {
+    this.captureListeners.push(listener);
+  }
+
+  async captureNow(): Promise<void> {
+    await this.capture();
+    await this.capture();
+  }
+
+  private async capture(): Promise<void> {
+    if (!this.environment) return;
+    try {
+      await this.environment.capture();
+      for (const listener of this.captureListeners) listener();
+    } catch (error) {
+      console.warn(`[sky] environment capture failed, the lighting keeps the previous sky: ${error}`);
+    }
   }
 
   update(): void {
@@ -60,10 +85,10 @@ export class SkyStage {
     if (!this.environmentStale && sun.dot(this.capturedSun) > ENVIRONMENT_RECAPTURE_COS) return;
     this.capturedSun.copy(sun);
     this.environmentStale = false;
-    void environment.capture();
+    void this.capture();
   }
 
-  bindGui(gui: GUI, sun: SunControls): void {
+  bindGui(gui: GUI, sun: SunControls, bake: SkyBake): void {
     const folder = gui.addFolder('Sky');
     const settings = this.atmosphere.settings;
     const parameters = this.atmosphere.parameters;
@@ -75,6 +100,8 @@ export class SkyStage {
     folder.add(settings, 'altitudeKm', 0, 60, 0.1).name('viewer altitude (km)');
     folder.add(settings, 'sunDiscScale', 0.5, 8, 0.1).name('sun disc size');
     folder.add(settings, 'tintSunLight').name('sun light through air');
+    folder.add(settings, 'discPeak', 0.2, 20, 0.1).name('sun disc brightness');
+    this.bindBakeStatus(folder, bake);
     folder.add(parameters, 'mieScattering', 0, 0.05, 0.0005).name('haze (Mie, 1/km)').onChange(rebuild);
     folder.add(parameters, 'mieScaleHeightKm', 0.2, 5, 0.05).name('haze height (km)').onChange(rebuild);
     folder.add(parameters, 'mieAnisotropy', 0, 0.95, 0.01).name('haze forward glow').onChange(rebuild);
@@ -104,7 +131,21 @@ export class SkyStage {
     folder.open();
   }
 
+  /* @important Moving the sun re-captures the panorama at once, but the atlas and the probes stay as they
+     were baked: nothing in this project re-bakes on its own. The folder therefore says when the baked
+     light no longer matches the sky, and offers the bake that waits for the capture first - a bake
+     started while the capture is still reading back would light the scene with the previous sky. */
+  private bindBakeStatus(folder: GUI, bake: SkyBake): void {
+    const state = { baked: bake.status() };
+    folder.add(state, 'baked').name('baked light').listen().disable();
+    setInterval(() => { state.baked = bake.status(); }, 500);
+    const bakeFromSky = () => this.captureNow().then(bake.rebake);
+    folder.add({ rebake: () => { void bakeFromSky(); } }, 'rebake').name('bake light from this sky');
+    hook('__skyBake', { status: bake.status, bakeFromSky });
+  }
+
   private apply(): void {
     this.host.scene.backgroundNode = this.enabled ? (this.clouds.settings.enabled ? this.cloudySky : this.clearSky) : null;
+    if (!this.enabled) this.host.sun.color.setRGB(1, 1, 1);
   }
 }

@@ -115,6 +115,7 @@ export class StaticLight {
       this.enableLod(atlas.pixels);
       this.atlasIntensity.value = this.atlasParams.intensity;
       const probesBaked = await this.prepareProbes(bakeTree, atlas.probes, options.interiorVolumes ?? []);
+      if (atlas.fresh || probesBaked) this.bakedProvenance = this.currentProvenance();
       if ((atlas.fresh || probesBaked) && atlas.surfels) await this.save(atlas.pixels, atlas.surfels);
       this.gi.setFrozen(true);
       this.ready = true;
@@ -158,9 +159,10 @@ export class StaticLight {
     return { ...baked, fresh: true };
   }
 
-  /* @important The two digests are taken once and kept: the panorama and the transport
-     settings do not change while the scene runs, and the HUD asks for the status every
-     frame. Only the sun's transform, intensity and colour are read live. */
+  /* @important The two digests are taken at every prepare and kept until the next one, because
+     the HUD asks for the status every frame. The panorama can change in between - the sky stage
+     rewrites it whenever the sun moves - and that is caught through the sun's transform and
+     colour, which are read live, not through this digest. */
   private async warmProvenance(): Promise<void> {
     this.digests = {
       environment: await environmentDigest(this.gi.envTexture as THREE.DataTexture),

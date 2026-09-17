@@ -109,7 +109,7 @@ export class AtmosphereLuts {
   private multiScatteringKernel(): N {
     const atmosphere = this.atmosphere;
     return eachTexel(MULTI_SCATTERING_SIZE, (id) => {
-      const unit = vec2(id.xy).add(0.5).div(vec2(MULTI_SCATTERING_SIZE[0], MULTI_SCATTERING_SIZE[1]));
+      const unit = vec2(id.xy).div(vec2(MULTI_SCATTERING_SIZE[0] - 1, MULTI_SCATTERING_SIZE[1] - 1));
       const sunDirection = sunInPlane(unit.x.mul(2).sub(1));
       const origin = vec3(0, atmosphere.groundRadius.add(unit.y.mul(atmosphere.topRadius.sub(atmosphere.groundRadius))), 0);
       const luminance = vec3(0).toVar();

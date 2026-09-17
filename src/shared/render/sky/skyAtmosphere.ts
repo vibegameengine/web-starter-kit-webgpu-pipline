@@ -1,5 +1,5 @@
 import * as THREE from 'three/webgpu';
-import { acos, clamp, float, max, normalize, positionWorldDirection, pow, select, sqrt, texture, uniform, vec2, vec3, vec4 } from 'three/tsl';
+import { acos, clamp, float, max, min, normalize, positionWorldDirection, pow, select, sqrt, texture, uniform, vec2, vec3, vec4 } from 'three/tsl';
 import { AtmosphereUniforms, earthAtmosphere, type AtmosphereParameters } from './atmosphereParameters.ts';
 import { AtmosphereLuts } from './atmosphereLuts.ts';
 import { readTransmittance, skyViewUnit, texelCentreUv } from './lutMapping.ts';
@@ -11,18 +11,20 @@ type N = any;
 const METRES_PER_KM = 1000;
 const MIN_ALTITUDE_KM = 0.0005;
 const SUN_ANGULAR_DIAMETER_DEG = 0.533;
-const SKY_VIEW_RECOMPUTE_EPSILON = 1e-5;
+const RADIUS_RECOMPUTE_EPSILON_KM = 1e-3;
+const SUN_RECOMPUTE_EPSILON = 1e-5;
 /* @important Power-law limb darkening I(mu)/I(1) = mu^alpha, per channel for roughly the sRGB
    primaries' wavelengths, from the solar limb measurements fitted by Hestroffer and Magnan,
-   "Wavelength dependency of the Solar limb darkening", A&A 333 (1998). A flat disc is what every
-   game sun is; the real one is visibly redder and dimmer at its rim, most of all at sunset. */
+   "Wavelength dependency of the Solar limb darkening", A&A 333 (1998). The disc carries it, but
+   whether it reaches the screen depends on exposure: under auto exposure at sunset the output
+   transform still washes the disc toward white (harsh-critic run, 2026-09-17). */
 const LIMB_DARKENING_ALPHA = new THREE.Vector3(0.397, 0.503, 0.652);
 
 export interface SkyAtmosphereSettings {
   enabled: boolean;
   altitudeKm: number;
   sunDiscScale: number;
-  maxDiscLuminance: number;
+  discPeak: number;
   tintSunLight: boolean;
 }
 
@@ -30,7 +32,7 @@ export const DEFAULT_SKY_SETTINGS: SkyAtmosphereSettings = {
   enabled: true,
   altitudeKm: 0,
   sunDiscScale: 1,
-  maxDiscLuminance: 20000,
+  discPeak: 0.6,
   tintSunLight: true,
 };
 
@@ -42,7 +44,7 @@ export class SkyAtmosphere {
   readonly sunIlluminance = uniform(1);
   readonly discCosHalfAngle = uniform(1);
   readonly discSolidAngle = uniform(1);
-  readonly maxDiscLuminance = uniform(1);
+  readonly discPeak = uniform(1);
   readonly sunLightTransmittance = new THREE.Vector3(1, 1, 1);
   private readonly uniforms = new AtmosphereUniforms();
   private atmosphereDirty = true;
@@ -103,14 +105,26 @@ export class SkyAtmosphere {
     const transmittance = readTransmittance(this.luts.transmittanceSource, radius, direction.y);
     const luminance = limb.mul(transmittance).mul(this.sunIlluminance.div(this.discSolidAngle)).mul(edge);
     const aboveGround = direction.y.greaterThan(sqrt(max(radius.mul(radius).sub(this.uniforms.groundRadius.mul(this.uniforms.groundRadius)), 0)).div(radius).negate());
-    return select(cosAngle.greaterThan(this.discCosHalfAngle).and(aboveGround), luminance.min(vec3(this.maxDiscLuminance)), vec3(0));
+    return select(cosAngle.greaterThan(this.discCosHalfAngle).and(aboveGround), this.limitDisc(luminance), vec3(0));
+  }
+
+  /* @important The disc is 1/solid-angle = 147 000 times brighter than the illuminance it carries, and
+     a per-channel clamp flattened every channel to the same ceiling: the disc drew white at sunset
+     and its limb darkening never reached the screen (harsh-critic run, 2026-09-17). The ceiling now
+     scales the colour as a whole, and sits at `discPeak` times the sun's illuminance - bright enough
+     to dominate the sky, low enough that exposure and the output transform keep its colour and rim.
+     The lighting never reads this value; the sun still lights the scene at full strength. */
+  private limitDisc(luminance: N): N {
+    const peak = max(luminance.x, max(luminance.y, luminance.z));
+    const ceiling = this.sunIlluminance.mul(this.discPeak);
+    return luminance.mul(min(float(1), ceiling.div(max(peak, 1e-6))));
   }
 
   private syncDisc(): void {
     const halfAngle = THREE.MathUtils.degToRad(SUN_ANGULAR_DIAMETER_DEG * this.settings.sunDiscScale) / 2;
     this.discCosHalfAngle.value = Math.cos(halfAngle);
     this.discSolidAngle.value = 2 * Math.PI * (1 - Math.cos(halfAngle));
-    this.maxDiscLuminance.value = this.settings.maxDiscLuminance;
+    this.discPeak.value = this.settings.discPeak;
   }
 
   private recompute(radiusKm: number, sunCosZenith: number): void {
@@ -119,7 +133,7 @@ export class SkyAtmosphere {
       this.atmosphereDirty = false;
       this.computedRadius = -1;
     }
-    const moved = Math.abs(radiusKm - this.computedRadius) > SKY_VIEW_RECOMPUTE_EPSILON || Math.abs(sunCosZenith - this.computedSunCos) > SKY_VIEW_RECOMPUTE_EPSILON;
+    const moved = Math.abs(radiusKm - this.computedRadius) > RADIUS_RECOMPUTE_EPSILON_KM || Math.abs(sunCosZenith - this.computedSunCos) > SUN_RECOMPUTE_EPSILON;
     if (!moved) return;
     this.luts.computeSkyView(radiusKm, sunCosZenith);
     this.computedRadius = radiusKm;

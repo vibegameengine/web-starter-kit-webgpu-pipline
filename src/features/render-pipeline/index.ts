@@ -17,6 +17,7 @@ import { leakHookApi } from '../../shared/gi/bake/leakStages.ts';
 import { TraceStages } from './traceStages.ts';
 import { PostStages } from './postStages.ts';
 import { SkyStage } from './skyStage.ts';
+import { meanEnvironmentRadiance } from '../../shared/render/atmosphere/volumetricFog.ts';
 import { drawCounts, frameCpu, gpuPasses } from './audit.ts';
 import { bootStage } from '../../shared/ui/bootProgress.ts';
 import { ReflectionCache, deriveReflectionVolume, type ReflectionVolume } from '../../shared/gi/reflect/cache/index.ts';
@@ -165,6 +166,16 @@ function bindCineGui(gui: GUI, p: Pipeline): void {
   folder.close();
 }
 
+function rebakeStatic(p: Pipeline, ui: PipelineUi): Promise<void> {
+  const { staticLight, frameGraph } = p;
+  return staticLight.prepare(frameGraph, { forceBake: true, bakeTree: () => p.trace.detailedTree(p.host.scene), interiorVolumes: p.host.interiorVolumes })
+    .then(() => {
+      if (p.lab && staticLight.lod) { p.lab.element.remove(); p.lab = new LodLab(p.renderer, staticLight.lod); }
+      ui.clearLoading();
+    })
+    .catch(ui.showError);
+}
+
 function bindLightingGui(gui: GUI, p: Pipeline, ui: PipelineUi): void {
   const { frameGraph, gi, staticLight } = p;
   const giFolder = gui.addFolder('GI (live surfels)');
@@ -192,14 +203,7 @@ function bindLightingGui(gui: GUI, p: Pipeline, ui: PipelineUi): void {
       ? `${layout.metresPerTexel.toFixed(3)} m/texel, ${layout.pages} page(s), sample ${(p.url.num('sample') ?? 0.1).toFixed(2)} m`
       : 'unwrapping';
   }, 500);
-  bake.add({ rebake: () => {
-    void staticLight.prepare(frameGraph, { forceBake: true, bakeTree: () => p.trace.detailedTree(p.host.scene), interiorVolumes: p.host.interiorVolumes })
-      .then(() => {
-        if (p.lab && staticLight.lod) { p.lab.element.remove(); p.lab = new LodLab(p.renderer, staticLight.lod); }
-        ui.clearLoading();
-      })
-      .catch(ui.showError);
-  } }, 'rebake').name('re-bake now');
+  bake.add({ rebake: () => { void rebakeStatic(p, ui); } }, 'rebake').name('re-bake now');
   const lodState = { streaming: 'baking' };
   bake.add(lodState, 'streaming').name('lightmap LOD').listen().disable();
   setInterval(() => {
@@ -616,8 +620,8 @@ function startLoop(p: Pipeline, ui: PipelineUi, state: { paused: boolean; stepOn
     world.beginFrame(dt);
     controls.update();
     p.sun.updateAnimation();
-    p.sky?.update();
     camera.updateMatrixWorld();
+    p.sky?.update();
     p.sun.shadowFit.update(camera);
     frameGraph.beginFrame();
     if (!state.frozen) p.dynamic?.update(now * 0.001);
@@ -710,7 +714,11 @@ async function runPipeline(renderer: THREE.WebGPURenderer, gi: SurfelGI, host: S
   bindCineGui(gui, p);
   bindLeakGui(gui, p);
   host.bindGui?.(gui);
-  sky?.bindGui(gui, sun);
+  sky?.onEnvironmentCaptured(() => {
+    trace.reflections.setAmbient(meanEnvironmentRadiance(gi.envTexture as THREE.DataTexture).multiplyScalar(0.5));
+    post.fog.setEnvironment(gi.envTexture as THREE.DataTexture);
+  });
+  sky?.bindGui(gui, sun, { status: () => staticLight.ready ? staticLight.bakeStatusText() : 'baking', rebake: () => rebakeStatic(p, ui) });
   post.bindGui(gui);
   trace.bindGui(gui, frameGraph);
   window.addEventListener('resize', () => {

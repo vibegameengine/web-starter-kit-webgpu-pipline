@@ -72,9 +72,11 @@ and `composite()` puts the result over the sky in the background node. GUI folde
 
 - **Octaves halving per step, as published, left a thick deck black underneath at noon.** The
   extinction scales are now 1, 1/4 and 1/20, with weights 1, 0.7 and 0.45.
-- **A `select` does not skip work on the GPU.** Moving the light march behind `If(extinction > 0)`
-  and adding `Break` at 1 % transmittance took the lab from 44.8 fps to the 120 fps vsync cap at
-  1600x900, with the frame unchanged.
+- **A `select` does not skip work on the GPU.** The light march now sits behind `If(extinction > 0)`,
+  and a `Break` ends the ray at 1 % transmittance. The first version drew 44.8 fps at 1600x900. The
+  later "120 fps" was the vsync cap and measured nothing. The harsh-critic run measured with vsync off:
+  +0.66 ms at coverage 0.73, +2.3 ms at 0.3 under an 8 degree sun, and +3.8 ms for that case at
+  2560x1440.
 - **A deep deck lit only by octaves reads as a dark blue veil.** The octaves die exponentially,
   which leaves the base lit by the blue sky alone. A two-stream diffuse transmission term,
   1 / (1 + 3/4 tau (1 - g)), weighted in only at large optical depth, turned overcast grey-white and
@@ -83,6 +85,28 @@ and `composite()` puts the result over the sky in the background node. GUI folde
   to 0.15 and every billow filled in, leaving no structure. The threshold is now
   1 - 0.75 x coverage, and the default coverage moved from 0.55 to 0.73 to keep the same look.
 - A cloud 1.5 km straight overhead is soft at half resolution. Horizon views are not.
+
+## What the harsh-critic run of 2026-09-17 found, and what changed
+
+- **Moving the sun left the bake lit by the old sky** while the lab card promised the opposite. The
+  Sky folder now shows the bake status, and "bake light from this sky" (`__skyBake.bakeFromSky`)
+  waits for two captures before it bakes. Reflections and fog take a new ambient after every
+  capture. A fresh bake records its provenance even with `bakeCache=0`; before this, the status
+  read "provenance unknown" and staleness was never shown.
+- **A per-channel clamp at 20000 flattened the sun disc to white.** The ceiling now scales the
+  colour as a whole, at `discPeak` (0.6) times the sun's illuminance. At sunset under auto exposure
+  the disc is still near white on screen, so limb darkening is not claimed as visible.
+- **The cloud targets never followed a resize, and their history never reset.** The targets are
+  now sized for the display, the traced area is a uniform, and the history drops on any resize,
+  settings change or skipped frame.
+- **A fixed 45 km haze dissolved distant clouds into whatever lay behind them.** From 12 km the
+  whole layer vanished into the ground. The air between camera and cloud now comes from the
+  transmittance LUT, and the layer reaches the horizon.
+- **The clouds read the camera matrix before `updateMatrixWorld`.** The sky update now runs after it.
+- The multi-scattering LUT was written at texel centres and read at texel edges; both now use edges.
+  The sky view recomputed on any 1 cm of vertical camera motion; the threshold is now 1 m.
+- A failed capture is reported with a warning instead of stopping the render loop. Switching the sky
+  off returns the sun to white.
 
 ## Open
 
@@ -94,4 +118,8 @@ and `composite()` puts the result over the sky in the background node. GUI folde
 - Spectral integration: the LUTs are RGB.
 - Only the lab opts in; the beach, forest and village still use the panorama.
 - Clouds are not in the environment capture (bake, probes, reflections) and cast no shadows yet (step 2).
-- There is no aerial perspective volume; clouds fade to the sky with one 45 km exponential (step 3).
+- No aerial perspective volume for geometry (step 3).
+- From altitude the 96³ shape volume visibly repeats as rows running to the horizon.
+- Not verified: shadow fill in the shade 2-10x below the panorama's own sky irradiance, and backlit
+  clouds that read flat at low sun (the critic's suspicion is the octave weights plus the two-stream
+  term). Both still need an ablation.

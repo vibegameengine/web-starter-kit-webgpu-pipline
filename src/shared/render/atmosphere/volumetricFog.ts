@@ -227,6 +227,10 @@ export class VolumetricFog {
   }
 
   /** Off costs nothing: no dispatch, and the composite drops the sample entirely. */
+  setEnvironment(environment: THREE.DataTexture): void {
+    this.ambient.copy(meanEnvironmentRadiance(environment));
+  }
+
   setEnabled(value: boolean): void {
     if (value === this.settings.enabled) return;
     this.settings.enabled = value;

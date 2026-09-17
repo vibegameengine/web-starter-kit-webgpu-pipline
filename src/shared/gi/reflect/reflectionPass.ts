@@ -361,6 +361,10 @@ export class ReflectionPass {
     return this.settings.enabled;
   }
 
+  setAmbient(ambient: THREE.Color): void {
+    this.uAmbient.value.copy(ambient);
+  }
+
   setEnabled(value: boolean): void {
     this.settings.enabled = value;
     this.historyValid = false;
