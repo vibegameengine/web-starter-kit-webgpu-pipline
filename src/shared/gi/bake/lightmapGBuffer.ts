@@ -8,6 +8,7 @@ import {
   normalGeometry,
   positionGeometry,
   varying,
+  vec2,
   vec4,
 } from 'three/tsl';
 import { Layer } from '../../world/index.ts';
@@ -63,8 +64,9 @@ export function rasteriseLightmapGBuffer(
   scene: THREE.Scene,
   size: number,
   pages = 1,
+  page?: { index: number; into?: LightmapGBuffer },
 ): LightmapGBuffer {
-  const target = new THREE.RenderTarget(size, size * pages, {
+  const target = page?.into?.target ?? new THREE.RenderTarget(size, page ? size : size * pages, {
     count: 2,
     type: THREE.FloatType,
     format: THREE.RGBAFormat,
@@ -109,10 +111,15 @@ export function rasteriseLightmapGBuffer(
      six minutes against the forty seconds the scene took before pages existed. Nothing
      required that - the seeder, the denoiser and the blit have always taken a height. What
      the surfel pool limits is the number of COVERED texels, not the number of pages. */
+  /* @important One page is drawn into a page-sized target: v is shifted by the page's row in
+     the stack and scaled by the number of pages, so a page needs no texture as tall as the
+     world. The target is reused from page to page because the seed, link and resolve kernels
+     bind its textures when they are first built. */
+  const pageUv = page ? vec2(atlasUv.x, atlasUv.y.mul(float(pages)).sub(float(page.index))) : atlasUv;
   const bakeMaterial = new THREE.MeshBasicNodeMaterial();
   bakeMaterial.vertexNode = vec4(
-    atlasUv.x.mul(2).sub(1),
-    atlasUv.y.mul(2).sub(1).negate(),
+    pageUv.x.mul(2).sub(1),
+    pageUv.y.mul(2).sub(1).negate(),
     float(0),
     1,
   );

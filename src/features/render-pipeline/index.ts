@@ -364,7 +364,7 @@ function installAtlasHooks(p: Pipeline): void {
   });
   hook('__pages', () => {
     const layout = staticLight.layout;
-    const pixels = staticLight.atlasPixels;
+    const pixels = staticLight.atlasStack();
     if (!layout || !pixels) return null;
     const size = staticLight.atlasSize;
     return [...Array(layout.pages).keys()].map((page) => {
@@ -392,7 +392,7 @@ function installAtlasHooks(p: Pipeline): void {
      mark: 1 measured by its own surfel, 0.5 carried or padded, 0 nothing. */
   hook('__atlasDump', (page = -1) => {
     const layout = staticLight.layout;
-    const pixels = staticLight.atlasPixels;
+    const pixels = staticLight.atlasStack();
     if (!layout || !pixels) return null;
     const size = staticLight.atlasSize;
     const height = staticLight.atlasHeight();
@@ -445,7 +445,7 @@ function installAtlasHooks(p: Pipeline): void {
   });
   hook('__meshLight', () => {
     const layout = staticLight.layout;
-    const pixels = staticLight.atlasPixels;
+    const pixels = staticLight.atlasStack();
     if (!layout || !pixels) return null;
     const size = staticLight.atlasSize;
     const perMesh = new Map<string, { charts: number; dark: number; texels: number; measured: number; zeros: number; sum: number }>();
@@ -483,7 +483,7 @@ function installAtlasHooks(p: Pipeline): void {
   });
   hook('__chartLight', (name = 'bench') => {
     const layout = staticLight.layout;
-    const pixels = staticLight.atlasPixels;
+    const pixels = staticLight.atlasStack();
     if (!layout || !pixels) return null;
     const size = staticLight.atlasSize;
     return layout.placements.flatMap((placement, chart) => {

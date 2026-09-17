@@ -22,8 +22,8 @@ export interface ChartPyramid {
 }
 
 export interface PyramidSource {
-  atlas: Float32Array;
-  atlasWidth: number;
+  pages: Float32Array[];
+  pageSize: number;
   regions: LightmapRegion[];
   tileSize: number;
 }
@@ -67,7 +67,7 @@ export class ChartPyramidSet {
     this.physicalTile = source.tileSize + 2 * TILE_BORDER;
     const tails: TailBox[] = [];
     for (const [chart, region] of source.regions.entries()) {
-      tails.push({ chart, ...this.cutChart(chart, region, cutRegion(source.atlas, source.atlasWidth, region)) });
+      tails.push({ chart, ...this.cutChart(chart, region, cutRegion(source.pages, source.pageSize, region)) });
     }
     const packed = packTails(tails, source.regions.length);
     this.tailSize = packed.size;
@@ -211,11 +211,14 @@ function copyBordered(
   }
 }
 
-function cutRegion(atlas: Float32Array, atlasWidth: number, region: LightmapRegion): Float32Array {
+function cutRegion(pages: Float32Array[], pageSize: number, region: LightmapRegion): Float32Array {
+  const page = Math.floor(region.y / pageSize);
+  const pixels = pages[page];
+  const top = region.y - page * pageSize;
   const out = new Float32Array(region.width * region.height * 4);
   for (let y = 0; y < region.height; y++) {
-    const source = ((region.y + y) * atlasWidth + region.x) * 4;
-    out.set(atlas.subarray(source, source + region.width * 4), y * region.width * 4);
+    const source = ((top + y) * pageSize + region.x) * 4;
+    out.set(pixels.subarray(source, source + region.width * 4), y * region.width * 4);
   }
   return out;
 }

@@ -31,13 +31,13 @@ export class LightmapLod {
     renderer: THREE.WebGPURenderer,
     scene: THREE.Scene,
     layout: LightmapLayout,
-    pixels: Float32Array,
+    pages: Float32Array[],
     intensity: ReturnType<typeof uniform>,
     settings: LodSettings,
   ) {
     const started = performance.now();
     const sourceAtlas = { width: layout.atlasSize, height: layout.atlasHeight };
-    this.pyramids = new ChartPyramidSet({ atlas: pixels, atlasWidth: layout.atlasSize, regions: layout.regions, tileSize: settings.tileSize });
+    this.pyramids = new ChartPyramidSet({ pages, pageSize: layout.atlasSize, regions: layout.regions, tileSize: settings.tileSize });
     this.pool = new TilePool(renderer, this.pyramids, sourceAtlas, settings);
     this.feedback = new DemandFeedback(renderer, scene, sourceAtlas, settings.feedbackSpacing,
       (chart, level, atlasX, atlasY) => this.pyramids.tileAt(chart, level, atlasX, atlasY));

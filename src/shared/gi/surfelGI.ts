@@ -14,6 +14,7 @@ import { createSurfelHoleFill } from './bake/holeFill.ts';
 import type { LightmapGBuffer } from './bake/lightmapGBuffer.ts';
 import { captureFrozenSurfels, restoreFrozenSurfels } from './bake/frozenSurfels.ts';
 import type { FrozenSurfelData } from './bake/persistedBake.ts';
+import { readFloatTexture } from '../render/gpuReadback.ts';
 
 import {
   CASCADES,
@@ -1124,6 +1125,101 @@ export class SurfelGI {
     } catch (error) {
       console.error('[gi] post-bake pool occupancy readback failed', error);
     }
+  }
+
+  /* @important The lightmap is baked page by page and integrated once. A page is seeded from its
+     own page-sized G-buffer, its texel-to-surfel map and its links go to tab memory, and the
+     next page seeds after it into the same pool. The integration then runs once over every
+     surfel, so bounce light crosses pages and the startup pays one integration as before. Each
+     page is resolved afterwards from its saved maps into a page of pixels. No texture or array
+     the size of the whole atlas exists on the way. */
+  beginLightmapPages(renderer: THREE.WebGPURenderer, pageSize: number, surfelBound: number): void {
+    this.ensurePoolCapacity(renderer, Math.min(MAX_SURFELS, Math.max(1, surfelBound)));
+    this.lightmapSurfels = createLightmapSurfels(this.pool, pageSize, pageSize);
+    this.lightmapFilterLinks = createFilterLinks(pageSize, pageSize, this.lightmapSurfels.links);
+
+  }
+
+
+  async seedLightmapPage(
+    renderer: THREE.WebGPURenderer,
+    scene: THREE.Scene,
+    gbuffer: LightmapGBuffer,
+    options: { regions: { x: number; y: number; width: number; height: number }[]; sampleStride: number; sampleFallback: boolean; filterLinks: ContactBVHBundle | null },
+  ): Promise<{ texelSurfel: Int32Array; links: Uint32Array; seeded: number }> {
+    const lm = this.lightmapSurfels;
+    if (!lm || !this.lightmapFilterLinks) throw new Error('[lightmap] beginLightmapPages before seeding a page');
+    if (options.filterLinks) {
+      const reach = this.staticBounds(scene).getSize(new THREE.Vector3()).length() * 0.05;
+      this.lightmapFilterLinks.run(renderer, gbuffer, options.filterLinks, { supportMetres: reach, hiddenTest: giKnobs.bakeHiddenTexels() });
+    } else {
+      (lm.links.array as Uint32Array).fill(0);
+      lm.links.needsUpdate = true;
+    }
+    lm.setPlacement(options.filterLinks ? giKnobs.bakePlacement() : 0);
+    lm.setCharts(options.regions, options.sampleStride, options.sampleFallback);
+    if (!lm.seed(renderer, gbuffer)) throw new Error('[lightmap] the page seed kernel did not run');
+    const texelSurfel = new Int32Array(await renderer.getArrayBufferAsync(lm.texelSurfel)).slice();
+    const links = new Uint32Array(await renderer.getArrayBufferAsync(lm.links)).slice();
+    let seeded = 0;
+    for (const surfel of texelSurfel) if (surfel >= 0) seeded++;
+    return { texelSurfel, links, seeded };
+  }
+
+  async integrateLightmapPages(
+    renderer: THREE.WebGPURenderer,
+    scene: THREE.Scene,
+    options: { iterations: number; raysPerSurfel: number; budgetMs: number; onProgress?: (fraction: number, iteration: number) => void },
+  ): Promise<number> {
+    if (!this.bvh || !this.dynamicBvh || !this.integrate) throw new Error('[lightmap] no BVH to integrate against');
+    this.setBaseSampleCount(options.raysPerSurfel);
+    this.integrate.setExactReuse(giKnobs.exactBakeReuse());
+    const camera = new THREE.PerspectiveCamera();
+    camera.position.copy(this.staticBounds(scene).getCenter(new THREE.Vector3()));
+    camera.updateMatrixWorld();
+    const minimumPasses = Math.min(options.iterations, TARGET_SAMPLE_COUNT);
+    const started = performance.now();
+    let passes = 0;
+    for (; passes < options.iterations; passes++) {
+      if (passes >= minimumPasses && options.budgetMs > 0 && performance.now() - started >= options.budgetMs) break;
+      renderer.info.frame++;
+      this.grid.build(renderer, this.pool, camera);
+      this.integratorArgs.run(renderer, this.pool);
+      this.integrate.run(renderer, this.pool, this.bvh, this.dynamicBvh, this.grid, camera, scene, this.integratorArgs.getIndirectAttr(), { includeDynamic: false });
+      this.pool.swapMoments();
+      options.onProgress?.(Math.min(1, Math.max((passes + 1) / options.iterations, options.budgetMs > 0 ? (performance.now() - started) / options.budgetMs : 0)), passes + 1);
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      if (options.budgetMs > 0) await (renderer.backend as { device?: GPUDevice }).device?.queue.onSubmittedWorkDone();
+    }
+    this.integrate.setExactReuse(false);
+    console.log(`[lightmap] ${passes} of ${options.iterations} integrations × ${options.raysPerSurfel} rays over every page in ${((performance.now() - started) / 1000).toFixed(2)} s`);
+    return passes;
+  }
+
+  async resolveLightmapPage(
+    renderer: THREE.WebGPURenderer,
+    scene: THREE.Scene,
+    gbuffer: LightmapGBuffer,
+    options: { texelSurfel: Int32Array; links: Uint32Array; regions: { x: number; y: number; width: number; height: number }[]; sampleStride: number; sampleFallback: boolean; useLinks: boolean; denoiseIgnoresSurface?: boolean; atlasGain?: number },
+  ): Promise<Float32Array> {
+    const lm = this.lightmapSurfels;
+    if (!lm) throw new Error('[lightmap] beginLightmapPages before resolving a page');
+    (lm.texelSurfel.array as Int32Array).set(options.texelSurfel);
+    lm.texelSurfel.needsUpdate = true;
+    (lm.links.array as Uint32Array).set(options.links);
+    lm.links.needsUpdate = true;
+    lm.setCharts(options.regions, options.sampleStride, options.sampleFallback);
+    const planeEpsilon = this.staticBounds(scene).getSize(new THREE.Vector3()).length() * 0.0025;
+    await lm.writeAtlas(renderer, gbuffer, { dilate: 0, planeEpsilon, denoiseIgnoresSurface: options.denoiseIgnoresSurface, atlasGain: options.atlasGain, useLinks: options.useLinks });
+    return (await readFloatTexture(renderer, lm.lightmap)).data;
+  }
+
+  finishLightmapPages(renderer: THREE.WebGPURenderer, seeded: number): void {
+    this.setBaseSampleCount(this.runtimeSampleCount);
+    this.immortaliser.run(renderer, this.pool);
+    this.atlasPinned = true;
+    if (this.rigidSurfels) this.pool.setAnchorStart(renderer, seeded);
+    this._frozen = false;
   }
 
   /**
