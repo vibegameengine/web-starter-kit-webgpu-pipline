@@ -31,6 +31,8 @@ export class TileResidency {
   private readonly slotUsed: Int32Array;
   private readonly keySlot = new Map<number, number>();
   private frame = 0;
+  private dirtyFrom = Number.POSITIVE_INFINITY;
+  private dirtyTo = -1;
   stats: ResidencyStats = { asked: 0, planned: 0, coarsened: 0, copies: 0, released: 0, refused: 0 };
 
   readonly chartRecordStart: number;
@@ -44,6 +46,8 @@ export class TileResidency {
     const rows = Math.ceil(Math.max(1, entries) / PAGE_TABLE_WIDTH);
     this.pageData = new Float32Array(PAGE_TABLE_WIDTH * rows * 4);
     this.writeChartRecords();
+    this.dirtyFrom = 0;
+    this.dirtyTo = Math.max(0, entries - 1);
     for (let chart = 0; chart < pyramids.charts.length; chart++) this.writeChart(chart);
   }
 
@@ -53,7 +57,7 @@ export class TileResidency {
    * frame degrades by level and never leaves a near surface on its tail while a far one
    * keeps detail.
    */
-  serve(requested: Set<number>): { copies: TileCopy[]; tableChanged: boolean } {
+  serve(requested: Set<number>): { copies: TileCopy[] } {
     this.frame++;
     const { wanted, coarsened } = this.fitToCapacity(requested);
     for (const key of wanted) {
@@ -83,7 +87,7 @@ export class TileResidency {
     }
     for (const chart of touched) this.writeChart(chart);
     this.stats = { asked: requested.size, planned: wanted.size, coarsened, copies: copies.length, released, refused };
-    return { copies, tableChanged: touched.size > 0 };
+    return { copies };
   }
 
   private writeChartRecords(): void {
@@ -141,9 +145,19 @@ export class TileResidency {
     }
   }
 
+  takeDirtyEntries(): { from: number; to: number } | null {
+    if (this.dirtyTo < 0) return null;
+    const range = { from: this.dirtyFrom, to: this.dirtyTo };
+    this.dirtyFrom = Number.POSITIVE_INFINITY;
+    this.dirtyTo = -1;
+    return range;
+  }
+
   private writeEntry(key: number, level: number, tailLevel: number): void {
     const slot = this.keySlot.get(key);
     const at = key * 4;
+    this.dirtyFrom = Math.min(this.dirtyFrom, key);
+    this.dirtyTo = Math.max(this.dirtyTo, key);
     if (slot !== undefined) {
       const tile = this.pyramids.tiles[key];
       this.pageData.set([slot + (this.options.shiftSlots ? 1 : 0), level, tile.tileX, tile.tileY], at);
