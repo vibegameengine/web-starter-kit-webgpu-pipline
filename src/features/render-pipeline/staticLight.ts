@@ -25,8 +25,8 @@ const DEFAULT_BAKE_SECONDS = 15;
 const DEFAULT_METRES_PER_TEXEL = 0.05;
 const DEFAULT_PROBE_ITERATIONS = 100;
 const MAX_PROBES = 65536;
-const DEFAULT_LOD_PAGE = 2048;
-const DEFAULT_LOD_ATLAS = 512;
+const DEFAULT_LOD_TILE = 64;
+const DEFAULT_LOD_SLOTS_PER_SIDE = 16;
 const DEFAULT_LOD_COPIES = 32;
 const DEFAULT_LOD_FEEDBACK_SPACING = 4;
 
@@ -345,10 +345,12 @@ export class StaticLight {
     this.lod = null;
     if (!this.lodWanted() || !this.layout) return;
     this.lod = new LightmapLod(this.renderer, this.scene, this.layout, pixels, this.atlasIntensity, {
-      pageSize: this.url.num('lodPage') ?? DEFAULT_LOD_PAGE,
-      atlasSize: this.url.num('lodAtlas') ?? DEFAULT_LOD_ATLAS,
+      tileSize: this.url.num('vtTile') ?? DEFAULT_LOD_TILE,
+      slotsPerSide: this.url.num('vtPool') ?? DEFAULT_LOD_SLOTS_PER_SIDE,
       copyBudget: this.url.num('lodCopies') ?? DEFAULT_LOD_COPIES,
       feedbackSpacing: this.url.num('lodFeedback') ?? DEFAULT_LOD_FEEDBACK_SPACING,
+      shiftSlots: this.url.get('vtMutation') === 'slot',
+      evictAll: this.url.get('vtEvict') === 'all',
     });
   }
 

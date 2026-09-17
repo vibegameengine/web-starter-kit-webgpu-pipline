@@ -205,14 +205,14 @@ function bindLightingGui(gui: GUI, p: Pipeline, ui: PipelineUi): void {
   setInterval(() => {
     const lod = staticLight.lod;
     lodState.streaming = lod
-      ? `${lod.pool.pages.length}×${lod.pool.pageSize}² pages → ${lod.atlas.size}², ${lod.atlas.residentCount()} resident, ${lod.plan.rootOnly} on root`
+      ? `${lod.pyramids.tiles.length} tiles of ${lod.pyramids.tileSize}², ${lod.pool.residency.residentKeys().length}/${lod.pool.residency.capacity} resident, ${lod.pool.residency.stats.coarsened} coarsened`
       : staticLight.ready ? 'off' : 'baking';
   }, 500);
   bake.add({ lab: () => {
     const params = new URLSearchParams(window.location.search);
     params.set('lodLab', params.get('lodLab') === '1' ? '0' : '1');
     window.location.search = params.toString();
-  } }, 'lab').name('LOD lab (scene | working atlas)');
+  } }, 'lab').name('LOD lab (scene | tile pool)');
   const envParams = { env: p.url.num('env') ?? 1, lod: p.url.num('envLod') ?? 4 };
   giFolder.add(envParams, 'env', 0, 5, 0.05).name('env').onChange(() => gi.setEnvControls(envParams.env, envParams.lod));
   bindBakedOnly(lighting, p, envParams);
@@ -319,30 +319,26 @@ function installAtlasHooks(p: Pipeline): void {
   hook('__lod', () => {
     const lod = staticLight.lod;
     if (!lod) return null;
+    const levels: Record<number, number> = {};
+    for (const key of lod.pool.residency.residentKeys()) levels[lod.pyramids.tiles[key].level] = (levels[lod.pyramids.tiles[key].level] ?? 0) + 1;
     return {
       charts: staticLight.layout?.regions.length ?? 0,
       bakePages: staticLight.layout?.pages ?? 0,
       metresPerTexel: staticLight.layout?.metresPerTexel ?? 0,
-      pages: lod.pool.pages.length,
-      pageSize: lod.pool.pageSize,
-      poolMiB: +(lod.pool.bytes / 1048576).toFixed(2),
-      atlasSize: lod.atlas.size,
-      resident: lod.atlas.residentCount(),
-      usedCells: lod.atlas.usedCells(),
-      totalCells: lod.atlas.totalCells(),
-      freeCells: lod.atlas.freeCells(),
-      asked: lod.feedback.count(),
+      tiles: lod.pyramids.tiles.length,
+      tileSize: lod.pyramids.tileSize,
+      tailSize: lod.pyramids.tailSize,
+      storeMiB: +(lod.pool.storeBytes / 1048576).toFixed(2),
+      slots: lod.pool.residency.capacity,
+      poolSize: lod.pool.size,
+      resident: lod.pool.residency.residentKeys().length,
       feedbackReads: lod.feedback.readsDone,
       feedbackDrawn: lod.feedback.drawnLastRead,
-      copies: lod.atlas.copiesLastFrame,
-      refused: lod.atlas.refusedLastFrame,
-      released: lod.atlas.releasedLastFrame,
-      ...lod.plan,
-      demands: undefined,
-      mips: lod.plan.demands.reduce((counts: Record<number, number>, demand) => {
-        counts[demand.mip] = (counts[demand.mip] ?? 0) + 1;
-        return counts;
-      }, {}),
+      feedbackLevels: lod.feedback.levelsLastRead,
+      feedbackOnTail: lod.feedback.onTailLastRead,
+      tailLevels: lod.pyramids.charts.reduce((counts: Record<number, number>, chart) => { counts[chart.tailLevel] = (counts[chart.tailLevel] ?? 0) + 1; return counts; }, {}),
+      ...lod.pool.residency.stats,
+      levels,
     };
   });
   hook('__lodChart', (name = 'bench') => {
@@ -351,17 +347,15 @@ function installAtlasHooks(p: Pipeline): void {
     if (!lod || !layout) return null;
     return layout.placements.flatMap((placement, chart) => {
       if (placement.mesh.name !== name) return [];
-      return [{
-        chart, region: placement.region, lastMip: lod.pool.lastMip(chart),
-        root: [lod.pool.rootColours[chart * 3], lod.pool.rootColours[chart * 3 + 1], lod.pool.rootColours[chart * 3 + 2]].map((v) => +v.toFixed(5)),
-        residentMip: lod.atlas.residentMip(chart),
-      }];
+      const pyramid = lod.pyramids.charts[chart];
+      const resident = lod.pool.residency.residentKeys().filter((key) => lod.pyramids.tiles[key].chart === chart).map((key) => lod.pyramids.tiles[key]);
+      return [{ chart, region: placement.region, tailLevel: pyramid.tailLevel, resident }];
     }).slice(0, 8);
   });
   hook('__lodPixels', async (x = 0, y = 0, width = 32, height = 4) => {
     const lod = staticLight.lod;
     if (!lod) return null;
-    const pixels = await renderer.readRenderTargetPixelsAsync(lod.atlas.target, x, y, width, height);
+    const pixels = await renderer.readRenderTargetPixelsAsync(lod.pool.target, x, y, width, height);
     return Array.from(pixels.slice(0, Math.min(pixels.length, 256)));
   });
   hook('__pages', () => {

@@ -28,18 +28,19 @@ export class LodLab {
     this.header = document.createElement('div');
     this.header.className = 'lab-header';
     this.view = document.createElement('canvas');
-    this.view.width = lod.atlas.size;
-    this.view.height = lod.atlas.size;
+    this.view.width = lod.pool.width;
+    this.view.height = lod.pool.height;
     this.legend = document.createElement('div');
     this.legend.className = 'lab-legend';
-    this.legend.innerHTML = MIP_COLOURS.map((colour, mip) => `<span><i style="background:${colour}"></i>mip ${mip}</span>`).join('');
+    this.legend.innerHTML = MIP_COLOURS.map((colour, mip) => `<span><i style="background:${colour}"></i>level ${mip}</span>`).join('');
     this.element.append(this.header, this.view, this.legend);
     document.body.append(this.element, labStyle());
     const context = this.view.getContext('2d');
     if (!context) throw new Error('lod lab: no 2D context');
     this.context = context;
     this.image = document.createElement('canvas');
-    this.image.width = this.image.height = lod.atlas.size;
+    this.image.width = lod.pool.width;
+    this.image.height = lod.pool.height;
   }
 
   update(): void {
@@ -53,12 +54,12 @@ export class LodLab {
     if (this.reading) return;
     this.reading = true;
     try {
-      const size = this.lod.atlas.size;
-      const pixels = (await readFloatTexture(this.renderer, this.lod.atlas.texture)).data;
+      const { width, height } = this.lod.pool;
+      const pixels = (await readFloatTexture(this.renderer, this.lod.pool.texture)).data;
       const context = this.image.getContext('2d');
       if (!context) return;
-      const rgba = context.createImageData(size, size);
-      for (let texel = 0; texel < size * size; texel++) {
+      const rgba = context.createImageData(width, height);
+      for (let texel = 0; texel < width * height; texel++) {
         for (let channel = 0; channel < 3; channel++) {
           const value = decode(pixels, texel * 4 + channel);
           rgba.data[texel * 4 + channel] = Math.round(255 * Math.min(1, (value / (1 + value)) ** (1 / 2.2)));
@@ -70,7 +71,7 @@ export class LodLab {
         this.reported = true;
         let max = 0;
         for (let index = 0; index < pixels.length; index++) max = Math.max(max, decode(pixels, index));
-        console.log(`[lod-lab] readback ${size}² ${pixels.constructor.name} of ${pixels.length}, max ${max}`);
+        console.log(`[lod-lab] readback ${width}x${height} ${pixels.constructor.name} of ${pixels.length}, max ${max}`);
       }
     } catch (error) {
       console.warn(`[lod-lab] atlas readback failed: ${error}`);
@@ -80,31 +81,29 @@ export class LodLab {
   }
 
   private draw(): void {
-    const size = this.lod.atlas.size;
-    this.context.clearRect(0, 0, size, size);
+    const side = this.lod.pyramids.physicalTile;
+    const slotsPerSide = Math.round(this.lod.pool.size / side);
+    this.context.clearRect(0, 0, this.lod.pool.width, this.lod.pool.height);
     this.context.drawImage(this.image, 0, 0);
     this.context.lineWidth = 1;
-    for (const demand of this.lod.plan.demands) {
-      const slot = this.lod.atlas.slotOf(demand.chart);
-      if (!slot) continue;
-      this.context.strokeStyle = MIP_COLOURS[Math.min(slot.mip, MIP_COLOURS.length - 1)];
-      this.context.strokeRect(slot.x + 0.5, slot.y + 0.5, slot.width - 1, slot.height - 1);
+    for (const key of this.lod.pool.residency.residentKeys()) {
+      const slot = this.lod.pool.residency.slotOf(key)!;
+      const level = this.lod.pyramids.tiles[key].level;
+      this.context.strokeStyle = MIP_COLOURS[Math.min(level, MIP_COLOURS.length - 1)];
+      this.context.strokeRect((slot % slotsPerSide) * side + 0.5, Math.floor(slot / slotsPerSide) * side + 0.5, side - 1, side - 1);
     }
   }
 
   private writeHeader(): void {
-    const atlas = this.lod.atlas;
-    const plan = this.lod.plan;
-    const mips: Record<number, number> = {};
-    for (const demand of plan.demands) mips[demand.mip] = (mips[demand.mip] ?? 0) + 1;
-    const spread = Object.entries(mips).map(([mip, count]) => `mip ${mip}: ${count}`).join(' · ') || 'nothing resident';
+    const { pyramids, pool } = this.lod;
+    const stats = pool.residency.stats;
+    const levels: Record<number, number> = {};
+    for (const key of pool.residency.residentKeys()) levels[pyramids.tiles[key].level] = (levels[pyramids.tiles[key].level] ?? 0) + 1;
+    const spread = Object.entries(levels).map(([level, count]) => `level ${level}: ${count}`).join(' · ') || 'nothing resident';
     this.header.innerHTML =
-      `<b>source pages</b> ${this.lod.pool.pages.length} × ${this.lod.pool.pageSize}² = ${(this.lod.pool.bytes / 1048576).toFixed(1)} MiB` +
-      ` · <b>working atlas</b> ${atlas.size}² = ${((atlas.size * atlas.size * 8) / 1048576).toFixed(1)} MiB` +
-      `<br>on screen <b>${plan.visible}</b> charts · wanted <b>${plan.wantedCells}</b> cells · granted <b>${plan.grantedCells}</b>` +
-      ` of ${atlas.freeCells()} free (${atlas.totalCells()} total) · coarsened <b>${plan.coarsened}</b> steps · on root <b>${plan.rootOnly}</b>` +
-      `<br>copies this frame <b>${atlas.copiesLastFrame}</b>` +
-      ` · released <b>${atlas.releasedLastFrame}</b> · refused <b>${atlas.refusedLastFrame}</b> · resident <b>${atlas.residentCount()}</b> · cells used <b>${atlas.usedCells()}</b>` +
+      `<b>tiles</b> ${pyramids.tiles.length} × ${pyramids.tileSize}² in ${pyramids.storePages.length} store page(s) · <b>tail</b> ${pyramids.tailSize}² · ${(pool.storeBytes / 1048576).toFixed(1)} MiB` +
+      `<br><b>pool</b> ${pool.residency.residentKeys().length} / ${pool.residency.capacity} slots (${pool.size}²)` +
+      `<br>asked <b>${stats.asked}</b> · planned <b>${stats.planned}</b> · coarsened <b>${stats.coarsened}</b> · copies <b>${stats.copies}</b> · released <b>${stats.released}</b> · refused <b>${stats.refused}</b>` +
       `<br>${spread}`;
   }
 }
@@ -121,8 +120,8 @@ function labStyle(): HTMLStyleElement {
     #lod-lab { position: fixed; top: 0; right: var(--lod-lab-gutter, 0px); width: calc(50vw - var(--lod-lab-gutter, 0px));
       height: 100vh; background: #0b0d10; color: #cfd6df; font: 12px ui-monospace, Consolas, monospace;
       display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 10px 0; box-sizing: border-box; z-index: 5; }
-    #lod-lab canvas { image-rendering: pixelated; width: min(calc(48vw - var(--lod-lab-gutter, 0px)), calc(100vh - 120px));
-      height: auto; border: 1px solid #232a33; background: #05070a; }
+    #lod-lab canvas { image-rendering: pixelated; width: auto; height: auto; max-width: calc(48vw - var(--lod-lab-gutter, 0px)); max-height: calc(100vh - 120px);
+      border: 1px solid #232a33; background: #05070a; }
     #lod-lab .lab-header { line-height: 1.6; text-align: center; }
     #lod-lab .lab-legend { display: flex; gap: 12px; flex-wrap: wrap; justify-content: center; }
     #lod-lab .lab-legend i { display: inline-block; width: 10px; height: 10px; margin-right: 4px; border-radius: 2px; }
