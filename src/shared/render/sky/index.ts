@@ -3,4 +3,5 @@ export { earthAtmosphere, type AtmosphereParameters } from './atmosphereParamete
 export { sunTransmittance } from './sunTransmittance.ts';
 export { SkyEnvironment } from './skyEnvironment.ts';
 export { CloudLayer } from './cloudLayer.ts';
+export { CloudShadowMap } from './cloudShadowMap.ts';
 export { DEFAULT_CLOUD_SETTINGS, type CloudSettings } from './cloudDensity.ts';

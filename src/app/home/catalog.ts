@@ -78,7 +78,7 @@ export const SCENES: Entry[] = [
     title: 'Небо',
     art: 'home-art-beach',
     description:
-      'Физическая атмосфера и объёмные облака: LUT пропускания, многократного рассеяния и вида неба, слой кучевых облаков. Цвет солнца и отражения следуют за небом сразу; запечённый свет — после кнопки «bake light from this sky» в папке Sky, статус там же. Облака пока не отбрасывают тени и не входят в освещение.',
+      'Физическая атмосфера и объёмные облака: LUT пропускания, многократного рассеяния и вида неба, слой кучевых облаков. Цвет солнца и отражения следуют за небом сразу; запечённый свет — после кнопки «bake light from this sky» в папке Sky, статус там же. Облака отбрасывают бегущие тени и входят в окружение: отражения и запечённый свет видят пасмурное небо.',
     href: '/?scene=sky&cam=objects',
     open: 'Открыть лабу',
     chips: [
@@ -91,6 +91,7 @@ export const SCENES: Entry[] = [
       { label: 'облака снизу', href: '/?scene=sky&cam=zenith&sunAz=-60&sunEl=40&bakeCache=0' },
       { label: 'разорванные облака', href: '/?scene=sky&cam=horizon&sunAz=-60&sunEl=40&cloudCoverage=0.5&bakeCache=0' },
       { label: 'пасмурно (слоистые)', href: '/?scene=sky&cam=horizon&sunAz=-60&sunEl=40&cloudCoverage=0.97&bakeCache=0' },
+      { label: 'тени облаков сверху', href: '/?scene=sky&cam=objects&sunAz=-60&sunEl=55&cloudCoverage=0.55&bakeCache=0' },
       { label: 'ясно', href: '/?scene=sky&cam=horizon&sunAz=-60&sunEl=40&clouds=0&bakeCache=0' },
       { label: 'без неба (панорама)', href: '/?scene=sky&cam=objects&sky=0' },
     ],

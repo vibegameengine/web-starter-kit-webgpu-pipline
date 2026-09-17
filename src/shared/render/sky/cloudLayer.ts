@@ -46,7 +46,7 @@ function interleavedGradientNoise(pixel: N, frame: N): N {
 export class CloudLayer {
   readonly settings: CloudSettings;
   readonly uniforms = new CloudUniforms();
-  private readonly volumes: CloudNoiseVolumes;
+  readonly volumes: CloudNoiseVolumes;
   private readonly targets: [THREE.StorageTexture, THREE.StorageTexture];
   private readonly kernels: [N, N];
   private readonly parity = uniform(0);
@@ -175,7 +175,7 @@ export class CloudLayer {
     return { value: texture(read, this.activeUv(uv)).level(float(0)), weight };
   }
 
-  private lightContext(): CloudLightContext {
+  lightContext(): CloudLightContext {
     const sky = this.sky;
     const up = sky.skyLuminance(vec3(0, 1, 0));
     const side = sky.skyLuminance(normalize(vec3(sky.sunDirection.x, 0.15, sky.sunDirection.z)));
@@ -187,6 +187,17 @@ export class CloudLayer {
     };
   }
 
+  traceDirection(direction: N, jitter: N, steps: number): N {
+    const origin = vec3(0, this.sky.luts.viewRadius, 0);
+    const segment = layerSegment(this.uniforms, origin, direction, this.sky.luts.atmosphere.groundRadius);
+    const march = marchCloudLayer(this.lightContext(), { origin, direction, start: segment.start, end: segment.end, jitter, steps });
+    const air = this.airTransmittance(origin, direction, march.depth);
+    const airMean = air.x.add(air.y).add(air.z).div(3);
+    const luminance = select(segment.valid, march.luminance.mul(air), vec3(0));
+    const transmittance = select(segment.valid, mix(float(1), march.transmittance, airMean), float(1));
+    return vec4(luminance, transmittance);
+  }
+
   private kernel(writeIndex: number): N {
     const write = this.targets[writeIndex];
     const read = this.targets[1 - writeIndex];
@@ -194,15 +205,9 @@ export class CloudLayer {
       If(float(globalId.x).lessThan(this.active.x).and(float(globalId.y).lessThan(this.active.y)), () => {
         const pixel = vec2(globalId.xy);
         const direction = this.viewDirection(pixel);
-        const origin = vec3(0, this.sky.luts.viewRadius, 0);
-        const segment = layerSegment(this.uniforms, origin, direction, this.sky.luts.atmosphere.groundRadius);
-        const march = marchCloudLayer(this.lightContext(), { origin, direction, start: segment.start, end: segment.end, jitter: interleavedGradientNoise(pixel, this.frame), steps: MARCH_STEPS });
-        const air = this.airTransmittance(origin, direction, march.depth);
-        const airMean = air.x.add(air.y).add(air.z).div(3);
-        const luminance = select(segment.valid, march.luminance.mul(air), vec3(0));
-        const transmittance = select(segment.valid, mix(float(1), march.transmittance, airMean), float(1));
+        const traced = this.traceDirection(direction, interleavedGradientNoise(pixel, this.frame), MARCH_STEPS);
         const history = this.history(read, direction);
-        textureStore(write, uvec2(globalId.x, globalId.y), mix(vec4(luminance, transmittance), history.value, history.weight));
+        textureStore(write, uvec2(globalId.x, globalId.y), mix(traced, history.value, history.weight));
       });
     })().computeKernel([WORKGROUP, WORKGROUP, 1]).setName(`Clouds ${writeIndex}`);
   }

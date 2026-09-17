@@ -108,6 +108,23 @@ and `composite()` puts the result over the sky in the background node. GUI folde
 - A failed capture is reported with a warning instead of stopping the render loop. Switching the sky
   off returns the sun to white.
 
+## Clouds in the lighting (step 2 of 3)
+
+- **Shadows.** `cloudShadowMap.ts` is a 512² top-down map of 8 km around the camera. Every texel is
+  a ground point marched 12 steps toward the sun through the layer, stored as transmittance. `SkyStage`
+  wraps the sun's own `shadow.filterNode` and multiplies it by that map at `positionWorld`, so every
+  receiver of the sun darkens under a cloud and no material changes. A scene without a custom filter
+  gets a console warning and no cloud shadows. Seen in the lab from 38 m up with a 6 km/min wind:
+  the plinth goes fully shaded, then a shadow edge crosses it and the column shadows come back.
+- **Environment.** `SkyEnvironment` traces the clouds once more into a 512×256 equirect at 24 steps
+  (`CloudLayer.traceDirection`, shared with the screen layer) and composites them over the sky in the
+  panorama. The panorama is recaptured when the sun moves, when any cloud setting changes, and every
+  4 s while clouds are on, because of the wind. At coverage 0.97 the lab loses its hard sun shadows
+  and the mirror sphere reflects the deck.
+- The atlas and the probes still follow only through "bake light from this sky".
+- Under overcast the plinth reads very dark. It may be the same unverified shade-fill deficit
+  listed below.
+
 ## Open
 
 - Aerial perspective on geometry: there is no froxel volume yet. The existing volumetric fog is
@@ -117,7 +134,6 @@ and `composite()` puts the result over the sky in the background node. GUI folde
 - The planet ground below the horizon is a flat albedo. A scene with terrain covers it.
 - Spectral integration: the LUTs are RGB.
 - Only the lab opts in; the beach, forest and village still use the panorama.
-- Clouds are not in the environment capture (bake, probes, reflections) and cast no shadows yet (step 2).
 - No aerial perspective volume for geometry (step 3).
 - From altitude the 96³ shape volume visibly repeats as rows running to the horizon.
 - Not verified: shadow fill in the shade 2-10x below the panorama's own sky irradiance, and backlit
