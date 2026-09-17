@@ -57,12 +57,6 @@ const DEGENERATE_EXTENT = 1e-4;
 
 const LAYER_GRID = 256;
 
-const DEFAULT_SAFE_MIP = 2;
-
-const MAX_PAGE_SIZE = 4096;
-
-const MAX_ATLAS_ROWS = 8192;
-
 const FOLD_SEPARATION_METRES = 0.25;
 
 const _a = new THREE.Vector3();
@@ -129,9 +123,9 @@ export function assignLightmapUvs(
   scene: THREE.Scene,
   options: { padding?: number; atlasSize?: number; filterMip?: number; maxPages?: number; metresPerTexel?: number } = {},
 ): LightmapLayout {
-  const requestedPageSize = options.atlasSize ?? 512;
-  const safeMip = options.filterMip ?? DEFAULT_SAFE_MIP;
-  if (!Number.isInteger(safeMip) || safeMip < 0 || safeMip > Math.log2(requestedPageSize) - 1) throw new Error('Invalid lightmap filter mip');
+  const atlasSize = options.atlasSize ?? 512;
+  const safeMip = options.filterMip ?? Math.log2(atlasSize / Math.min(128, atlasSize / 2));
+  if (!Number.isInteger(safeMip) || safeMip < 0 || safeMip > Math.log2(atlasSize) - 1) throw new Error('Invalid lightmap filter mip');
   const alignment = 2 ** safeMip;
   // At the coarsest mip a bilinear tap must still stay inside its own rectangle.
   // Extra base-level separation also isolates the baker's 3x3 denoiser.
@@ -197,14 +191,14 @@ export function assignLightmapUvs(
       regions: [],
       pageOfRegion: [],
       pages: 0,
-      atlasHeight: requestedPageSize,
+      atlasHeight: atlasSize,
       placements: [],
       safeMip,
-      gridSide: requestedPageSize,
+      gridSide: atlasSize,
       cellCount: 0,
       mappedArea: 0,
       refusedArea,
-      atlasSize: requestedPageSize,
+      atlasSize,
       metresPerTexel: 0,
     };
   }
@@ -218,15 +212,19 @@ export function assignLightmapUvs(
      scene's area it made the same bench 0.1156 m per texel in the corridor and 0.0691 on the
      beach - quality as a by-product of how much surface a scene has. `?lmDensity=0` goes back
      to the area estimate. The page ceiling is what one texture can be: 8192 texels. */
+  const maxPages = options.maxPages ?? Math.floor(8192 / atlasSize);
   const metresPerTexel = options.metresPerTexel && options.metresPerTexel > 0
     ? options.metresPerTexel
-    : Math.sqrt(mappedArea / (TARGET_FILL * requestedPageSize * requestedPageSize));
+    : Math.sqrt(mappedArea / (TARGET_FILL * atlasSize * atlasSize));
   const placed: ChartRequest[] = requests;
   for (const chart of placed) {
     chart.w = Math.max(2 * alignment, Math.ceil((chart.extentU / metresPerTexel + 2 * inset) / alignment) * alignment);
     chart.h = Math.max(2 * alignment, Math.ceil((chart.extentV / metresPerTexel + 2 * inset) / alignment) * alignment);
   }
-  const { atlasSize, pages } = packGrowingPages(placed, { requestedPageSize, alignment, maxPages: options.maxPages, metresPerTexel });
+  const pages = packPages(placed, atlasSize, alignment, maxPages);
+  if (pages === 0) {
+    throw new Error(`[lightmap] a single chart is larger than a ${atlasSize}² page at ${metresPerTexel.toFixed(4)} m/texel`);
+  }
   const atlasHeight = atlasSize * pages;
   const measurable = new Set(placed.filter((chart) => coversTexelCentre(chart, inset)));
   const drawn = placed.filter((chart) => measurable.has(chart));
@@ -708,24 +706,6 @@ function islandChart(mesh: THREE.Mesh, vertices: number[], world: Float32Array, 
  * atlas to 2048 broke the probe bake's readback. The density is fixed and pages are
  * added until every chart has a home.
  */
-/* @important The page grows to the world, not the world to the page. A fixed 512 page refused
-   a 40 m ground plate at 0.05 m/texel (808 texels) and the scene's author shrank the ground
-   to 24 m to get a bake. The page starts at the requested size, becomes the power of two
-   that holds the widest chart, and doubles again while the stack of pages cannot hold every
-   chart in one texture's 8192 rows. It stops at the saved bake format's 4096. */
-function packGrowingPages(
-  charts: ChartRequest[],
-  options: { requestedPageSize: number; alignment: number; maxPages?: number; metresPerTexel: number },
-): { atlasSize: number; pages: number } {
-  const widest = charts.reduce((most, chart) => Math.max(most, chart.w, chart.h), 0);
-  let side = Math.max(options.requestedPageSize, 2 ** Math.ceil(Math.log2(Math.max(1, widest))));
-  for (; side <= MAX_PAGE_SIZE; side *= 2) {
-    const pages = packPages(charts, side, options.alignment, options.maxPages ?? Math.floor(MAX_ATLAS_ROWS / side));
-    if (pages > 0) return { atlasSize: side, pages };
-  }
-  throw new Error(`[lightmap] ${charts.length} charts (widest ${widest} texels) do not fit ${MAX_ATLAS_ROWS} rows of ${MAX_PAGE_SIZE}² pages at ${options.metresPerTexel.toFixed(4)} m/texel`);
-}
-
 function packPages(charts: ChartRequest[], side: number, alignment: number, maxPages: number): number {
   let remaining = charts;
   let page = 0;

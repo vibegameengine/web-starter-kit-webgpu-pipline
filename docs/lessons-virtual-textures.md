@@ -1,6 +1,6 @@
 # Virtual textures, stage 1a (2026-09-17)
 
-Stage 1a of the virtual texture work: every lightmap chart
+Stage 1a of [virtual-textures-design.md](virtual-textures-design.md): every lightmap chart
 has its own pyramid down to a level that fits one tile; levels wider than a tile are cut
 into equal 64² tiles with a 2-texel border from the same level; the first level that fits
 is the chart's tail, packed once into a strip below the pool slots. The page table points
