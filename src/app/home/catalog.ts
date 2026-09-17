@@ -92,6 +92,19 @@ export const SCENES: Entry[] = [
     ],
   },
   {
+    title: 'Масштабы · LOD лайтмапы',
+    art: 'home-art-cornell',
+    description:
+      'Стенд для LOD лайтмапы: земля 24 м под перголой, один домик в четырёх масштабах, стена 18 м, и везде мелкие тени от реек — грубый уровень, шов тайла и скачок уровня видны сразу.',
+    href: '/?scene=lod-scale&cam=overview',
+    open: 'Открыть',
+    chips: [
+      ...cams('lod-scale', ['overview', 'eye', 'grazing', 'glow', 'pergola', 'ladder', 'wall', 'far']),
+      { label: 'LOD-лаба', href: '/?scene=lod-scale&cam=eye&lodLab=1' },
+      { label: 'пул 16 тайлов', href: '/?scene=lod-scale&cam=eye&vtPool=4' },
+    ],
+  },
+  {
     title: 'Комната протечек',
     art: 'home-art-cornell',
     description:
