@@ -28,7 +28,7 @@ export const DEFAULT_CLOUD_SETTINGS: CloudSettings = {
   coverage: 0.73,
   bottomKm: 1.5,
   thicknessKm: 2.5,
-  densityPerKm: 90,
+  densityPerKm: 30,
   shapeScaleKm: 9,
   detailScaleKm: 0.6,
   detailErosion: 0.6,

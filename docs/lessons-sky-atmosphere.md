@@ -157,6 +157,20 @@ horizontal position by up to ±1.5 km before the shape is read. The same views s
 afterwards (`shots/streaks/fixed2-shape5.png`, `fixed2-coverage06.png`). The cost is two more
 volume reads per density sample.
 
+## High sun looked dirty and harsh (2026-09-17)
+
+The user's frame at a high sun showed a yellow-brown band of distant clouds, grey dirty cloud masses
+and a harsh contrast. Three suspects, each tested on its own:
+
+- **The shade fill is correct.** With `__bakedOnly(true)`, the plinth's linear base colour is
+  (0.0178, 0.0284, 0.0446). Its albedo times the panorama's upper-hemisphere irradiance over pi is
+  (0.0170, 0.0287, 0.0460) (`scripts/_shade_fill.mjs`). Blue shadows are the sky's own colour
+  (red:blue 1:4 at 45 degrees), not a bake deficit.
+- **Faulty: distant clouds were dimmed by the per-channel air transmittance.** That reddens them
+  without adding the blue the air scatters in front of them. They are now dimmed by the mean.
+- **Faulty: 90/km gave an optical depth near 180 through a 2 km cloud.** Real cumulus is 20-50. The
+  default is now 30/km, and the clouds read white at noon.
+
 ## Open
 
 - Aerial perspective on geometry: there is no froxel volume yet. The existing volumetric fog is

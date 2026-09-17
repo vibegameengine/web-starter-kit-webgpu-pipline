@@ -187,13 +187,18 @@ export class CloudLayer {
     };
   }
 
+  /* @important The cloud's light is dimmed by the mean air transmittance, not the per-channel one. The
+     per-channel value reddens the cloud as it should, but the blue light the same air scatters toward
+     the camera is never added here, so distant clouds at noon came out as a yellow-brown band along the
+     horizon (shots/highsun/before.png against greyair.png). The grey dimming plus the sky revealed
+     through the alpha keeps the haze blue-white. */
   traceDirection(direction: N, jitter: N, steps: number): N {
     const origin = vec3(0, this.sky.luts.viewRadius, 0);
     const segment = layerSegment(this.uniforms, origin, direction, this.sky.luts.atmosphere.groundRadius);
     const march = marchCloudLayer(this.lightContext(), { origin, direction, start: segment.start, end: segment.end, jitter, steps });
     const air = this.airTransmittance(origin, direction, march.depth);
     const airMean = air.x.add(air.y).add(air.z).div(3);
-    const luminance = select(segment.valid, march.luminance.mul(air), vec3(0));
+    const luminance = select(segment.valid, march.luminance.mul(airMean), vec3(0));
     const transmittance = select(segment.valid, mix(float(1), march.transmittance, airMean), float(1));
     return vec4(luminance, transmittance);
   }
