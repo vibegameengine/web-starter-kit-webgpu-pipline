@@ -28,6 +28,7 @@ const MAX_PROBES = 65536;
 const DEFAULT_LOD_TILE = 64;
 const DEFAULT_LOD_SLOTS_PER_SIDE = 16;
 const DEFAULT_LOD_COPIES = 32;
+const DEFAULT_LOD_UPLOAD_KIB = 1024;
 const DEFAULT_LOD_FEEDBACK_SPACING = 4;
 
 export interface BakeCacheState { source: string; storage: string; key: string; saved: boolean; error: string; probes: string }
@@ -348,6 +349,7 @@ export class StaticLight {
       tileSize: this.url.num('vtTile') ?? DEFAULT_LOD_TILE,
       slotsPerSide: this.url.num('vtPool') ?? DEFAULT_LOD_SLOTS_PER_SIDE,
       copyBudget: this.url.num('lodCopies') ?? DEFAULT_LOD_COPIES,
+      uploadBytesPerFrame: (this.url.num('vtUploadKiB') ?? DEFAULT_LOD_UPLOAD_KIB) * 1024,
       feedbackSpacing: this.url.num('lodFeedback') ?? DEFAULT_LOD_FEEDBACK_SPACING,
       shiftSlots: this.url.get('vtMutation') === 'slot',
       evictAll: this.url.get('vtEvict') === 'all',

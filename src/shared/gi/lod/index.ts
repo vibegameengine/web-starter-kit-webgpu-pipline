@@ -16,6 +16,7 @@ export interface LodSettings {
   tileSize: number;
   slotsPerSide: number;
   copyBudget: number;
+  uploadBytesPerFrame: number;
   feedbackSpacing: number;
   shiftSlots: boolean;
   evictAll: boolean;
@@ -46,9 +47,9 @@ export class LightmapLod {
       if (mesh.isMesh && mesh.geometry.getAttribute('lightmapChart') && mesh.layers.isEnabled(Layer.GiStatic)) mesh.layers.enable(Layer.LightmapDemand);
     });
     console.log(
-      `[lod] ${layout.regions.length} charts, ${this.pyramids.tiles.length} tiles of ${settings.tileSize}² in ${this.pyramids.storePages.length} store page(s), ` +
+      `[lod] ${layout.regions.length} charts, ${this.pyramids.tiles.length} tiles of ${settings.tileSize}² in tab memory, ` +
         `tail ${this.pyramids.tailSize}², pool ${this.pool.residency.capacity} slots (${this.pool.size}²), ` +
-        `${(this.pool.storeBytes / 1048576).toFixed(1)} MiB stored, built in ${(performance.now() - started).toFixed(0)} ms`,
+        `${(this.pool.storeBytes / 1048576).toFixed(1)} MiB stored, ${this.pool.copyBudget} tiles a frame, built in ${(performance.now() - started).toFixed(0)} ms`,
     );
   }
 
