@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ChartPyramidSet, STORE_PAGE_SIZE, TILE_BORDER, levelSize } from './chartPyramids.ts';
+import { ChartPyramidSet, TILE_BORDER, levelSize } from './chartPyramids.ts';
 import { TileResidency } from './tileResidency.ts';
 
 const ATLAS_WIDTH = 512;
@@ -23,9 +23,8 @@ function gradientAtlas(region: { x: number; y: number; width: number; height: nu
 }
 
 function storeTexel(set: ChartPyramidSet, key: number, x: number, y: number): number[] {
-  const tile = set.tiles[key];
-  const at = ((tile.storeY + y) * STORE_PAGE_SIZE + tile.storeX + x) * 4;
-  return Array.from(set.storePages[tile.storePage].subarray(at, at + 4));
+  const at = (y * set.physicalTile + x) * 4;
+  return Array.from(set.tiles[key].pixels.subarray(at, at + 4));
 }
 
 describe('ChartPyramidSet', () => {
@@ -145,6 +144,21 @@ describe('TileResidency', () => {
     residency.serve(new Set(set.tiles.keys()));
     expect(residency.residentKeys()).toHaveLength(0);
     for (const key of set.tiles.keys()) expect(residency.entry(key).onTail).toBe(true);
+  });
+
+  it('reports only the page entries a frame changed', () => {
+    const set = build();
+    const residency = new TileResidency(set, { slotsPerSide: 4, copyBudget: 64 });
+    expect(residency.takeDirtyEntries()).toEqual({ from: 0, to: set.tiles.length + set.charts.length * 4 - 1 });
+    residency.serve(new Set());
+    expect(residency.takeDirtyEntries()).toBeNull();
+    const key = set.tileKey(1, 0, 2, 3);
+    residency.serve(new Set([key]));
+    const range = residency.takeDirtyEntries()!;
+    const chartTiles = [...set.tiles.keys()].filter((index) => set.tiles[index].chart === 1);
+    expect(range).toEqual({ from: Math.min(...chartTiles), to: Math.max(...chartTiles) });
+    residency.serve(new Set([key]));
+    expect(residency.takeDirtyEntries()).toBeNull();
   });
 
   it('respects the copy budget per frame', () => {

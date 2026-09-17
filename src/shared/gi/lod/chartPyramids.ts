@@ -2,7 +2,6 @@ import type { LightmapRegion } from '../bake/chartPadding.ts';
 
 export const TILE_BORDER = 2;
 export const MAX_TILED_LEVELS = 8;
-export const STORE_PAGE_SIZE = 2048;
 const TAIL_SIDES = [256, 512, 1024, 2048, 4096, 8192];
 
 export interface TileRecord {
@@ -10,9 +9,7 @@ export interface TileRecord {
   level: number;
   tileX: number;
   tileY: number;
-  storePage: number;
-  storeX: number;
-  storeY: number;
+  pixels: Float32Array;
 }
 
 export interface ChartPyramid {
@@ -60,8 +57,7 @@ export function tilesAcross(size: number, level: number, tileSize: number): numb
 export class ChartPyramidSet {
   readonly charts: ChartPyramid[] = [];
   readonly tiles: TileRecord[] = [];
-  readonly storePages: Float32Array[] = [];
-  readonly tailPixels: Float32Array;
+  tailPixels: Float32Array;
   readonly tailSize: number;
   readonly physicalTile: number;
   readonly tileSize: number;
@@ -100,22 +96,21 @@ export class ChartPyramidSet {
   }
 
   private cutLevel(chart: number, level: number, image: LevelImage): void {
-    const perRow = Math.floor(STORE_PAGE_SIZE / this.physicalTile);
     const across = Math.ceil(image.width / this.tileSize);
     const down = Math.ceil(image.height / this.tileSize);
     for (let tileY = 0; tileY < down; tileY++) {
       for (let tileX = 0; tileX < across; tileX++) {
-        const index = this.tiles.length;
-        const storePage = Math.floor(index / (perRow * perRow));
-        if (storePage >= this.storePages.length) this.storePages.push(new Float32Array(STORE_PAGE_SIZE * STORE_PAGE_SIZE * 4));
-        const local = index - storePage * perRow * perRow;
-        const storeX = (local % perRow) * this.physicalTile;
-        const storeY = Math.floor(local / perRow) * this.physicalTile;
-        copyBordered(image, { pixels: this.storePages[storePage], width: STORE_PAGE_SIZE },
-          { fromX: tileX * this.tileSize - TILE_BORDER, fromY: tileY * this.tileSize - TILE_BORDER, toX: storeX, toY: storeY, width: this.physicalTile, height: this.physicalTile });
-        this.tiles.push({ chart, level, tileX, tileY, storePage, storeX, storeY });
+        const pixels = new Float32Array(this.physicalTile * this.physicalTile * 4);
+        copyBordered(image, { pixels, width: this.physicalTile },
+          { fromX: tileX * this.tileSize - TILE_BORDER, fromY: tileY * this.tileSize - TILE_BORDER, toX: 0, toY: 0, width: this.physicalTile, height: this.physicalTile });
+        this.tiles.push({ chart, level, tileX, tileY, pixels });
       }
     }
+  }
+
+  releasePixels(): void {
+    for (const tile of this.tiles) tile.pixels = new Float32Array(0);
+    this.tailPixels = new Float32Array(0);
   }
 
   tileKey(chart: number, level: number, tileX: number, tileY: number): number {

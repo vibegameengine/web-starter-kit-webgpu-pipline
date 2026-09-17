@@ -61,6 +61,15 @@ import type { LightmapGBuffer } from './lightmapGBuffer.ts';
  * no leak gate — the resolve exists to *reconstruct* a value at a point that has no
  * surfel of its own, and here every point has one by construction.
  */
+/* @important The lattice only needs the chart corner's phase, and the phase is stored as a
+   non-negative number because a negative origin is the "no chart here" sentinel. A lightmap window
+   that starts inside a large chart puts that chart's corner left of or above the window: the corner
+   went negative and the whole chart seeded one fallback surfel instead of 28455 (60 m ground,
+   2026-09-17). */
+function latticePhase(origin: number, stride: number): number {
+  return ((origin % stride) + stride) % stride;
+}
+
 export function createLightmapSurfels(pool: SurfelPool, size: number, height = size) {
   const texelCount = size * height;
   const DEPTH_TILE = SURFEL_DEPTH_TEXELS * SURFEL_DEPTH_TEXELS;
@@ -144,11 +153,11 @@ export function createLightmapSurfels(pool: SurfelPool, size: number, height = s
     for (const [chart, region] of regions.entries()) {
       const right = Math.min(size, region.x + region.width);
       const bottom = Math.min(height, region.y + region.height);
-      for (let y = region.y; y < bottom; y++) {
-        for (let x = region.x; x < right; x++) {
+      for (let y = Math.max(0, region.y); y < bottom; y++) {
+        for (let x = Math.max(0, region.x); x < right; x++) {
           const index = (y * size + x) * 2;
-          origins[index] = region.x;
-          origins[index + 1] = region.y;
+          origins[index] = latticePhase(region.x, U_STRIDE.value);
+          origins[index + 1] = latticePhase(region.y, U_STRIDE.value);
           indices[y * size + x] = chart;
         }
       }

@@ -101,9 +101,9 @@ export class LodLab {
     for (const key of pool.residency.residentKeys()) levels[pyramids.tiles[key].level] = (levels[pyramids.tiles[key].level] ?? 0) + 1;
     const spread = Object.entries(levels).map(([level, count]) => `level ${level}: ${count}`).join(' · ') || 'nothing resident';
     this.header.innerHTML =
-      `<b>tiles</b> ${pyramids.tiles.length} × ${pyramids.tileSize}² in ${pyramids.storePages.length} store page(s) · <b>tail</b> ${pyramids.tailSize}² · ${(pool.storeBytes / 1048576).toFixed(1)} MiB` +
+      `<b>tiles</b> ${pyramids.tiles.length} × ${pyramids.tileSize}² in tab memory · <b>tail</b> ${pyramids.tailSize}² · ${(pool.storeBytes / 1048576).toFixed(1)} MiB` +
       `<br><b>pool</b> ${pool.residency.residentKeys().length} / ${pool.residency.capacity} slots (${pool.size}²)` +
-      `<br>asked <b>${stats.asked}</b> · planned <b>${stats.planned}</b> · coarsened <b>${stats.coarsened}</b> · copies <b>${stats.copies}</b> · released <b>${stats.released}</b> · refused <b>${stats.refused}</b>` +
+      `<br>asked <b>${stats.asked}</b> · planned <b>${stats.planned}</b> · coarsened <b>${stats.coarsened}</b> · copies <b>${stats.copies}</b> (${(pool.uploadedBytesLastFrame / 1024).toFixed(0)} KiB) · released <b>${stats.released}</b> · refused <b>${stats.refused}</b>` +
       `<br>${spread}`;
   }
 }

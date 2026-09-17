@@ -4,7 +4,7 @@ import { initRenderer } from '../shared/render/index.ts';
 import { createLightingPipeline } from '../features/lighting-pipeline/index.ts';
 import { createRenderPipeline, type SceneHost } from '../features/render-pipeline/index.ts';
 import { staticInteriorVolume } from '../shared/gi/probes/index.ts';
-import { createBeachScene, createMidseeVillageScene, createVillageLightScene, createCorridorScene, createCorridorLightsScene, createCornellScene, createForestScene, createLeakRoomScene, createSkyLabScene, populateCornell } from '../widgets/world/index.ts';
+import { createBeachScene, createMidseeVillageScene, createVillageLightScene, createCorridorScene, createCorridorLightsScene, createCornellScene, createForestScene, createLeakRoomScene, createLodScaleScene, createSkyLabScene, populateCornell } from '../widgets/world/index.ts';
 import { applyGuiSettings, loadGuiSettings, settingsProfile, settingsProfileSource, settingsSceneName } from './guiSettings.ts';
 import { addGuiSettingsControls } from './guiSettingsPanel.ts';
 import { bootStage, onBootProgress } from '../shared/ui/bootProgress.ts';
@@ -92,6 +92,9 @@ async function boot(): Promise<void> {
   } else if (params.get('scene') === 'sky') {
     const lab = await createSkyLabScene(renderer);
     host = { ...lab, skyIsBackground: false, moverByDefault: false, sunIntensity: 8, sky: {} };
+  } else if (params.get('scene') === 'lod-scale') {
+    const stand = await createLodScaleScene(renderer);
+    host = { ...stand, skyIsBackground: false, moverByDefault: false, sunIntensity: 2 };
   } else if (params.get('scene') === 'leak-room') {
     const room = createLeakRoomScene(renderer);
     host = { ...room, skyIsBackground: true, moverByDefault: false };
